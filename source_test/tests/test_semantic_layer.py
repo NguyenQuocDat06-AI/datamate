@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from bizreason.contracts import BusinessContext, ColumnMeta, SourceRef, TableMeta
+from bizreason.contracts import BusinessContext, ColumnMeta, Diagnostic, SourceRef, TableMeta
 from bizreason.semantic import layer
 
 # name -> (column names, rows)
@@ -1179,4 +1179,215 @@ def test_build_stats_exists_with_every_key_when_there_are_no_tables(tmp_path: Pa
         "qty_cells_nonblank": 0, "qty_cells_unparsed": 0, "money_cells_nonblank": 0, "money_cells_unparsed": 0,
         "product_rows_without_order": 0, "annotation_keys_unresolved": 0,
         "tables_skipped_missing_order_id": 0, "status_unmapped_values": 0,
+        "subtotal_rows_removed": 0, "combined_items_split": 0, "combined_items_unsplit": 0,
+        "values_regrouped": 0, "scaled_tables": 0,
     }
+
+
+SALES_LINE_ROLES = {"order": "order_id", "date": "ordered_at", "item": "product_name", "amount": "line_amount"}
+SALES_LINE_COLUMNS = ["order", "date", "item", "amount"]
+
+
+def _run_with(tmp_path: Path, specs: Specs, records: list[dict[str, Any]], *, readme: str = "",
+              diagnostics: tuple = (), **kwargs: Any) -> tuple[dict, Path]:
+    context = _context(_source(tmp_path, specs), specs).model_copy(
+        update={"readme": readme, "diagnostics": list(diagnostics)})
+    out = tmp_path / "canonical.sqlite"
+    report = layer.build(context, records, out, **kwargs)
+    return report, out
+
+
+def _raw_line_count(out: Path) -> int:
+    return _query(out, "SELECT COUNT(*) FROM raw_lines")[0][0]
+
+
+def test_subtotal_row_is_removed_and_counted(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (SALES_LINE_COLUMNS, [
+        ("O1", "2026-03-01", "tea", "100"),
+        ("O1", "2026-03-01", "coffee", "50"),
+        ("", "", "", "150"),  # subtotal of O1's two lines
+        ("O2", "2026-03-02", "milk", "30"),
+        ("", "", "", "30"),  # subtotal of O2
+    ])}
+    report, out = _run_with(tmp_path, specs, [_record(SALES_LINE_COLUMNS, "sales", SALES_LINE_ROLES)])
+
+    assert _query(out, "SELECT order_id, amount FROM lines ORDER BY order_id, amount") == [
+        ("O1", 50.0), ("O1", 100.0), ("O2", 30.0),
+    ]
+    stats = _stats(out)
+    assert stats["subtotal_rows_removed"] == 2
+    assert report["orders"] == 2
+    # row conservation: every source row is loaded or excluded with a reason
+    assert _raw_line_count(out) + stats["subtotal_rows_removed"] + report["duplicate_lines_removed"] == 5
+
+
+def test_product_row_equal_to_previous_sum_is_kept(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (SALES_LINE_COLUMNS, [
+        ("O1", "2026-03-01", "tea", "100"),
+        ("O1", "2026-03-01", "coffee", "100"),  # equals the run above, but it names a product
+        ("", "", "juice", "100"),  # a product with no order id takes O1, and is still not a subtotal
+    ])}
+    report, out = _run_with(tmp_path, specs, [_record(SALES_LINE_COLUMNS, "sales", SALES_LINE_ROLES)])
+
+    assert _query(out, "SELECT order_id, product_name FROM lines ORDER BY product_name") == [
+        ("O1", "coffee"), ("O1", "juice"), ("O1", "tea"),
+    ]
+    assert _stats(out)["subtotal_rows_removed"] == 0
+
+
+def test_blank_product_row_that_is_not_a_subtotal_keeps_todays_behaviour(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (SALES_LINE_COLUMNS, [
+        ("O1", "2026-03-01", "tea", "100"),
+        ("O1", "2026-03-01", "", "40"),  # no product, and 40 is not the sum of the run
+    ])}
+    _, out = _run_with(tmp_path, specs, [_record(SALES_LINE_COLUMNS, "sales", SALES_LINE_ROLES)])
+
+    assert _query(out, "SELECT order_id, amount FROM lines") == [("O1", 100.0)]
+    assert _raw_line_count(out) == 2
+    assert _stats(out)["subtotal_rows_removed"] == 0
+
+
+def test_order_id_never_crosses_a_subtotal_row(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (SALES_LINE_COLUMNS, [
+        ("O1", "2026-03-01", "tea", "100"),
+        ("", "", "", "100"),  # subtotal: closes O1's group
+        ("", "", "coffee", "50"),  # would inherit O1 without the barrier; it must stay an orphan
+    ])}
+    report, out = _run_with(tmp_path, specs, [_record(SALES_LINE_COLUMNS, "sales", SALES_LINE_ROLES)])
+
+    assert _query(out, "SELECT order_id, product_name FROM lines") == [("O1", "tea")]
+    assert report["orders"] == 1
+    stats = _stats(out)
+    assert stats["product_rows_without_order"] == 1
+    assert stats["subtotal_rows_removed"] == 1
+
+
+def test_subtotal_is_matched_within_one_unit_and_only_over_product_rows_since_the_last_one(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (SALES_LINE_COLUMNS, [
+        ("O1", "2026-03-01", "tea", "100.5"),
+        ("", "", "", "100"),  # within one unit of 100.5: subtotal
+        ("O2", "2026-03-02", "milk", "20"),
+        ("", "", "", "30"),  # 30 is not the 20 since the last subtotal: kept as a non-subtotal row
+    ])}
+    _, out = _run_with(tmp_path, specs, [_record(SALES_LINE_COLUMNS, "sales", SALES_LINE_ROLES)])
+
+    assert _stats(out)["subtotal_rows_removed"] == 1
+    assert _raw_line_count(out) == 3
+
+
+COMBINED_ROLES = {"order": "order_id", "item": "product_name", "qty": "qty", "amount": "line_amount"}
+COMBINED_COLUMNS = ["order", "item", "qty", "amount"]
+COFFEE_README = "Toppings are written in the same cell as the drink, joined with a plus sign: Latte + 2 Shot (5000)."
+
+
+def test_combined_item_is_split_into_main_item_and_priced_toppings(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (COMBINED_COLUMNS, [
+        ("O1", "Latte + 2 Shot (5000) + Syrup (3000)", "1", "20000"),
+        ("O2", "Latte", "1", "30000"),
+    ])}
+    _, out = _run_with(tmp_path, specs, [_record(COMBINED_COLUMNS, "sales", COMBINED_ROLES)], readme=COFFEE_README)
+
+    assert _query(out, "SELECT order_id, product_name, qty, amount FROM lines ORDER BY order_id, amount") == [
+        ("O1", "Syrup", 1.0, 3000.0), ("O1", "Latte", 1.0, 7000.0), ("O1", "Shot", 2.0, 10000.0),
+        ("O2", "Latte", 1.0, 30000.0),
+    ]
+    assert _query(out, "SELECT revenue FROM orders WHERE order_id='O1'") == [(20000.0,)]
+    stats = _stats(out)
+    assert stats["combined_items_split"] == 1
+    assert stats["combined_items_unsplit"] == 0
+
+
+def test_combined_item_whose_toppings_exceed_the_amount_stays_whole(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (COMBINED_COLUMNS, [
+        ("O1", "Latte + Shot (30000)", "1", "20000"),  # 30000 does not fit inside 20000
+        ("O2", "Latte + Shot", "1", "20000"),  # no price for the topping
+    ])}
+    _, out = _run_with(tmp_path, specs, [_record(COMBINED_COLUMNS, "sales", COMBINED_ROLES)], readme=COFFEE_README)
+
+    assert _query(out, "SELECT order_id, product_name, amount FROM lines ORDER BY order_id") == [
+        ("O1", "Latte + Shot (30000)", 20000.0), ("O2", "Latte + Shot", 20000.0),
+    ]
+    stats = _stats(out)
+    assert stats["combined_items_split"] == 0
+    assert stats["combined_items_unsplit"] == 2
+
+
+def test_combined_item_is_not_split_when_the_readme_states_no_such_convention(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (COMBINED_COLUMNS, [("O1", "Latte + 2 Shot (5000)", "1", "7000")])}
+    _, out = _run_with(tmp_path, specs, [_record(COMBINED_COLUMNS, "sales", COMBINED_ROLES)], readme="Plain shop.")
+
+    assert _query(out, "SELECT product_name FROM lines") == [("Latte + 2 Shot (5000)",)]
+    stats = _stats(out)
+    assert stats["combined_items_split"] == 0
+    assert stats["combined_items_unsplit"] == 0
+
+
+def _amount_scale(table: str, path: str, factor: str) -> Diagnostic:
+    return Diagnostic(code="AMOUNT_SCALE", message=factor, source=SourceRef(path=path, table=table))
+
+
+def test_amount_scale_multiplies_money_of_the_named_table_only(tmp_path: Path) -> None:
+    specs: Specs = {
+        "sales_a": (COMBINED_COLUMNS, [("O1", "tea", "2", "12")]),
+        "sales_b": (COMBINED_COLUMNS, [("O9", "tea", "1", "50")]),
+    }
+    diagnostics = (
+        _amount_scale("sales_a", "sales_a.csv", "1000"),
+        _amount_scale("sales_b", "other.csv", "1000"),  # right table name, wrong source path: not applied
+    )
+    report, out = _run_with(tmp_path, specs, [_record(COMBINED_COLUMNS, "sales", COMBINED_ROLES)],
+                            diagnostics=diagnostics)
+
+    assert _query(out, "SELECT order_id, qty, amount FROM lines ORDER BY order_id") == [
+        ("O1", 2.0, 12000.0), ("O9", 1.0, 50.0),
+    ]
+    assert _stats(out)["scaled_tables"] == 1
+
+
+def test_no_amount_scale_diagnostic_changes_nothing(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (COMBINED_COLUMNS, [("O1", "tea", "2", "12")])}
+    _, out = _run_with(tmp_path, specs, [_record(COMBINED_COLUMNS, "sales", COMBINED_ROLES)])
+
+    assert _query(out, "SELECT amount FROM lines") == [(12.0,)]
+    assert _stats(out)["scaled_tables"] == 0
+
+
+def test_value_groups_regroup_canonical_fields_and_keep_the_raw_text(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount", "pay", "channel", "group", "cat"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "tea", "100", "Visa", "Web", "Regular", "Drinks"),
+        ("O2", "coffee", "50", "cash", "Shop", "Regular", "Drinks"),
+        ("O3", "milk", "30", "master ", "Web", "Gold", "Dairy"),
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount",
+                                          "pay": "payment_method", "channel": "channel",
+                                          "group": "customer_group", "cat": "product_category"})]
+    groups = {
+        "payment_method": {"Visa": "card", "Master": "card"},
+        "channel": {"Web": "online"},
+        "customer_group": {"Regular": "retail"},
+        "product_category": {"Drinks": "beverage"},
+    }
+    _, out = _run_with(tmp_path, specs, records, value_groups=groups)
+
+    assert _query(out, "SELECT order_id, payment_method, payment_method_raw FROM orders ORDER BY order_id") == [
+        ("O1", "card", "Visa"), ("O2", "cash", "cash"), ("O3", "card", "master"),  # cells are trimmed on load
+    ]
+    assert _query(out, "SELECT order_id, channel, channel_raw FROM orders ORDER BY order_id") == [
+        ("O1", "online", "Web"), ("O2", "Shop", "Shop"), ("O3", "online", "Web"),
+    ]
+    assert _query(out, "SELECT order_id, customer_group, customer_group_raw FROM lines ORDER BY order_id") == [
+        ("O1", "retail", "Regular"), ("O2", "retail", "Regular"), ("O3", "Gold", "Gold"),
+    ]
+    assert _query(out, "SELECT order_id, category, category_raw FROM lines ORDER BY order_id") == [
+        ("O1", "beverage", "Drinks"), ("O2", "beverage", "Drinks"), ("O3", "Dairy", "Dairy"),
+    ]
+    # orders: payment 2 + channel 2 + group 2; lines: payment 2 + channel 2 + group 2 + category 2
+    assert _stats(out)["values_regrouped"] == 14
+
+
+def test_unknown_value_group_role_is_rejected(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (SALES_LINE_COLUMNS, [("O1", "2026-03-01", "tea", "100")])}
+    with pytest.raises(ValueError):
+        _run_with(tmp_path, specs, [_record(SALES_LINE_COLUMNS, "sales", SALES_LINE_ROLES)],
+                  value_groups={"colour": {"red": "blue"}})

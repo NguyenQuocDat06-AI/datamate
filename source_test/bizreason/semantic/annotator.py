@@ -13,13 +13,16 @@ import re
 import sqlite3
 import tempfile
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 from bizreason.contracts import BusinessContext, ColumnMeta, TableMeta
 from bizreason.llm import LanguageModel
-from bizreason.semantic.layer import CANONICAL_STATUS, LINE_KINDS, annotations_by_signature, effective_roles
+from bizreason.semantic.layer import CANONICAL_STATUS, LINE_KINDS, annotations_by_signature, effective_roles, _load_catalog_keys
+from bizreason.semantic.vocabulary import PAYMENT_CANONICAL
 from bizreason.utils import normalize_lookup, quote_identifier as q
 
 KINDS = {
@@ -134,6 +137,10 @@ LINE_NAME_KINDS = {
     "service_fee": "a service charge added to the bill",
 }
 LINE_NAME_BATCH = 120
+# Value grouping: roles whose distinct values the model groups by spelling, and the largest list sent per call.
+GROUPED_ROLES = ("channel", "customer_group", "product_category", "unit", "base_unit")
+VALUE_ROLES = ("payment_method",) + GROUPED_ROLES
+VALUE_GROUP_BATCH = 120
 # Table kind implied by the grain ingestion measured from the data. Used when the kind call fails or answers "other".
 GRAIN_KIND = {
     "order_line": "sales",
@@ -239,6 +246,80 @@ def order_status_values(context: BusinessContext, records: list[dict[str, Any]])
     return sorted(value for value in found if value not in CANONICAL_STATUS)
 
 
+def _value_counts(context: BusinessContext, records: list[dict[str, Any]]) -> dict[str, Counter]:
+    """Count of each distinct value of every VALUE_ROLES column, over all tables with an annotation.
+
+    effective_roles picks one column per role per table. A NULL stored value is read from __raw_json, as
+    order_status_values does.
+    """
+    notes = annotations_by_signature(records)
+    found: dict[str, Counter] = {role: Counter() for role in VALUE_ROLES}
+    # effective_roles reads evidence through the "source" schema, the same layout layer.build uses.
+    con = sqlite3.connect(":memory:", uri=True)
+    con.execute("ATTACH DATABASE ? AS source", (f"file:{context.database}?mode=ro",))
+    con.execute("CREATE TEMP TABLE catalog_ids (role TEXT, id TEXT, name TEXT)")
+    for table in context.tables:
+        note = notes.get(tuple(c.name for c in table.columns))
+        if note is not None and "kind" in note:
+            _load_catalog_keys(con, table, note["kind"], effective_roles(table, note))
+    try:
+        for table in context.tables:
+            note = notes.get(tuple(c.name for c in table.columns))
+            if note is None:
+                continue
+            roles = effective_roles(table, note, con)
+            names = [c.name for c in table.columns]
+            for role in VALUE_ROLES:
+                column = roles.get(role)
+                if not column:
+                    continue
+                position = names.index(column)
+                rows = con.execute(
+                    "SELECT value, COUNT(*) FROM (SELECT COALESCE("
+                    f"NULLIF(TRIM(CAST({q(column)} AS TEXT)),''), "
+                    f"NULLIF(TRIM(CAST(json_extract({q('__raw_json')}, '$[{position}]') AS TEXT)),'')) AS value "
+                    f"FROM source.{q(table.name)}) WHERE value IS NOT NULL GROUP BY value"
+                ).fetchall()
+                for value, count in rows:
+                    found[role][value] += count
+    finally:
+        con.close()
+    return found
+
+
+def _changed_only(maps: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    changed = {
+        role: {raw: canonical for raw, canonical in mapping.items() if raw != canonical}
+        for role, mapping in maps.items()
+    }
+    return {role: entries for role, entries in changed.items() if entries}
+
+
+def _unit_key(value: str) -> str:
+    """Values with the same normalized form are one unit; a value that normalizes to nothing is its own unit."""
+    return normalize_lookup(value) or value
+
+
+def _canonical(members: list[str], counts: dict[str, int]) -> str:
+    """The most frequent spelling, then the shortest, then the first in sort order."""
+    return min(members, key=lambda value: (-counts.get(value, 0), len(value), value))
+
+
+def _is_subsequence(short: str, long: str) -> bool:
+    remaining = iter(long)
+    return all(char in remaining for char in short)
+
+
+def _compatible(first: str, second: str) -> bool:
+    """Two values may share a group when their normalized forms share a word, or one is an abbreviation of the
+    other (its letters appear in order in the other, at least two of them)."""
+    a, b = normalize_lookup(first), normalize_lookup(second)
+    if set(a.split()) & set(b.split()):
+        return True
+    short, long = sorted((a.replace(" ", ""), b.replace(" ", "")), key=len)
+    return len(short) >= 2 and _is_subsequence(short, long)
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
@@ -341,6 +422,121 @@ class Annotator:
             return {}
         classified = self.classify_line_names(list(unlisted.values()))
         return {normalize_lookup(name): kind for name, kind in classified.items()}
+
+    def group_values(self, role: str, values: list[str], counts: dict[str, int] | None = None) -> dict[str, str]:
+        """Canonical spelling for each distinct value of one role. {} when a model call fails.
+
+        payment_method: each value maps to a PAYMENT_CANONICAL key; unknown or invalid answers are dropped.
+        Grouped roles: every value maps to the canonical spelling of its group (the most frequent by counts, then
+        the shortest). A value the model leaves out stays alone. A group whose members are not compatible is split.
+        """
+        if role != "payment_method" and role not in GROUPED_ROLES:
+            raise ValueError(f"no value grouping for role {role!r}")
+        distinct = list(dict.fromkeys(values))
+        if not distinct:
+            return {}
+        counts = counts or {}
+        try:
+            if role == "payment_method":
+                return self._map_payment(distinct)
+            units: dict[str, list[str]] = {}
+            for value in distinct:
+                units.setdefault(_unit_key(value), []).append(value)
+            members_of = {_canonical(members, counts): members for members in units.values()}
+            reps = list(members_of)
+            if len(reps) < 2:
+                groups = [[rep] for rep in reps]
+            else:
+                groups = []
+                for start in range(0, len(reps), VALUE_GROUP_BATCH):
+                    groups.extend(self._ask_groups(role, reps[start:start + VALUE_GROUP_BATCH]))
+            result: dict[str, str] = {}
+            for group in groups:
+                members = [value for rep in group for value in members_of[rep]]
+                canonical = _canonical(members, counts)
+                result.update({value: canonical for value in members})
+            return result
+        except Exception:
+            return {}
+
+    def _map_payment(self, values: list[str]) -> dict[str, str]:
+        system = (
+            "Classify each payment method of a shop's orders into exactly one key, or unknown when no key fits. "
+            "Reply with JSON only: one object mapping each input value to a key.\n"
+            + _role_list({**PAYMENT_CANONICAL, "unknown": "no key fits"})
+        )
+        result: dict[str, str] = {}
+        for start in range(0, len(values), VALUE_GROUP_BATCH):
+            batch = values[start:start + VALUE_GROUP_BATCH]
+            reply = self.model.generate_json(system, "Values:\n" + json.dumps(batch, ensure_ascii=False),
+                                             timeout=self.timeout)
+            if not isinstance(reply, dict):
+                raise TypeError("payment reply is not a JSON object")
+            result.update({
+                value: reply[value]
+                for value in batch
+                if isinstance(reply.get(value), str) and reply[value] in PAYMENT_CANONICAL
+            })
+        return result
+
+    def _ask_groups(self, role: str, reps: list[str]) -> list[list[str]]:
+        """Partition of reps into groups for one call. Raises when the reply is malformed.
+
+        Each rep appears in exactly one group; reps the model left out become singletons; a group with an
+        incompatible pair is split into singletons.
+        """
+        system = (
+            f"Group the distinct values of one field ({role}) of a shop's data. Put values in one group only when "
+            "they are the same name written differently: spelling, accents, case, spacing, or an abbreviation of "
+            "the same name. Different names stay apart, even when they look similar. Each value appears in at most "
+            'one group. Reply with JSON only: {"groups": [[value, value, ...], ...]}'
+        )
+        reply = self.model.generate_json(system, "Values:\n" + json.dumps(reps, ensure_ascii=False),
+                                         timeout=self.timeout)
+        if not isinstance(reply, dict) or not isinstance(reply.get("groups"), list):
+            raise TypeError("grouping reply has no groups list")
+        allowed = set(reps)
+        placed: set[str] = set()
+        groups: list[list[str]] = []
+        for raw_group in reply["groups"]:
+            if not isinstance(raw_group, list):
+                continue
+            group: list[str] = []
+            for value in raw_group:
+                if isinstance(value, str) and value in allowed and value not in placed:
+                    placed.add(value)
+                    group.append(value)
+            if group:
+                groups.append(group)
+        groups.extend([rep] for rep in reps if rep not in placed)
+        checked: list[list[str]] = []
+        for group in groups:
+            if len(group) > 1 and not all(_compatible(a, b) for a, b in combinations(group, 2)):
+                checked.extend([value] for value in group)
+            else:
+                checked.append(group)
+        return checked
+
+    def _group_context(self, context: BusinessContext, records: list[dict[str, Any]]) -> tuple[dict[str, dict[str, str]], bool]:
+        """Full value map of every role with at least two distinct values, and whether any role's call failed."""
+        counts = _value_counts(context, records)
+        maps: dict[str, dict[str, str]] = {}
+        failed = False
+        for role in VALUE_ROLES:
+            counter = counts[role]
+            if len(counter) < 2:
+                continue
+            mapping = self.group_values(role, list(counter), dict(counter))
+            if mapping:
+                maps[role] = mapping
+            else:
+                failed = True
+        return maps, failed
+
+    def annotate_value_groups(self, context: BusinessContext, records: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+        """{role: {raw value: canonical}} for the entries that change a value, per role that has any."""
+        maps, _ = self._group_context(context, records)
+        return _changed_only(maps)
 
     def _ask_roles(self, doc: str, columns: list[ColumnMeta], roles: dict[str, str]) -> dict[str, str]:
         """One role call for the given columns; roles outside the scope become "other"."""
@@ -463,3 +659,24 @@ def load_status_map(annotator: Annotator, context: BusinessContext, records: lis
         return status_map  # a transient model failure must not persist
     _write_json_atomic(cache_path, {"revision": context.revision, "status_map": status_map})
     return status_map
+
+
+def load_value_groups(annotator: Annotator, context: BusinessContext, records: list[dict[str, Any]],
+                      cache_path: Path) -> dict[str, dict[str, str]]:
+    """Return the cached value groups when they match context.revision; otherwise group the values and cache them.
+
+    Any role whose model call failed makes the result a failure: it is returned but not cached.
+    """
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cached = None
+    if isinstance(cached, dict) and cached.get("revision") == context.revision and isinstance(cached.get("value_groups"), dict):
+        return cached["value_groups"]
+
+    maps, failed = annotator._group_context(context, records)
+    value_groups = _changed_only(maps)
+    if failed:
+        return value_groups  # a transient model failure must not persist
+    _write_json_atomic(cache_path, {"revision": context.revision, "value_groups": value_groups})
+    return value_groups

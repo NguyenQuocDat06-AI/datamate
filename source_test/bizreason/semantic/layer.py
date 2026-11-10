@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import re
 import sqlite3
+import unicodedata
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
@@ -70,8 +71,25 @@ FUZZY_KEY_RATIO = 0.85  # minimum difflib ratio for an annotation key to name a 
 BUILD_STAT_KEYS = (
     "qty_cells_nonblank", "qty_cells_unparsed", "money_cells_nonblank", "money_cells_unparsed",
     "product_rows_without_order", "annotation_keys_unresolved", "tables_skipped_missing_order_id",
-    "status_unmapped_values",
+    "status_unmapped_values", "subtotal_rows_removed", "combined_items_split", "combined_items_unsplit",
+    "values_regrouped", "scaled_tables",
 )
+SUBTOTAL_TOLERANCE = 1  # a subtotal row's amount may differ from the sum of its run by at most this many units
+COMBINED_SEPARATOR = " + "  # one sales cell naming an item and its toppings (rulebook section 6)
+COMBINED_TOPPING_WORD = re.compile(r"\b(?:toppings?|them)\b")  # ASCII-folded words for a topping
+TOPPING_PART = re.compile(r"\s*(?:(\d+)\s+)?(.*?)\s*(?:\(\s*(\d[\d.,]*)\s*\))?\s*")  # [count] name [(price)]
+SENTENCE_END = re.compile(r"[.!?;\n]")
+AMOUNT_SCALE_CODE = "AMOUNT_SCALE"  # ingestion diagnostic: a sheet's money is in units of the message's integer
+# value group role -> the (table, field) canonical columns it regroups; the original is kept as <field>_raw for these
+VALUE_GROUP_FIELDS = {
+    "payment_method": (("orders", "payment_method"), ("lines", "payment_method")),
+    "channel": (("orders", "channel"), ("lines", "channel")),
+    "customer_group": (("orders", "customer_group"), ("lines", "customer_group")),
+    "product_category": (("lines", "category"),),
+    "unit": (("lines", "unit"),),
+    "base_unit": (("lines", "base_unit"),),
+}
+VALUE_GROUP_KEEPS_RAW = ("payment_method", "channel", "customer_group", "category")
 
 _CURRENCY = "(?:" + "|".join(re.escape(suffix) for suffix in CURRENCY_SUFFIXES) + ")?"
 COMMA_GROUPED = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+\s*" + _CURRENCY, re.IGNORECASE)
@@ -282,40 +300,59 @@ def _source_columns(dst: sqlite3.Connection, table: TableMeta) -> list[str]:
     return [row[0] for row in dst.execute("SELECT name FROM pragma_table_info(?, 'source')", (table.name,))]
 
 
-def _order_source(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], report: dict[str, Any],
-                  stats: Counter) -> str:
-    """Copy a sales table with an order column to temp.order_source, ready to load.
+def _sales_source(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], report: dict[str, Any],
+                  stats: Counter) -> str | None:
+    """Copy a sales table to temp.order_source, ready to load, or return None when it loads as it is.
 
-    Rows identical in every source cell are one export error and keep only their first copy. A row whose order
-    id is blank is never a duplicate of another, so it is kept. A product row with no order id then takes the
-    order-level values of the nearest order above it, in source-row order (blank cells only, as ingestion does).
-    A product row with no order above it stays an orphan and is counted.
+    Rows identical in every source cell are one export error and keep only their first copy (order tables only).
+    A row whose order id is blank is never a duplicate of another, so it is kept.
+    A subtotal row (see _subtotal_rows) is removed. It also closes its group: a product row after it takes no
+    order-level values from above it.
+    A product row with no order id takes the order-level values of the nearest order above it, in source-row order
+    (blank cells only, as ingestion does), and any order id change starts a new group. A product row with no order
+    above it, or after a subtotal, stays an orphan and is counted.
     """
-    order_column = roles["order_id"]
-    columns = _source_columns(dst, table)
-    group = ",".join(q(column) for column in columns if not column.startswith("__"))
-    keep = (f"{_text(order_column)} IS NULL OR src.rowid IN "
-            f"(SELECT MIN(rowid) FROM source.{q(table.name)} GROUP BY {group})")
+    order_column = roles.get("order_id")
+    amount_column = roles.get("line_amount")
+    if not order_column and not amount_column:
+        return None  # nothing to remove or fill: the table loads as it is
     dst.execute("DROP TABLE IF EXISTS temp.order_source")
+    if order_column:
+        columns = _source_columns(dst, table)
+        group = ",".join(q(column) for column in columns if not column.startswith("__"))
+        keep = (f"{_text(order_column)} IS NULL OR src.rowid IN "
+                f"(SELECT MIN(rowid) FROM source.{q(table.name)} GROUP BY {group})")
+    else:
+        keep = "1"
     dst.execute(f"CREATE TEMP TABLE order_source AS SELECT src.rowid AS __rid, src.* FROM source.{q(table.name)} "
                 f"AS src WHERE {keep}")
-    total = dst.execute(f"SELECT COUNT(*) FROM source.{q(table.name)}").fetchone()[0]
-    kept = dst.execute("SELECT COUNT(*) FROM temp.order_source").fetchone()[0]
-    report["duplicate_lines_removed"] += total - kept
+    if order_column:
+        total = dst.execute(f"SELECT COUNT(*) FROM source.{q(table.name)}").fetchone()[0]
+        kept = dst.execute("SELECT COUNT(*) FROM temp.order_source").fetchone()[0]
+        report["duplicate_lines_removed"] += total - kept
 
-    fill = [order_column] + [roles[role] for role in ORDER_ROLES if role != "order_id" and roles.get(role)]
-    fill = list(dict.fromkeys(fill))
     product = [roles[role] for role in ("product_name", "product_id") if roles.get(role)]
+    fill = []
+    if order_column:
+        fill = [order_column] + [roles[role] for role in ORDER_ROLES if role != "order_id" and roles.get(role)]
+        fill = list(dict.fromkeys(fill))
+    locale = _column_locale(dst, table, amount_column) if amount_column else None
     cursor = dst.execute("SELECT * FROM temp.order_source ORDER BY __source_row, __rid")
     names = [description[0] for description in cursor.description]
-    rows = cursor.fetchall()
+    rows = [dict(zip(names, record)) for record in cursor.fetchall()]
+    subtotals = _subtotal_rows(rows, product, amount_column, locale)
+
     carried: dict[str, Any] | None = None
     updates: list[tuple[Any, ...]] = []
     orphans = 0
-    for record in rows:
-        values = dict(zip(names, record))
+    for values in rows:
+        if values["__rid"] in subtotals:
+            carried = None  # a subtotal closes the group above it
+            continue
+        if not order_column:
+            continue
         if not blank(values[order_column]):
-            carried = {column: values[column] for column in fill}
+            carried = {column: values[column] for column in fill}  # an order id starts its own group
             continue
         if not any(not blank(values[column]) for column in product):
             continue
@@ -327,15 +364,47 @@ def _order_source(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, st
     if updates:
         assignments = ",".join(f"{q(column)}=?" for column in fill)
         dst.executemany(f"UPDATE temp.order_source SET {assignments} WHERE __rid=?", updates)
+    if subtotals:
+        dst.executemany("DELETE FROM temp.order_source WHERE __rid=?", [(rid,) for rid in subtotals])
+    stats["subtotal_rows_removed"] += len(subtotals)
     stats["product_rows_without_order"] += orphans
     return "temp.order_source"
+
+
+def _subtotal_rows(rows: list[dict[str, Any]], product: list[str], amount_column: str | None,
+                   locale: str | None) -> set[Any]:
+    """The __rid of each subtotal row, in source-row order.
+
+    A subtotal has no product (every product cell blank) and an amount within SUBTOTAL_TOLERANCE of the sum of the
+    product rows since the previous subtotal or the table start. A run holding a product row whose amount does not
+    read is never matched. A product row is never a subtotal, whatever its amount.
+    """
+    if not amount_column:
+        return set()
+    found: set[Any] = set()
+    run_sum, run_count, run_known = 0.0, 0, True
+    for values in rows:
+        amount = _number(values[amount_column], locale or "unknown")
+        if any(not blank(values[column]) for column in product):
+            run_count += 1
+            if amount is None:
+                run_known = False
+            else:
+                run_sum += amount
+        elif (amount is not None and run_count and run_known
+              and abs(amount - run_sum) <= SUBTOTAL_TOLERANCE):
+            found.add(values["__rid"])
+            run_sum, run_count, run_known = 0.0, 0, True
+    return found
 
 
 def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[str, str],
             texts: dict[str, str], numbers: dict[str, str], synthetic_prefix: str | None = None, *,
             origin: str | None = None, report: dict[str, Any] | None = None,
-            defaults: dict[str, str] | None = None, stats: Counter | None = None) -> int:
-    """Insert rows of a source table (or of origin, a prepared copy of it) into target."""
+            defaults: dict[str, str] | None = None, stats: Counter | None = None, scale: int = 1) -> int:
+    """Insert rows of a source table (or of origin, a prepared copy of it) into target.
+
+    scale multiplies the table's money fields (every numeric field that is not a quantity)."""
     source = origin or f"source.{q(table.name)}"
     names, exprs = [], []
     counted: set[tuple[str, str]] = set()
@@ -370,7 +439,10 @@ def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[
         locale = _column_locale(dst, table, column)
         if locale and report is not None:
             report["columns_with_locale_inferred"] += 1
-        exprs.append(f"{_parse_fn(field, locale)}(src.{q(column)})")
+        expr = f"{_parse_fn(field, locale)}(src.{q(column)})"
+        if scale != 1 and field not in QUANTITY_FIELDS:
+            expr = f"{expr}*{int(scale)}"
+        exprs.append(expr)
         if stats is not None:
             _count_cells(dst, source, field, column, locale, stats, counted)
     cursor = dst.execute(
@@ -397,22 +469,115 @@ def _count_cells(dst: sqlite3.Connection, source: str, field: str, column: str, 
 
 def _load_lines(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str],
                 synthetic_prefix: str, has_product: int, report: dict[str, Any], stats: Counter, *,
-                origin: str | None = None, defaults: dict[str, str] | None = None) -> int:
+                origin: str | None = None, defaults: dict[str, str] | None = None, scale: int = 1) -> int:
     rows = _insert(dst, "raw_lines", table, roles, LINE_FIELDS, LINE_NUMBERS, synthetic_prefix,
-                   origin=origin, report=report, defaults=defaults, stats=stats)
+                   origin=origin, report=report, defaults=defaults, stats=stats, scale=scale)
     dst.execute("UPDATE raw_lines SET has_product=? WHERE has_product IS NULL", (has_product,))
     return rows
 
 
 def _load_sales(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], synthetic: str,
-                has_product: int, report: dict[str, Any], stats: Counter) -> None:
-    """A sales table's lines. With an order column, the rows are first copied and ordered (see _order_source)."""
-    if not roles.get("order_id"):
-        _load_lines(dst, table, roles, synthetic, has_product, report, stats)
-        return
-    origin = _order_source(dst, table, roles, report, stats)
-    _load_lines(dst, table, roles, synthetic, has_product, report, stats, origin=origin)
-    dst.execute("DROP TABLE temp.order_source")
+                has_product: int, report: dict[str, Any], stats: Counter, *, scale: int = 1,
+                combined: bool = False) -> None:
+    """A sales table's lines. Rows are first copied and cleaned when needed (see _sales_source). With combined,
+    a line whose product cell joins an item and its toppings is split (see _split_combined)."""
+    start = dst.execute("SELECT COALESCE(MAX(rowid), 0) FROM raw_lines").fetchone()[0]
+    origin = _sales_source(dst, table, roles, report, stats)
+    _load_lines(dst, table, roles, synthetic, has_product, report, stats, origin=origin, scale=scale)
+    if origin:
+        dst.execute("DROP TABLE temp.order_source")
+    if combined:
+        _split_combined(dst, start, scale, stats)
+
+
+def _split_combined(dst: sqlite3.Connection, start: int, scale: int, stats: Counter) -> None:
+    """Split the sales lines loaded after rowid start whose product cell has the separator (rulebook section 6).
+
+    Each topping becomes its own line with the same order id: quantity is its count times the line quantity, and
+    its amount is its price times that quantity. The main item keeps the remaining amount. A line is split only
+    when every topping has a price, the line has a quantity and an amount, and the remaining amount is not negative;
+    otherwise it stays whole and is counted as unsplit.
+    """
+    columns = [row[1] for row in dst.execute("PRAGMA table_info(raw_lines)")]
+    cursor = dst.execute(
+        "SELECT rowid AS __rid, * FROM raw_lines WHERE rowid > ? AND has_product = 1 "
+        "AND instr(product_name, ?) > 0 ORDER BY rowid",
+        (start, COMBINED_SEPARATOR),
+    )
+    names = [description[0] for description in cursor.description]
+    for record in cursor.fetchall():
+        line = dict(zip(names, record))
+        split = _combined_parts(line, scale)
+        if split is None:
+            stats["combined_items_unsplit"] += 1
+            continue
+        main_name, main_amount, toppings = split
+        dst.execute("UPDATE raw_lines SET product_name=?, line_amount=? WHERE rowid=?",
+                    (main_name, main_amount, line["__rid"]))
+        for label, quantity, amount, price in toppings:
+            row = {column: line[column] for column in columns}
+            row.update(product_name=label, product_id=None, qty=quantity, qty_base=None, line_amount=amount,
+                       unit_price=price, line_discount=None, line_cost=None, category=None, line_kind=None,
+                       has_product=1)
+            dst.execute(f"INSERT INTO raw_lines ({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
+                        [row[column] for column in columns])
+        stats["combined_items_split"] += 1
+
+
+def _combined_parts(line: dict[str, Any], scale: int) -> tuple[str, float, list[tuple[str, float, float, float]]] | None:
+    """The main item's name and amount, and each topping as (name, quantity, amount, unit price); None when the
+    line must stay whole."""
+    pieces = line["product_name"].split(COMBINED_SEPARATOR)
+    main = pieces[0].strip()
+    qty, amount = line["qty"], line["line_amount"]
+    if amount is None and qty is not None and line["unit_price"] is not None:
+        amount = qty * line["unit_price"] - (line["line_discount"] or 0)
+    if not main or qty is None or amount is None:
+        return None
+    toppings = []
+    for piece in pieces[1:]:
+        match = TOPPING_PART.fullmatch(piece)
+        if match is None or not match[2].strip() or match[3] is None:
+            return None  # no price, or no name
+        price = _number(match[3], "unknown")
+        if price is None:
+            return None
+        count = int(match[1]) if match[1] else 1
+        price *= scale  # the price is in the sheet's money units, as the line amount is
+        quantity = count * qty
+        toppings.append((match[2].strip(), quantity, price * quantity, price))
+    remainder = amount - sum(topping_amount for _, _, topping_amount, _ in toppings)
+    if remainder < 0:
+        return None  # the prices do not fit inside the line amount
+    return main, remainder, toppings
+
+
+def _combined_convention(readme: str) -> bool:
+    """True when the README states in one sentence that a plus sign joins an item to its toppings.
+
+    The check runs on an ASCII-folded copy: lower case, combining marks removed, other non-ASCII characters dropped."""
+    folded = unicodedata.normalize("NFKD", readme.lower())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    folded = folded.encode("ascii", "ignore").decode("ascii")
+    return any("+" in sentence and COMBINED_TOPPING_WORD.search(sentence)
+               for sentence in SENTENCE_END.split(folded))
+
+
+def _amount_scale(context: BusinessContext, table: TableMeta) -> int:
+    """The integer an AMOUNT_SCALE ingestion diagnostic gives for this sheet (its source path and table), or 1.
+
+    Two different factors for one sheet are a conflict, and nothing is scaled."""
+    paths = {source.path for source in table.sources}
+    factors = set()
+    for item in context.diagnostics:
+        if item.code != AMOUNT_SCALE_CODE or item.source is None:
+            continue
+        if item.source.table != table.name or item.source.path not in paths:
+            continue
+        text = item.message.strip()
+        if re.fullmatch(r"[1-9]\d*", text):
+            factors.add(int(text))
+    return factors.pop() if len(factors) == 1 else 1
 
 
 def _load_returns(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> None:
@@ -661,6 +826,30 @@ def _map_status(dst: sqlite3.Connection, status_map: dict[str, str], stats: Coun
     return mapped
 
 
+def _regroup_values(dst: sqlite3.Connection, value_groups: dict[str, dict[str, str]]) -> int:
+    """Rewrite each grouped field through its value group, on orders and lines. Values are matched after lookup
+    normalization. Where a field is kept raw, its original text goes to <field>_raw first.
+
+    Returns the number of order and line rows whose value changed.
+    """
+    changed = 0
+    for role, mapping in value_groups.items():
+        target = {normalize_lookup(raw): canonical for raw, canonical in mapping.items()}
+        for table, field in VALUE_GROUP_FIELDS[role]:
+            if field in VALUE_GROUP_KEEPS_RAW:
+                dst.execute(f"ALTER TABLE {table} ADD COLUMN {field}_raw")
+                dst.execute(f"UPDATE {table} SET {field}_raw={field}")
+            rows = dst.execute(f"SELECT rowid, {field} FROM {table}").fetchall()
+            updates = []
+            for rowid, value in rows:
+                canonical = target.get(normalize_lookup(value)) if value is not None else None
+                if canonical is not None and canonical != value:
+                    updates.append((canonical, rowid))
+            dst.executemany(f"UPDATE {table} SET {field}=? WHERE rowid=?", updates)
+            changed += len(updates)
+    return changed
+
+
 def _register(con: sqlite3.Connection) -> None:
     con.create_function("to_number", 1, to_number)
     con.create_function("to_number_en", 1, lambda v: _number(v, "en"))
@@ -675,13 +864,21 @@ def _register(con: sqlite3.Connection) -> None:
 
 
 def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
-          status_map: dict[str, str] | None = None, line_kinds: dict[str, str] | None = None) -> dict[str, Any]:
-    """line_kinds maps a product name (normalized by normalize_lookup) to a LINE_ITEM_KINDS value."""
+          status_map: dict[str, str] | None = None, line_kinds: dict[str, str] | None = None,
+          value_groups: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
+    """line_kinds maps a product name (normalized by normalize_lookup) to a LINE_ITEM_KINDS value.
+
+    value_groups maps a role (a key of VALUE_GROUP_FIELDS) to {raw value: canonical value}.
+    """
     pairs: list[tuple[str, str]] = []
     for name, kind in (line_kinds or {}).items():
         if kind not in LINE_ITEM_KINDS:
             raise ValueError(f"unknown line kind {kind!r}; expected one of {LINE_ITEM_KINDS}")
         pairs.append((normalize_lookup(name), kind))
+    for role in value_groups or {}:
+        if role not in VALUE_GROUP_FIELDS:
+            raise ValueError(f"unknown value group {role!r}; expected one of {tuple(VALUE_GROUP_FIELDS)}")
+    combined = _combined_convention(context.readme)
     notes = annotations_by_signature(records)
     path.unlink(missing_ok=True)
     dst = sqlite3.connect(path)
@@ -723,21 +920,26 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
         _load_catalog_keys(dst, table, note["kind"], effective_roles(table, note))
     for table, note in annotated:
         unresolved = _given_by_column(table, note.get("roles") or {})[1]
-        stats["annotation_keys_unresolved"] += sum(role in COUNTED_ROLES for role in unresolved)
         roles = effective_roles(table, note, dst)
+        # Only a role that stayed missing after every fallback can break the table.
+        stats["annotation_keys_unresolved"] += sum(role in COUNTED_ROLES and not roles.get(role) for role in unresolved)
         if not roles.get("employee_id") and roles.get("employee_name"):
             roles["employee_id"] = roles["employee_name"]
         synthetic = f"{table.name}:"  # order id prefix for rows that have no order column
+        # an order column that was named but matches no column, on a table with order-level columns: the
+        # rows cannot be tied to their orders, so synthetic per-row orders would only break payment links
+        lost_order = note["kind"] == "sales" and "order_id" in unresolved and not roles.get("order_id") and any(
+            roles.get(role) for role in ORDER_SIGNAL_ROLES)
+        if lost_order:
+            stats["tables_skipped_missing_order_id"] += 1
+            continue
+        scale = _amount_scale(context, table)
+        if scale != 1:
+            stats["scaled_tables"] += 1
         if note["kind"] == "sales":
-            # an order column that was named but matches no column, on a table with order-level columns: the
-            # rows cannot be tied to their orders, so synthetic per-row orders would only break payment links
-            lost_order = "order_id" in unresolved and not roles.get("order_id") and any(
-                roles.get(role) for role in ORDER_SIGNAL_ROLES)
-            if lost_order:
-                stats["tables_skipped_missing_order_id"] += 1
-                continue
             product = roles.get("product_name") or roles.get("product_id")
-            _load_sales(dst, table, roles, synthetic, 1 if product else 0, report, stats)
+            _load_sales(dst, table, roles, synthetic, 1 if product else 0, report, stats, scale=scale,
+                        combined=combined)
             report["sales_tables"] += 1
         elif note["kind"] == "service_ticket":
             # one row per visit: the ticket is the order, its amount is the line, the work done is the product
@@ -752,15 +954,17 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             # only a ledger with neither a status nor a note column is completed by default
             status_defaulted = "order_status" not in ticket and not (ticket.get("order_note") or ticket.get("note"))
             rows = _load_lines(dst, table, ticket, synthetic, 1, report, stats,
-                               defaults={"status": "completed"} if status_defaulted else None)
+                               defaults={"status": "completed"} if status_defaulted else None, scale=scale)
             if status_defaulted:
                 report["tickets_defaulted_completed"] += rows
             report["service_tables"] += 1
         elif note["kind"] == "purchase" and (roles.get("purchase_id") or roles.get("purchased_at")):
-            _insert(dst, "purchases", table, roles, PURCHASE_FIELDS, PURCHASE_NUMBERS, report=report, stats=stats)
+            _insert(dst, "purchases", table, roles, PURCHASE_FIELDS, PURCHASE_NUMBERS, report=report, stats=stats,
+                    scale=scale)
             report["purchase_tables"] += 1
         elif note["kind"] == "payment" and (roles.get("order_id") or roles.get("paid_at")):
-            _insert(dst, "payments", table, roles, PAYMENT_FIELDS, PAYMENT_NUMBERS, report=report, stats=stats)
+            _insert(dst, "payments", table, roles, PAYMENT_FIELDS, PAYMENT_NUMBERS, report=report, stats=stats,
+                    scale=scale)
         elif note["kind"] == "delivery" and (roles.get("order_id") or roles.get("delivered_at")):
             _insert(dst, "deliveries", table, roles, DELIVERY_FIELDS, DELIVERY_NUMBERS, report=report, stats=stats)
         elif note["kind"] == "sales_return":
@@ -782,6 +986,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["status_mapped"] = _map_status(dst, status_map or {}, stats)
     report["qty_base_derived"] = _derive_qty_base(dst)
     _derive(dst)
+    stats["values_regrouped"] = _regroup_values(dst, value_groups or {})
     report["orders_marked_returned"] = _mark_returned(dst)
     _write_shop_facts(dst, context)
     dst.executemany("INSERT INTO build_stats VALUES (?,?)", [(key, stats[key]) for key in BUILD_STAT_KEYS])

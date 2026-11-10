@@ -14,10 +14,12 @@ from bizreason.semantic.annotator import (
     group_tables,
     load_or_annotate,
     load_status_map,
+    load_value_groups,
     needs_reannotation,
     order_status_values,
     relevant_readme,
 )
+from bizreason.semantic.vocabulary import PAYMENT_CANONICAL
 from bizreason.utils import normalize_lookup
 
 
@@ -695,3 +697,220 @@ def test_annotate_status_maps_a_recovered_original(tmp_path: Path) -> None:
     result = Annotator(model, workers=1).annotate_status(context, records)
 
     assert result == {"Bom hang": "cancelled"}
+
+
+class ValueModel:
+    """Answers each call with handler(system, prompt); records every call."""
+
+    def __init__(self, handler: Any) -> None:
+        self.handler = handler
+        self.calls: list[tuple[str, str]] = []
+        self.usage = None
+
+    def generate_json(self, system: str, prompt: str, *, timeout: float) -> Any:
+        self.calls.append((system, prompt))
+        return self.handler(system, prompt)
+
+
+def _sent(prompt: str) -> list[str]:
+    return json.loads(prompt.split("Values:\n", 1)[1])
+
+
+def _raise(system: str, prompt: str) -> Any:
+    raise RuntimeError("down")
+
+
+def test_payment_mapping_keeps_known_keys_and_drops_unknown_and_invalid() -> None:
+    reply = {"Chuyển khoản": "transfer", "CK": "transfer", "Ví MoMo": "ewallet", "Lạ": "unknown",
+             "Thẻ": "maybe", "Ghost": "cash"}
+    model = ValueModel(lambda system, prompt: reply)
+
+    result = Annotator(model, workers=1).group_values("payment_method", ["Chuyển khoản", "CK", "Ví MoMo", "Lạ", "Thẻ"])
+
+    assert result == {"Chuyển khoản": "transfer", "CK": "transfer", "Ví MoMo": "ewallet"}
+    system, _ = model.calls[0]
+    for key, meaning in PAYMENT_CANONICAL.items():
+        assert f"- {key}: {meaning}" in system
+    assert "- unknown: no key fits" in system
+
+
+def test_grouping_picks_most_frequent_spelling_then_shortest() -> None:
+    model = ValueModel(lambda system, prompt: {"groups": [["Bán lẻ tại quầy", "Bán lẻ"]]})
+    values = ["Bán lẻ", "Bán lẻ tại quầy", "Bán sỉ"]
+
+    frequent = Annotator(model, workers=1).group_values(
+        "channel", values, {"Bán lẻ": 2, "Bán lẻ tại quầy": 5, "Bán sỉ": 1})
+    tied = Annotator(model, workers=1).group_values("channel", values, {"Bán lẻ": 3, "Bán lẻ tại quầy": 3})
+
+    assert frequent == {"Bán lẻ": "Bán lẻ tại quầy", "Bán lẻ tại quầy": "Bán lẻ tại quầy", "Bán sỉ": "Bán sỉ"}
+    assert tied["Bán lẻ"] == tied["Bán lẻ tại quầy"] == "Bán lẻ"
+
+
+def test_spelling_variants_of_one_name_are_one_unit_with_the_most_frequent_spelling() -> None:
+    model = ValueModel(lambda system, prompt: {"groups": []})
+
+    result = Annotator(model, workers=1).group_values("customer_group", ["Thân thiết", "thân thiết"],
+                                                      {"Thân thiết": 1, "thân thiết": 3})
+
+    assert result == {"Thân thiết": "thân thiết", "thân thiết": "thân thiết"}
+
+
+def test_abbreviation_group_is_kept_and_unrelated_group_is_split() -> None:
+    counts = {"Chuyển khoản": 1, "CK": 3, "Tiền mặt": 2}
+    kept = ValueModel(lambda system, prompt: {"groups": [["Chuyển khoản", "CK"]]})
+    split = ValueModel(lambda system, prompt: {"groups": [["Chuyển khoản", "CK", "Tiền mặt"]]})
+
+    assert Annotator(kept, workers=1).group_values("channel", ["Chuyển khoản", "CK"], counts) == {
+        "Chuyển khoản": "CK", "CK": "CK"}
+    values = ["Chuyển khoản", "CK", "Tiền mặt"]
+    assert Annotator(split, workers=1).group_values("channel", values, counts) == {v: v for v in values}
+
+
+def test_values_the_model_leaves_out_map_to_themselves_and_repeats_are_ignored() -> None:
+    model = ValueModel(lambda system, prompt: {"groups": [["Bán lẻ tại quầy", "Bán lẻ"], ["Bán lẻ", "Ma"]]})
+    values = ["Bán lẻ", "Bán lẻ tại quầy", "Bán sỉ", "Đại lý"]
+
+    result = Annotator(model, workers=1).group_values("channel", values)
+
+    assert result == {"Bán lẻ": "Bán lẻ", "Bán lẻ tại quầy": "Bán lẻ", "Bán sỉ": "Bán sỉ", "Đại lý": "Đại lý"}
+
+
+def test_long_lists_are_split_into_120_value_calls() -> None:
+    model = ValueModel(lambda system, prompt: {"groups": [[v] for v in _sent(prompt)]})
+    values = [f"item {i}" for i in range(250)]
+
+    result = Annotator(model, workers=1).group_values("unit", values)
+
+    assert [len(_sent(prompt)) for _, prompt in model.calls] == [120, 120, 10]
+    assert result == {v: v for v in values}
+
+
+def test_grouping_failure_returns_empty_for_every_role() -> None:
+    values = ["Bán lẻ", "Bán sỉ"]
+
+    assert Annotator(ValueModel(_raise), workers=1).group_values("channel", values) == {}
+    assert Annotator(ValueModel(_raise), workers=1).group_values("payment_method", ["CK", "Tiền mặt"]) == {}
+    assert Annotator(ValueModel(lambda s, p: ["not", "an", "object"]), workers=1).group_values("unit", values) == {}
+
+
+def test_unsupported_role_is_rejected() -> None:
+    model = ValueModel(lambda system, prompt: {})
+
+    try:
+        Annotator(model, workers=1).group_values("brand", ["a", "b"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
+    assert model.calls == []
+
+
+def _value_context(tmp_path: Path, rows: list[tuple[str | None, str | None, list[str | None]]],
+                   revision: str = "rev-1") -> tuple[BusinessContext, list[dict[str, Any]]]:
+    """A sales table with channel and unit columns. Rows are (stored channel, stored unit, original row)."""
+    database = tmp_path / "source.sqlite"
+    con = sqlite3.connect(database)
+    con.execute('CREATE TABLE "sales" ("channel" TEXT, "unit" TEXT, __source_row INTEGER, __raw_json TEXT)')
+    con.executemany(
+        'INSERT INTO "sales" VALUES (?, ?, ?, ?)',
+        [(channel, unit, number, json.dumps(raw)) for number, (channel, unit, raw) in enumerate(rows, start=1)],
+    )
+    con.commit()
+    con.close()
+    context = BusinessContext(
+        business_id="shop_a", revision=revision, database=database, readme="", manifest={},
+        tables=[_table("sales", ["channel", "unit"])],
+    )
+    return context, [{"columns": ["channel", "unit"], "kind": "sales",
+                      "roles": {"channel": "channel", "unit": "unit"}}]
+
+
+def _grouping_handler(channel_groups: list[list[str]]) -> Any:
+    def handler(system: str, prompt: str) -> dict[str, Any]:
+        if "(channel)" in system:
+            return {"groups": channel_groups}
+        return {"groups": [[v] for v in _sent(prompt)]}
+    return handler
+
+
+def test_annotate_value_groups_reads_raw_values_when_stored_is_null(tmp_path: Path) -> None:
+    context, records = _value_context(tmp_path, [
+        ("Bán lẻ", "cai", ["Bán lẻ", "cai"]),
+        (None, "cai", ["Bán lẻ tại quầy", "cai"]),
+        (None, "hop", ["Bán lẻ tại quầy", "hop"]),
+    ])
+    model = ValueModel(_grouping_handler([["Bán lẻ", "Bán lẻ tại quầy"]]))
+
+    result = Annotator(model, workers=1).annotate_value_groups(context, records)
+
+    assert result == {"channel": {"Bán lẻ": "Bán lẻ tại quầy"}}
+    channel_prompts = [prompt for system, prompt in model.calls if "(channel)" in system]
+    assert channel_prompts and "Bán lẻ tại quầy" in _sent(channel_prompts[0])
+
+
+def test_annotate_value_groups_skips_roles_with_fewer_than_two_values(tmp_path: Path) -> None:
+    context, records = _value_context(tmp_path, [("Bán lẻ", "cai", ["Bán lẻ", "cai"]),
+                                                 ("Bán lẻ", "cai", ["Bán lẻ", "cai"])])
+    model = ValueModel(_grouping_handler([]))
+
+    assert Annotator(model, workers=1).annotate_value_groups(context, records) == {}
+    assert model.calls == []
+
+
+def test_load_value_groups_cache_hit_skips_model(tmp_path: Path) -> None:
+    context, records = _value_context(tmp_path, [("Bán lẻ", "cai", ["Bán lẻ", "cai"]),
+                                                 (None, "hop", ["Bán lẻ tại quầy", "hop"])])
+    cache = tmp_path / "groups.json"
+    cache.write_text(json.dumps({"revision": "rev-1", "value_groups": {"channel": {"Bán lẻ": "cached"}}}),
+                     encoding="utf-8")
+    model = ValueModel(_grouping_handler([["Bán lẻ", "Bán lẻ tại quầy"]]))
+
+    result = load_value_groups(Annotator(model, workers=1), context, records, cache)
+
+    assert result == {"channel": {"Bán lẻ": "cached"}}
+    assert model.calls == []
+
+
+def test_load_value_groups_does_not_cache_failure_and_caches_success(tmp_path: Path) -> None:
+    context, records = _value_context(tmp_path, [("Bán lẻ", "cai", ["Bán lẻ", "cai"]),
+                                                 (None, "hop", ["Bán lẻ tại quầy", "hop"])])
+    cache = tmp_path / "groups.json"
+
+    failed = load_value_groups(Annotator(ValueModel(_raise), workers=1), context, records, cache)
+
+    assert failed == {}
+    assert not cache.exists()
+
+    recovered = load_value_groups(Annotator(ValueModel(_grouping_handler([["Bán lẻ", "Bán lẻ tại quầy"]])),
+                                            workers=1), context, records, cache)
+
+    # One row each, so the spellings tie and the shorter one wins.
+    assert recovered == {"channel": {"Bán lẻ tại quầy": "Bán lẻ"}}
+    assert json.loads(cache.read_text(encoding="utf-8")) == {"revision": "rev-1", "value_groups": recovered}
+
+
+def test_load_value_groups_caches_a_successful_run_with_no_changes(tmp_path: Path) -> None:
+    context, records = _value_context(tmp_path, [("Bán lẻ", "cai", ["Bán lẻ", "cai"]),
+                                                 ("Bán sỉ", "hop", ["Bán sỉ", "hop"])])
+    cache = tmp_path / "groups.json"
+
+    assert load_value_groups(Annotator(ValueModel(_grouping_handler([])), workers=1), context, records, cache) == {}
+    assert json.loads(cache.read_text(encoding="utf-8")) == {"revision": "rev-1", "value_groups": {}}
+
+    model = ValueModel(_raise)
+    assert load_value_groups(Annotator(model, workers=1), context, records, cache) == {}
+    assert model.calls == []
+
+
+def test_load_value_groups_with_another_revision_is_ignored_and_rewritten(tmp_path: Path) -> None:
+    context, records = _value_context(tmp_path, [("Bán lẻ", "cai", ["Bán lẻ", "cai"]),
+                                                 (None, "hop", ["Bán lẻ tại quầy", "hop"])])
+    cache = tmp_path / "groups.json"
+    cache.write_text(json.dumps({"revision": "rev-0", "value_groups": {"channel": {"Bán lẻ": "stale"}}}),
+                     encoding="utf-8")
+
+    result = load_value_groups(Annotator(ValueModel(_grouping_handler([["Bán lẻ", "Bán lẻ tại quầy"]])), workers=1),
+                               context, records, cache)
+
+    assert result == {"channel": {"Bán lẻ tại quầy": "Bán lẻ"}}
+    assert json.loads(cache.read_text(encoding="utf-8")) == {"revision": "rev-1", "value_groups": result}

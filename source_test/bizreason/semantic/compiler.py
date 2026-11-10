@@ -359,6 +359,9 @@ class Compiler:
         ordered = sorted(found)
         return f"customer_key IN ({','.join('?' for _ in ordered)})", ordered, False
 
+    def _columns(self, table: str) -> set[str]:
+        return {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+
     def resolve_filter(self, dim: str, text: str, on: str | None = None) -> tuple[str, list[Any], bool]:
         """Return a SQL predicate for a filter, or raise when the value is not in the data.
 
@@ -413,7 +416,21 @@ class Compiler:
         available = self.line_columns if line else self.order_columns
         if source not in available:
             raise Unsupported(f"{dim} unavailable")
-        matched = self._stored_matches(table, source, dim, needle, text)
+        raw = f"{source}_raw"
+        if raw in self._columns(table):
+            # Values were regrouped; a question may still use any spelling found in the source.
+            try:
+                matched = self._stored_matches(table, source, dim, needle, text)
+            except Unsupported:
+                spellings = self._stored_matches(table, raw, dim, needle, text)
+                slots = ",".join("?" for _ in spellings)
+                matched = [row[0] for row in self.db.execute(
+                    f"SELECT DISTINCT {source} FROM {table} WHERE {raw} IN ({slots}) AND {source} IS NOT NULL",
+                    list(spellings))]
+                if not matched:
+                    raise
+        else:
+            matched = self._stored_matches(table, source, dim, needle, text)
         return f"{source} IN ({','.join('?' for _ in matched)})", list(matched), line
 
     def _predicates(self, intent: Intent, skip: bool = False) -> tuple[list[str], list[Any], bool]:

@@ -86,6 +86,16 @@ CANCEL_TOKENS = ("huy", "cancel")
 # (cash on delivery, marketplace sales). Compared after lookup normalization, as whole words.
 DEBT_METHOD_TOKENS = ("ghi no", "debt")
 NON_DEBT_METHOD_TOKENS = ("cod", "giao hang thu tien", "san", "marketplace", "tmdt")
+# Rulebook §1 and §4: the payment methods a shop's wording is mapped onto. The only fixed category list; the
+# keys are English and the definitions say what each method means for a sale.
+PAYMENT_CANONICAL: dict[str, str] = {
+    "cash": "paid in cash when the order is placed",
+    "transfer": "paid by bank transfer",
+    "cod": "cash on delivery, collected by the carrier; not cash in the shop",
+    "debt": "recorded as debt (ghi no), the customer pays later",
+    "ewallet": "paid through an e-wallet app",
+    "card": "paid by payment card",
+}
 # Rulebook §2: shifts by order time, both ends inclusive. Matched when the key appears in the normalized filter text.
 SHIFT_WINDOWS = {"sang": ("06:00:00", "13:59:59"), "chieu": ("14:00:00", "21:59:59"),
     "morning": ("06:00:00", "13:59:59"),
