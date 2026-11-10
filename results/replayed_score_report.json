@@ -1,11 +1,11 @@
 {
-  "correct": 801,
-  "wrong": 93,
-  "abstain": 106,
+  "correct": 783,
+  "wrong": 97,
+  "abstain": 120,
   "n": 1000,
-  "pa": 0.708,
-  "coverage": 0.894,
-  "answered_accuracy": 0.8959731543624161,
+  "pa": 0.686,
+  "coverage": 0.88,
+  "answered_accuracy": 0.8897727272727273,
   "by_type": {
     "boolean": {
       "correct": 1,
@@ -26,31 +26,31 @@
       "answered_accuracy": 0.9574468085106383
     },
     "list": {
-      "correct": 54,
-      "wrong": 6,
+      "correct": 53,
+      "wrong": 7,
       "abstain": 16,
       "n": 76,
-      "pa": 0.631578947368421,
+      "pa": 0.6052631578947368,
       "coverage": 0.7894736842105263,
-      "answered_accuracy": 0.9
+      "answered_accuracy": 0.8833333333333333
     },
     "number": {
-      "correct": 530,
-      "wrong": 57,
-      "abstain": 42,
+      "correct": 515,
+      "wrong": 59,
+      "abstain": 55,
       "n": 629,
-      "pa": 0.7519872813990461,
-      "coverage": 0.9332273449920508,
-      "answered_accuracy": 0.9028960817717206
+      "pa": 0.724960254372019,
+      "coverage": 0.9125596184419714,
+      "answered_accuracy": 0.8972125435540069
     },
     "percent": {
-      "correct": 129,
-      "wrong": 27,
-      "abstain": 26,
+      "correct": 127,
+      "wrong": 28,
+      "abstain": 27,
       "n": 182,
-      "pa": 0.5604395604395604,
-      "coverage": 0.8571428571428571,
-      "answered_accuracy": 0.8269230769230769
+      "pa": 0.5439560439560439,
+      "coverage": 0.8516483516483516,
+      "answered_accuracy": 0.8193548387096774
     },
     "string": {
       "correct": 34,
@@ -127,13 +127,13 @@
       "answered_accuracy": 0.9354838709677419
     },
     "biz_106": {
-      "correct": 29,
-      "wrong": 3,
-      "abstain": 11,
+      "correct": 18,
+      "wrong": 7,
+      "abstain": 18,
       "n": 43,
-      "pa": 0.6046511627906976,
-      "coverage": 0.7441860465116279,
-      "answered_accuracy": 0.90625
+      "pa": 0.2558139534883721,
+      "coverage": 0.5813953488372093,
+      "answered_accuracy": 0.72
     },
     "biz_107": {
       "correct": 19,
@@ -244,22 +244,22 @@
       "answered_accuracy": 0.9166666666666666
     },
     "biz_119": {
-      "correct": 37,
+      "correct": 32,
       "wrong": 5,
-      "abstain": 2,
+      "abstain": 7,
       "n": 44,
-      "pa": 0.7272727272727273,
-      "coverage": 0.9545454545454546,
-      "answered_accuracy": 0.8809523809523809
+      "pa": 0.6136363636363636,
+      "coverage": 0.8409090909090909,
+      "answered_accuracy": 0.8648648648648649
     },
     "biz_120": {
-      "correct": 33,
+      "correct": 31,
       "wrong": 3,
-      "abstain": 1,
+      "abstain": 3,
       "n": 37,
-      "pa": 0.8108108108108109,
-      "coverage": 0.972972972972973,
-      "answered_accuracy": 0.9166666666666666
+      "pa": 0.7567567567567568,
+      "coverage": 0.918918918918919,
+      "answered_accuracy": 0.9117647058823529
     },
     "biz_121": {
       "correct": 37,
@@ -1329,7 +1329,7 @@
     },
     {
       "id": "q_0d5667212f41",
-      "outcome": "correct",
+      "outcome": "wrong",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -1821,7 +1821,7 @@
     },
     {
       "id": "q_144f8e62d410",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_120"
     },
@@ -2079,7 +2079,7 @@
     },
     {
       "id": "q_1885ab61433f",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -2139,7 +2139,7 @@
     },
     {
       "id": "q_194556651253",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -2643,7 +2643,7 @@
     },
     {
       "id": "q_20ad1fe3cbcd",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -2727,7 +2727,7 @@
     },
     {
       "id": "q_21c312790767",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_119"
     },
@@ -3087,7 +3087,7 @@
     },
     {
       "id": "q_25e68617a9f7",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -3249,7 +3249,7 @@
     },
     {
       "id": "q_284698f995b8",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_119"
     },
@@ -3357,7 +3357,7 @@
     },
     {
       "id": "q_29eb2ce0741a",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "percent",
       "business_id": "biz_106"
     },
@@ -3513,7 +3513,7 @@
     },
     {
       "id": "q_2c5b660fce33",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_119"
     },
@@ -3537,7 +3537,7 @@
     },
     {
       "id": "q_2cdc20d0256d",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_119"
     },
@@ -4977,13 +4977,13 @@
     },
     {
       "id": "q_4161c903ad81",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_120"
     },
     {
       "id": "q_4192ef63e140",
-      "outcome": "correct",
+      "outcome": "wrong",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -5025,7 +5025,7 @@
     },
     {
       "id": "q_42157bbc3125",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -5349,7 +5349,7 @@
     },
     {
       "id": "q_465a4bdab726",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_106"
     },
@@ -5481,7 +5481,7 @@
     },
     {
       "id": "q_48910c66e7e6",
-      "outcome": "correct",
+      "outcome": "abstain",
       "type": "number",
       "business_id": "biz_119"
     },
@@ -5757,7 +5757,7 @@
     },
     {
       "id": "q_4c7f65214480",
-      "outcome": "correct",
+      "outcome": "wrong",
       "type": "percent",
       "business_id": "biz_106"
     },
@@ -6171,7 +6171,7 @@
     },
     {
       "id": "q_5186dc3dd581",
-      "outcome": "correct",
+      "outcome": "wrong",
       "type": "list",
       "business_id": "biz_106"
     },

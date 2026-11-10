@@ -160,7 +160,7 @@
 {"id": "q_0d1d7ead3e7e", "type": "number", "answer": 1475400, "rounding": "money"}
 {"id": "q_0d3c74a07021", "type": "percent", "answer": 391.3, "rounding": "two_decimals"}
 {"id": "q_0d3d69f04d88", "type": "number", "answer": 114261, "rounding": "money"}
-{"id": "q_0d5667212f41", "type": "number", "answer": 149, "rounding": "none"}
+{"id": "q_0d5667212f41", "type": "number", "answer": 156, "rounding": "none"}
 {"id": "q_0da07cfbc55f", "type": "number", "answer": 561179000, "rounding": "money"}
 {"id": "q_0db8d6ef55e9", "type": "date", "answer": "2025-05-11", "rounding": "none"}
 {"id": "q_0dca3f5299ba", "type": "number", "answer": 1423804300, "rounding": "money"}
@@ -242,7 +242,7 @@
 {"id": "q_141b4202edf8", "type": "number", "answer": 109008900, "rounding": "none"}
 {"id": "q_1428af8f0be3", "type": "date", "answer": "2026-02-28", "rounding": "none"}
 {"id": "q_1442d195be9c", "type": "number", "answer": 2843103000, "rounding": "money"}
-{"id": "q_144f8e62d410", "type": "number", "answer": 21463, "rounding": "money"}
+{"id": "q_144f8e62d410", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_14693fd38657", "type": "number", "answer": 24, "rounding": "integer"}
 {"id": "q_147e7a072dc7", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_148c642fbf7b", "type": "percent", "answer": 0.93, "rounding": "two_decimals"}
@@ -285,7 +285,7 @@
 {"id": "q_1837da83c4a5", "type": "string", "answer": "Tạ Quang Khánh", "rounding": "none"}
 {"id": "q_18497b6ca770", "type": "number", "answer": 212577400, "rounding": "money"}
 {"id": "q_18833548c734", "type": "number", "answer": 133482500, "rounding": "money"}
-{"id": "q_1885ab61433f", "type": "number", "answer": 89, "rounding": "none"}
+{"id": "q_1885ab61433f", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_189cb0ae43e6", "type": "number", "answer": 8108700, "rounding": "money"}
 {"id": "q_18a3c0b665fe", "type": "date", "answer": "2025-03-24", "rounding": "none"}
 {"id": "q_18a4f2eb5280", "type": "number", "answer": 63522, "rounding": "money"}
@@ -295,7 +295,7 @@
 {"id": "q_18e8c7f00fce", "type": "number", "answer": 51036, "rounding": "money"}
 {"id": "q_18f8cdf43ae0", "type": "number", "answer": 6199692000, "rounding": "money"}
 {"id": "q_1915a6fd7b94", "type": "number", "answer": 72500, "rounding": "money"}
-{"id": "q_194556651253", "type": "number", "answer": 125457000, "rounding": "money"}
+{"id": "q_194556651253", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_1969df5e8f80", "type": "number", "answer": 723839400, "rounding": "money"}
 {"id": "q_197487e4b9a2", "type": "list", "answer": [264082800, 250892100, 259652600], "rounding": "money"}
 {"id": "q_197e220d0f3b", "type": "number", "answer": 3779100, "rounding": "money"}
@@ -379,7 +379,7 @@
 {"id": "q_209594b21664", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_20aa716764dc", "type": "percent", "answer": 1.51, "rounding": "two_decimals"}
 {"id": "q_20aa992c0d3f", "type": "date", "answer": "2026-05-09", "rounding": "none"}
-{"id": "q_20ad1fe3cbcd", "type": "number", "answer": 429490000, "rounding": "money"}
+{"id": "q_20ad1fe3cbcd", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_20c6e10447cf", "type": "number", "answer": 49852400, "rounding": "money"}
 {"id": "q_20cfa482235e", "type": "string", "answer": "Cty Thân Ngọc", "rounding": "none"}
 {"id": "q_20d5aeb823b2", "type": "number", "answer": 156348, "rounding": "money"}
@@ -393,7 +393,7 @@
 {"id": "q_219d208db5e7", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_21a7c98568e0", "type": "date", "answer": "2025-10", "rounding": "none"}
 {"id": "q_21c12147e6d6", "type": "string", "answer": "Thân Hồng Nhung", "rounding": "none"}
-{"id": "q_21c312790767", "type": "number", "answer": 71143, "rounding": "money"}
+{"id": "q_21c312790767", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_21ddf8b64394", "type": "number", "answer": 16652700, "rounding": "money"}
 {"id": "q_21e3d299c23d", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_22066f683e43", "type": "number", "answer": 538804, "rounding": "money"}
@@ -453,7 +453,7 @@
 {"id": "q_259342644826", "type": "percent", "answer": 31.39, "rounding": "two_decimals"}
 {"id": "q_25a74f03c947", "type": "number", "answer": 71071, "rounding": "money"}
 {"id": "q_25c012ee0fce", "type": "number", "answer": 2996996, "rounding": "money"}
-{"id": "q_25e68617a9f7", "type": "number", "answer": 1088, "rounding": "none"}
+{"id": "q_25e68617a9f7", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_260318057077", "type": "number", "answer": 797461200, "rounding": "money"}
 {"id": "q_2615aa591115", "type": "number", "answer": 215, "rounding": "none"}
 {"id": "q_261ae1fe4be0", "type": "list", "answer": ["Cà phê sữa (M)", "Trà đào cam sả (M)", "Trà sữa trân châu (M)", "Cà phê đen (M)", "Bạc xỉu (M)"], "rounding": "none"}
@@ -480,7 +480,7 @@
 {"id": "q_27ea93d85fa6", "type": "number", "answer": 32031700, "rounding": "money"}
 {"id": "q_27eebcccdf1f", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_281d6d8a83c6", "type": "list", "answer": [389514000, 269031700, 398881600], "rounding": "money"}
-{"id": "q_284698f995b8", "type": "number", "answer": 86414, "rounding": "money"}
+{"id": "q_284698f995b8", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_286954dbbcb9", "type": "number", "answer": 168032, "rounding": "money"}
 {"id": "q_287292f3f5e1", "type": "number", "answer": 0, "rounding": "integer"}
 {"id": "q_287ada14fabf", "type": "number", "answer": 321252600, "rounding": "none"}
@@ -498,7 +498,7 @@
 {"id": "q_29237cfd9d01", "type": "number", "answer": 5096000, "rounding": "money"}
 {"id": "q_29503ba420d0", "type": "number", "answer": 130289800, "rounding": "money"}
 {"id": "q_299e5230f52e", "type": "number", "answer": 3013600, "rounding": "money"}
-{"id": "q_29eb2ce0741a", "type": "percent", "answer": -24.9, "rounding": "two_decimals"}
+{"id": "q_29eb2ce0741a", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_29f3255d8636", "type": "date", "answer": "2025-11", "rounding": "none"}
 {"id": "q_2a0e86444947", "type": "number", "answer": 507, "rounding": "integer"}
 {"id": "q_2a3019504577", "type": "number", "answer": 3530400, "rounding": "money"}
@@ -524,11 +524,11 @@
 {"id": "q_2c03415e4415", "type": "number", "answer": 10943, "rounding": "integer"}
 {"id": "q_2c2fdcb79780", "type": "number", "answer": 22, "rounding": "integer"}
 {"id": "q_2c3829aa0f16", "type": "percent", "answer": 38.36, "rounding": "two_decimals"}
-{"id": "q_2c5b660fce33", "type": "number", "answer": 147900, "rounding": "money"}
+{"id": "q_2c5b660fce33", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_2c664c3eaf2c", "type": "number", "answer": 116822200, "rounding": "money"}
 {"id": "q_2c97f6f308e9", "type": "number", "answer": 9983, "rounding": "integer"}
 {"id": "q_2ca8fd946a09", "type": "number", "answer": 5888993000, "rounding": "money"}
-{"id": "q_2cdc20d0256d", "type": "number", "answer": 38933, "rounding": "money"}
+{"id": "q_2cdc20d0256d", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_2d2b39ab0b27", "type": "number", "answer": 31, "rounding": "none"}
 {"id": "q_2d2d91435d5d", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_2d390a634c19", "type": "number", "answer": 40, "rounding": "integer"}
@@ -768,15 +768,15 @@
 {"id": "q_4103fb4b4b98", "type": "number", "answer": 137, "rounding": "none"}
 {"id": "q_411885af7ae3", "type": "percent", "answer": -10.51, "rounding": "two_decimals"}
 {"id": "q_414a1f3eaf25", "type": "number", "answer": 76, "rounding": "none"}
-{"id": "q_4161c903ad81", "type": "number", "answer": 28302, "rounding": "money"}
-{"id": "q_4192ef63e140", "type": "number", "answer": 23, "rounding": "integer"}
+{"id": "q_4161c903ad81", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
+{"id": "q_4192ef63e140", "type": "number", "answer": 26, "rounding": "integer"}
 {"id": "q_41a920e55256", "type": "list", "answer": ["Bia Tiger lon", "Lẩu Thái tôm cá (nhỏ)", "Bia Tiger Bạc lon"], "rounding": "none"}
 {"id": "q_41aefc7c556f", "type": "percent", "answer": 0.85, "rounding": "two_decimals"}
 {"id": "q_41b3968eb526", "type": "percent", "answer": 19.36, "rounding": "two_decimals"}
 {"id": "q_41c306df830d", "type": "number", "answer": 1067, "rounding": "integer"}
 {"id": "q_41c360c34398", "type": "number", "answer": 3030, "rounding": "none"}
 {"id": "q_420556897d22", "type": "table", "answer": {"columns": ["khach_hang", "so_tien_no"], "rows": [["Thái Nam Phương", 151000], ["Vương Hằng Phúc", 117500], ["Trương Bình Nam", 116500]]}, "rounding": "none"}
-{"id": "q_42157bbc3125", "type": "number", "answer": 4665, "rounding": "none"}
+{"id": "q_42157bbc3125", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_4229b5a0f8b2", "type": "list", "answer": [11000, 5500], "rounding": "none"}
 {"id": "q_4239d9d46ec8", "type": "number", "answer": 6916600, "rounding": "money"}
 {"id": "q_426baab167a3", "type": "list", "answer": [78000, 25000], "rounding": "money"}
@@ -830,7 +830,7 @@
 {"id": "q_4632f7122d38", "type": "number", "answer": 781, "rounding": "integer"}
 {"id": "q_463f31b888f0", "type": "number", "answer": 65, "rounding": "integer"}
 {"id": "q_464577a14b31", "type": "number", "answer": 6368000, "rounding": "money"}
-{"id": "q_465a4bdab726", "type": "number", "answer": 2015, "rounding": "none"}
+{"id": "q_465a4bdab726", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_4665bcdcd758", "type": "number", "answer": 116, "rounding": "none"}
 {"id": "q_4697998a9e2d", "type": "percent", "answer": 2.82, "rounding": "two_decimals"}
 {"id": "q_46a6577343f1", "type": "list", "answer": [250892100, 259652600, 259231600], "rounding": "money"}
@@ -852,7 +852,7 @@
 {"id": "q_483fd47f80e8", "type": "number", "answer": 79, "rounding": "none"}
 {"id": "q_486e3139b1e7", "type": "list", "answer": [368766700, 348311500, 379300800], "rounding": "money"}
 {"id": "q_486e80882b47", "type": "number", "answer": 55, "rounding": "integer"}
-{"id": "q_48910c66e7e6", "type": "number", "answer": 101304, "rounding": "money"}
+{"id": "q_48910c66e7e6", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_489bb0e084b6", "type": "number", "answer": 2071, "rounding": "integer"}
 {"id": "q_48c2958faab6", "type": "number", "answer": 22, "rounding": "none"}
 {"id": "q_48cfe79d54ec", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
@@ -898,7 +898,7 @@
 {"id": "q_4bf431361cac", "type": "number", "answer": 113, "rounding": "integer"}
 {"id": "q_4bfce7dd9238", "type": "number", "answer": 1492, "rounding": "none"}
 {"id": "q_4c6b7e495690", "type": "number", "answer": 81, "rounding": "none"}
-{"id": "q_4c7f65214480", "type": "percent", "answer": -3.33, "rounding": "two_decimals"}
+{"id": "q_4c7f65214480", "type": "percent", "answer": -2.94, "rounding": "two_decimals"}
 {"id": "q_4c974b445a53", "type": "table", "answer": {"columns": ["khach_hang_ten", "total_debt"], "rows": [["Lâm Bảo Ngọc", 632000], ["Nghiêm Duy Linh", 620000], ["Lương Huy Quang", 360500], ["Lương Thanh Hương", 230000], ["Tống Ngọc Trung", 168000]]}, "rounding": "none"}
 {"id": "q_4cb3efa8bd01", "type": "percent", "answer": 38.88, "rounding": "two_decimals"}
 {"id": "q_4cbb6b73939c", "type": "percent", "answer": 39.21, "rounding": "two_decimals"}
@@ -967,7 +967,7 @@
 {"id": "q_516ed0dbe40c", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_5178da2e9933", "type": "abstain", "reason": "No eligible candidate or unsupported evidence"}
 {"id": "q_517c46933148", "type": "number", "answer": 1413690000, "rounding": "money"}
-{"id": "q_5186dc3dd581", "type": "list", "answer": [264914500, 305793500, 295438500], "rounding": "money"}
+{"id": "q_5186dc3dd581", "type": "list", "answer": [271419000, 312227500, 302611000], "rounding": "money"}
 {"id": "q_5188823e1efb", "type": "percent", "answer": 3.31, "rounding": "two_decimals"}
 {"id": "q_51963984e8da", "type": "number", "answer": 131458000, "rounding": "money"}
 {"id": "q_51b60e9a3887", "type": "percent", "answer": 1.89, "rounding": "two_decimals"}

@@ -1,5 +1,5 @@
 {
-  "elapsed_seconds": 219.75740909576416,
+  "elapsed_seconds": 222.3083691596985,
   "baseline": {
     "n": 1000,
     "correct": 569,
@@ -11,12 +11,12 @@
   },
   "replayed": {
     "n": 1000,
-    "correct": 801,
-    "wrong": 93,
-    "abstain": 106,
-    "answered_accuracy": 0.8959731543624161,
-    "coverage": 0.894,
-    "pa": 0.708
+    "correct": 783,
+    "wrong": 97,
+    "abstain": 120,
+    "answered_accuracy": 0.8897727272727273,
+    "coverage": 0.88,
+    "pa": 0.686
   },
   "target_businesses": {
     "biz_101": {
@@ -130,13 +130,13 @@
         "answered_accuracy": 0.3333333333333333
       },
       "after": {
-        "correct": 29,
-        "wrong": 3,
-        "abstain": 11,
+        "correct": 18,
+        "wrong": 7,
+        "abstain": 18,
         "n": 43,
-        "pa": 0.6046511627906976,
-        "coverage": 0.7441860465116279,
-        "answered_accuracy": 0.90625
+        "pa": 0.2558139534883721,
+        "coverage": 0.5813953488372093,
+        "answered_accuracy": 0.72
       }
     },
     "biz_107": {
@@ -390,13 +390,13 @@
         "answered_accuracy": 0.7666666666666667
       },
       "after": {
-        "correct": 37,
+        "correct": 32,
         "wrong": 5,
-        "abstain": 2,
+        "abstain": 7,
         "n": 44,
-        "pa": 0.7272727272727273,
-        "coverage": 0.9545454545454546,
-        "answered_accuracy": 0.8809523809523809
+        "pa": 0.6136363636363636,
+        "coverage": 0.8409090909090909,
+        "answered_accuracy": 0.8648648648648649
       }
     },
     "biz_120": {
@@ -410,13 +410,13 @@
         "answered_accuracy": 0.8518518518518519
       },
       "after": {
-        "correct": 33,
+        "correct": 31,
         "wrong": 3,
-        "abstain": 1,
+        "abstain": 3,
         "n": 37,
-        "pa": 0.8108108108108109,
-        "coverage": 0.972972972972973,
-        "answered_accuracy": 0.9166666666666666
+        "pa": 0.7567567567567568,
+        "coverage": 0.918918918918919,
+        "answered_accuracy": 0.9117647058823529
       }
     },
     "biz_121": {
@@ -622,7 +622,7 @@
   },
   "regressions_count": 0,
   "regressions": [],
-  "improvements_count": 235,
+  "improvements_count": 217,
   "improvements": [
     {
       "id": "q_00a6e23cbacf",
@@ -1166,17 +1166,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_0d5667212f41",
-      "business_id": "biz_106",
-      "question": "trong thang 2 nam 2025 cua hang ban duoc may ly tra sua o long (m)",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 149,
-      "expected": 149,
-      "trace_errors": []
-    },
-    {
       "id": "q_0dea4845a4cd",
       "business_id": "biz_109",
       "question": "so don bi huy trong thang 7 nam 2026 la bao nhieu",
@@ -1438,17 +1427,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_144f8e62d410",
-      "business_id": "biz_120",
-      "question": "Giá nhập bình quân một hộp Oresol 245 DHG hộp 20 gói trong tháng 2 năm 2026 là bao nhiêu ạ?",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 21463,
-      "expected": 21463,
-      "trace_errors": []
-    },
-    {
       "id": "q_14693fd38657",
       "business_id": "biz_124",
       "question": "Đến hết ngày 12/11/2025, số khách còn công nợ với cửa hàng là bao nhiêu nhỉ?",
@@ -1592,17 +1570,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_1885ab61433f",
-      "business_id": "biz_106",
-      "question": "Tháng 8 năm 2025 bán ra bao nhiêu cái Bánh tiramisu?",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 89,
-      "expected": 89,
-      "trace_errors": []
-    },
-    {
       "id": "q_18a4f2eb5280",
       "business_id": "biz_117",
       "question": "tháng 1/2025 giá nhập bình quân một cây băng keo điện nano 20 yard là bao nhiu",
@@ -1666,17 +1633,6 @@
       "old_answer": 80000,
       "new_answer": 72500,
       "expected": 72500,
-      "trace_errors": []
-    },
-    {
-      "id": "q_194556651253",
-      "business_id": "biz_106",
-      "question": "ca chieu thang 8/2025 doanh thu duoc bnhiu",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 125457000,
-      "expected": 125457000,
       "trace_errors": []
     },
     {
@@ -1957,17 +1913,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_20ad1fe3cbcd",
-      "business_id": "biz_106",
-      "question": "từ đầu năm đến hết hnay cửa hàng bán được nhiêu tiền",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 429490000,
-      "expected": 429490000,
-      "trace_errors": []
-    },
-    {
       "id": "q_20cfa482235e",
       "business_id": "biz_105",
       "question": "coi giùm tháng 5/2026 cuwar hàng nhập nhiều tiền hàng nhất từ nhaf cung cấp nào",
@@ -2020,17 +1965,6 @@
       "old_answer": null,
       "new_answer": "Thân Hồng Nhung",
       "expected": "Thân Hồng Nhung",
-      "trace_errors": []
-    },
-    {
-      "id": "q_21c312790767",
-      "business_id": "biz_119",
-      "question": "trong tháng 11/2025, acemuc kids 200mg hộp 30 gói nhập vào giá bình quân một hộp laf bao nhiêu",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 71143,
-      "expected": 71143,
       "trace_errors": []
     },
     {
@@ -2241,17 +2175,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_25e68617a9f7",
-      "business_id": "biz_106",
-      "question": "Quán bán được bao nhiêu ly size L trong tháng này, cộng mọi món?",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 1088,
-      "expected": 1088,
-      "trace_errors": []
-    },
-    {
       "id": "q_261be063aa99",
       "business_id": "biz_127",
       "question": "thang 10/2025 doanh thu thay doi bnhiu % so vs thang lien trc",
@@ -2395,17 +2318,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_284698f995b8",
-      "business_id": "biz_119",
-      "question": "trong thang 6/2025, yumangel hop 20 goi nhap vao gia binh quan mot hop la bao nhiu vay",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 86414,
-      "expected": 86414,
-      "trace_errors": []
-    },
-    {
       "id": "q_2889186ce0d8",
       "business_id": "biz_124",
       "question": "Giá nhập bình quân một hộp Gaviscon hộp 24 gói x 10ml trong tháng 11 năm 2025 là bao nhiêu?",
@@ -2425,17 +2337,6 @@
       "old_answer": null,
       "new_answer": "2025-12",
       "expected": "2025-12",
-      "trace_errors": []
-    },
-    {
-      "id": "q_29eb2ce0741a",
-      "business_id": "biz_106",
-      "question": "ee tuần rồi dthu ca chiều chênh ca sangs nhiêu %",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": -24.9,
-      "expected": -24.9,
       "trace_errors": []
     },
     {
@@ -2505,17 +2406,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_2c5b660fce33",
-      "business_id": "biz_119",
-      "question": "Trong tháng 10/2025, Gaviscon hộp 24 gói x 10ml nhập vào giá bình quân một hộp là bao nhiêu nhỉ?",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 147900,
-      "expected": 147900,
-      "trace_errors": []
-    },
-    {
       "id": "q_2ca8fd946a09",
       "business_id": "biz_130",
       "question": "doanh thu từ đầu năm tới heets hnay là bao nhiêu nhỉ",
@@ -2524,17 +2414,6 @@
       "old_answer": null,
       "new_answer": 5888993000,
       "expected": 5888993000,
-      "trace_errors": []
-    },
-    {
-      "id": "q_2cdc20d0256d",
-      "business_id": "biz_119",
-      "question": "Giá nhập bình quân một hộp Efferalgan 500mg viên sủi hộp 4 vỉ x 4 viên trong tháng 2 năm 2026 là bao nhiêu vậy?",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 38933,
-      "expected": 38933,
       "trace_errors": []
     },
     {
@@ -3155,28 +3034,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_4161c903ad81",
-      "business_id": "biz_120",
-      "question": "coi gium thang 2/2026 gia nhap binh quan mot tuyp upsa-c 1g vien sui tuyp 10 vien la bao nhieu",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 28302,
-      "expected": 28302,
-      "trace_errors": []
-    },
-    {
-      "id": "q_4192ef63e140",
-      "business_id": "biz_106",
-      "question": "check gium thang 3/2026 co bao nhieu mat hang xuat hien trong it nhat 123 don",
-      "old_outcome": "wrong",
-      "new_outcome": "correct",
-      "old_answer": 1,
-      "new_answer": 23,
-      "expected": 23,
-      "trace_errors": []
-    },
-    {
       "id": "q_41c360c34398",
       "business_id": "biz_104",
       "question": "Tháng 4/2025 quán bán được bao nhiêu ly size M?",
@@ -3234,17 +3091,6 @@
           ]
         ]
       },
-      "trace_errors": []
-    },
-    {
-      "id": "q_42157bbc3125",
-      "business_id": "biz_106",
-      "question": "tháng 5/2026 quán bán ra total mấy ly size M, cộng tất cả các món",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 4665,
-      "expected": 4665,
       "trace_errors": []
     },
     {
@@ -3427,17 +3273,6 @@
       "trace_errors": []
     },
     {
-      "id": "q_465a4bdab726",
-      "business_id": "biz_106",
-      "question": "thang 4/2025 quan ban ra tong cong may ly size l, cong tat ca cac mon",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 2015,
-      "expected": 2015,
-      "trace_errors": []
-    },
-    {
       "id": "q_46a6577343f1",
       "business_id": "biz_121",
       "question": "Cho tôi dthu của tháng 2/2026, tháng 3/2026 và tháng 4/2026, ghi lần lượt theo thứ tự đó",
@@ -3517,17 +3352,6 @@
         348311500,
         379300800
       ],
-      "trace_errors": []
-    },
-    {
-      "id": "q_48910c66e7e6",
-      "business_id": "biz_119",
-      "question": "Tháng 2/2026 giá nhập bình quân một hộp Phosphalugel hộp 26 gói là bao nhiêu?",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": 101304,
-      "expected": 101304,
       "trace_errors": []
     },
     {
@@ -3650,17 +3474,6 @@
       "old_answer": 8466,
       "new_answer": 1492,
       "expected": 1492,
-      "trace_errors": []
-    },
-    {
-      "id": "q_4c7f65214480",
-      "business_id": "biz_106",
-      "question": "xem giup so voi cung ky th truoc, doanh thu tu dau thang nay den het hom nay tang hay giam bn %",
-      "old_outcome": "abstain",
-      "new_outcome": "correct",
-      "old_answer": null,
-      "new_answer": -3.33,
-      "expected": -3.33,
       "trace_errors": []
     },
     {
@@ -3898,29 +3711,6 @@
       "old_answer": "2025-08-01",
       "new_answer": "2025-08-30",
       "expected": "2025-08-30",
-      "trace_errors": []
-    },
-    {
-      "id": "q_5186dc3dd581",
-      "business_id": "biz_106",
-      "question": "Doanh thu từng tháng của 3 tháng 11/2025, 12/2025, 1/2026 lần lượt là bao nhiêu?",
-      "old_outcome": "wrong",
-      "new_outcome": "correct",
-      "old_answer": [
-        271419000,
-        312227500,
-        302611000
-      ],
-      "new_answer": [
-        264914500,
-        305793500,
-        295438500
-      ],
-      "expected": [
-        264914500,
-        305793500,
-        295438500
-      ],
       "trace_errors": []
     },
     {

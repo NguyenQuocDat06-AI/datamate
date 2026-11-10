@@ -331,17 +331,8 @@ def auto_join_header_for_detail_date(
             proj_u, t1_u, cond_u, t2_u = m_split_union.groups()
             healed = f"SELECT {proj_u} FROM (SELECT * FROM {t1_u} UNION SELECT * FROM {t2_u}) AS {t1_u} WHERE {cond_u}"
 
-        def _repl_sub_union(m: re.Match) -> str:
-            if not _split_pair(m.group(1), m.group(3)):
-                return m.group(0)
-            return f"FROM (SELECT * FROM {m.group(1)} UNION SELECT * FROM {m.group(3)}) AS {m.group(1)} WHERE {m.group(2)}"
+        # Note: Do not pull WHERE out of UNION ALL subqueries with trailing alias
 
-        healed = re.sub(
-            r"FROM\s*\(\s*SELECT\s+[^\n()]+?\s+FROM\s+([A-Za-z0-9_]+_1_[A-Za-z0-9_]+)\s+WHERE\s+([^\n()]+?)\s+UNION\s+ALL\s+SELECT\s+[^\n()]+?\s+FROM\s+([A-Za-z0-9_]+_2_[A-Za-z0-9_]+)\s+WHERE\s+\2\s*\)\s*(?:AS\s+[A-Za-z0-9_]+)?",
-            _repl_sub_union,
-            healed,
-            flags=re.IGNORECASE,
-        )
 
     date_cands = (
         "thoi_gian_tao",
