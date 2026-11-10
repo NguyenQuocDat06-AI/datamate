@@ -79,8 +79,9 @@ def _unlinked_payment_share(connection: sqlite3.Connection) -> float | None:
         if not payment_rows:
             return None
         dated, unlinked = connection.execute(
-            "SELECT COUNT(*), SUM(CASE WHEN NOT EXISTS "
-            "(SELECT 1 FROM payments p WHERE p.order_id = o.order_id) THEN 1 ELSE 0 END) "
+            # A set lookup: a correlated subquery over an unindexed table is quadratic.
+            "SELECT COUNT(*), SUM(CASE WHEN o.order_id NOT IN "
+            "(SELECT order_id FROM payments WHERE order_id IS NOT NULL) THEN 1 ELSE 0 END) "
             "FROM orders o WHERE o.date IS NOT NULL"
         ).fetchone()
     except sqlite3.Error:
