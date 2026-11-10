@@ -1,0 +1,3982 @@
+{
+  "elapsed_seconds": 219.75740909576416,
+  "baseline": {
+    "n": 1000,
+    "correct": 569,
+    "wrong": 161,
+    "abstain": 270,
+    "answered_accuracy": 0.7794520547945205,
+    "coverage": 0.73,
+    "pa": 0.408
+  },
+  "replayed": {
+    "n": 1000,
+    "correct": 801,
+    "wrong": 93,
+    "abstain": 106,
+    "answered_accuracy": 0.8959731543624161,
+    "coverage": 0.894,
+    "pa": 0.708
+  },
+  "target_businesses": {
+    "biz_101": {
+      "before": {
+        "correct": 13,
+        "wrong": 0,
+        "abstain": 0,
+        "n": 13,
+        "pa": 1.0,
+        "coverage": 1.0,
+        "answered_accuracy": 1.0
+      },
+      "after": {
+        "correct": 13,
+        "wrong": 0,
+        "abstain": 0,
+        "n": 13,
+        "pa": 1.0,
+        "coverage": 1.0,
+        "answered_accuracy": 1.0
+      }
+    },
+    "biz_102": {
+      "before": {
+        "correct": 32,
+        "wrong": 0,
+        "abstain": 9,
+        "n": 41,
+        "pa": 0.7804878048780488,
+        "coverage": 0.7804878048780488,
+        "answered_accuracy": 1.0
+      },
+      "after": {
+        "correct": 40,
+        "wrong": 0,
+        "abstain": 1,
+        "n": 41,
+        "pa": 0.975609756097561,
+        "coverage": 0.975609756097561,
+        "answered_accuracy": 1.0
+      }
+    },
+    "biz_103": {
+      "before": {
+        "correct": 17,
+        "wrong": 3,
+        "abstain": 19,
+        "n": 39,
+        "pa": 0.358974358974359,
+        "coverage": 0.5128205128205128,
+        "answered_accuracy": 0.85
+      },
+      "after": {
+        "correct": 28,
+        "wrong": 2,
+        "abstain": 9,
+        "n": 39,
+        "pa": 0.6666666666666666,
+        "coverage": 0.7692307692307693,
+        "answered_accuracy": 0.9333333333333333
+      }
+    },
+    "biz_104": {
+      "before": {
+        "correct": 31,
+        "wrong": 6,
+        "abstain": 5,
+        "n": 42,
+        "pa": 0.5952380952380952,
+        "coverage": 0.8809523809523809,
+        "answered_accuracy": 0.8378378378378378
+      },
+      "after": {
+        "correct": 40,
+        "wrong": 1,
+        "abstain": 1,
+        "n": 42,
+        "pa": 0.9285714285714286,
+        "coverage": 0.9761904761904762,
+        "answered_accuracy": 0.975609756097561
+      }
+    },
+    "biz_105": {
+      "before": {
+        "correct": 19,
+        "wrong": 7,
+        "abstain": 8,
+        "n": 34,
+        "pa": 0.35294117647058826,
+        "coverage": 0.7647058823529411,
+        "answered_accuracy": 0.7307692307692307
+      },
+      "after": {
+        "correct": 29,
+        "wrong": 2,
+        "abstain": 3,
+        "n": 34,
+        "pa": 0.7941176470588235,
+        "coverage": 0.9117647058823529,
+        "answered_accuracy": 0.9354838709677419
+      }
+    },
+    "biz_106": {
+      "before": {
+        "correct": 4,
+        "wrong": 8,
+        "abstain": 31,
+        "n": 43,
+        "pa": -0.09302325581395349,
+        "coverage": 0.27906976744186046,
+        "answered_accuracy": 0.3333333333333333
+      },
+      "after": {
+        "correct": 29,
+        "wrong": 3,
+        "abstain": 11,
+        "n": 43,
+        "pa": 0.6046511627906976,
+        "coverage": 0.7441860465116279,
+        "answered_accuracy": 0.90625
+      }
+    },
+    "biz_107": {
+      "before": {
+        "correct": 18,
+        "wrong": 1,
+        "abstain": 1,
+        "n": 20,
+        "pa": 0.85,
+        "coverage": 0.95,
+        "answered_accuracy": 0.9473684210526315
+      },
+      "after": {
+        "correct": 19,
+        "wrong": 1,
+        "abstain": 0,
+        "n": 20,
+        "pa": 0.9,
+        "coverage": 1.0,
+        "answered_accuracy": 0.95
+      }
+    },
+    "biz_108": {
+      "before": {
+        "correct": 22,
+        "wrong": 7,
+        "abstain": 7,
+        "n": 36,
+        "pa": 0.4166666666666667,
+        "coverage": 0.8055555555555556,
+        "answered_accuracy": 0.7586206896551724
+      },
+      "after": {
+        "correct": 31,
+        "wrong": 5,
+        "abstain": 0,
+        "n": 36,
+        "pa": 0.7222222222222222,
+        "coverage": 1.0,
+        "answered_accuracy": 0.8611111111111112
+      }
+    },
+    "biz_109": {
+      "before": {
+        "correct": 6,
+        "wrong": 11,
+        "abstain": 17,
+        "n": 34,
+        "pa": -0.14705882352941177,
+        "coverage": 0.5,
+        "answered_accuracy": 0.35294117647058826
+      },
+      "after": {
+        "correct": 17,
+        "wrong": 10,
+        "abstain": 7,
+        "n": 34,
+        "pa": 0.20588235294117646,
+        "coverage": 0.7941176470588235,
+        "answered_accuracy": 0.6296296296296297
+      }
+    },
+    "biz_110": {
+      "before": {
+        "correct": 11,
+        "wrong": 3,
+        "abstain": 2,
+        "n": 16,
+        "pa": 0.5,
+        "coverage": 0.875,
+        "answered_accuracy": 0.7857142857142857
+      },
+      "after": {
+        "correct": 11,
+        "wrong": 3,
+        "abstain": 2,
+        "n": 16,
+        "pa": 0.5,
+        "coverage": 0.875,
+        "answered_accuracy": 0.7857142857142857
+      }
+    },
+    "biz_111": {
+      "before": {
+        "correct": 32,
+        "wrong": 3,
+        "abstain": 5,
+        "n": 40,
+        "pa": 0.725,
+        "coverage": 0.875,
+        "answered_accuracy": 0.9142857142857143
+      },
+      "after": {
+        "correct": 33,
+        "wrong": 3,
+        "abstain": 4,
+        "n": 40,
+        "pa": 0.75,
+        "coverage": 0.9,
+        "answered_accuracy": 0.9166666666666666
+      }
+    },
+    "biz_112": {
+      "before": {
+        "correct": 20,
+        "wrong": 6,
+        "abstain": 8,
+        "n": 34,
+        "pa": 0.4117647058823529,
+        "coverage": 0.7647058823529411,
+        "answered_accuracy": 0.7692307692307693
+      },
+      "after": {
+        "correct": 26,
+        "wrong": 4,
+        "abstain": 4,
+        "n": 34,
+        "pa": 0.6470588235294118,
+        "coverage": 0.8823529411764706,
+        "answered_accuracy": 0.8666666666666667
+      }
+    },
+    "biz_113": {
+      "before": {
+        "correct": 7,
+        "wrong": 0,
+        "abstain": 1,
+        "n": 8,
+        "pa": 0.875,
+        "coverage": 0.875,
+        "answered_accuracy": 1.0
+      },
+      "after": {
+        "correct": 8,
+        "wrong": 0,
+        "abstain": 0,
+        "n": 8,
+        "pa": 1.0,
+        "coverage": 1.0,
+        "answered_accuracy": 1.0
+      }
+    },
+    "biz_114": {
+      "before": {
+        "correct": 10,
+        "wrong": 1,
+        "abstain": 1,
+        "n": 12,
+        "pa": 0.75,
+        "coverage": 0.9166666666666666,
+        "answered_accuracy": 0.9090909090909091
+      },
+      "after": {
+        "correct": 11,
+        "wrong": 1,
+        "abstain": 0,
+        "n": 12,
+        "pa": 0.8333333333333334,
+        "coverage": 1.0,
+        "answered_accuracy": 0.9166666666666666
+      }
+    },
+    "biz_115": {
+      "before": {
+        "correct": 24,
+        "wrong": 2,
+        "abstain": 4,
+        "n": 30,
+        "pa": 0.7333333333333333,
+        "coverage": 0.8666666666666667,
+        "answered_accuracy": 0.9230769230769231
+      },
+      "after": {
+        "correct": 27,
+        "wrong": 2,
+        "abstain": 1,
+        "n": 30,
+        "pa": 0.8333333333333334,
+        "coverage": 0.9666666666666667,
+        "answered_accuracy": 0.9310344827586207
+      }
+    },
+    "biz_116": {
+      "before": {
+        "correct": 36,
+        "wrong": 3,
+        "abstain": 6,
+        "n": 45,
+        "pa": 0.7333333333333333,
+        "coverage": 0.8666666666666667,
+        "answered_accuracy": 0.9230769230769231
+      },
+      "after": {
+        "correct": 41,
+        "wrong": 2,
+        "abstain": 2,
+        "n": 45,
+        "pa": 0.8666666666666667,
+        "coverage": 0.9555555555555556,
+        "answered_accuracy": 0.9534883720930233
+      }
+    },
+    "biz_117": {
+      "before": {
+        "correct": 16,
+        "wrong": 8,
+        "abstain": 9,
+        "n": 33,
+        "pa": 0.24242424242424243,
+        "coverage": 0.7272727272727273,
+        "answered_accuracy": 0.6666666666666666
+      },
+      "after": {
+        "correct": 25,
+        "wrong": 5,
+        "abstain": 3,
+        "n": 33,
+        "pa": 0.6060606060606061,
+        "coverage": 0.9090909090909091,
+        "answered_accuracy": 0.8333333333333334
+      }
+    },
+    "biz_118": {
+      "before": {
+        "correct": 14,
+        "wrong": 6,
+        "abstain": 9,
+        "n": 29,
+        "pa": 0.27586206896551724,
+        "coverage": 0.6896551724137931,
+        "answered_accuracy": 0.7
+      },
+      "after": {
+        "correct": 22,
+        "wrong": 2,
+        "abstain": 5,
+        "n": 29,
+        "pa": 0.6896551724137931,
+        "coverage": 0.8275862068965517,
+        "answered_accuracy": 0.9166666666666666
+      }
+    },
+    "biz_119": {
+      "before": {
+        "correct": 23,
+        "wrong": 7,
+        "abstain": 14,
+        "n": 44,
+        "pa": 0.36363636363636365,
+        "coverage": 0.6818181818181818,
+        "answered_accuracy": 0.7666666666666667
+      },
+      "after": {
+        "correct": 37,
+        "wrong": 5,
+        "abstain": 2,
+        "n": 44,
+        "pa": 0.7272727272727273,
+        "coverage": 0.9545454545454546,
+        "answered_accuracy": 0.8809523809523809
+      }
+    },
+    "biz_120": {
+      "before": {
+        "correct": 23,
+        "wrong": 4,
+        "abstain": 10,
+        "n": 37,
+        "pa": 0.5135135135135135,
+        "coverage": 0.7297297297297297,
+        "answered_accuracy": 0.8518518518518519
+      },
+      "after": {
+        "correct": 33,
+        "wrong": 3,
+        "abstain": 1,
+        "n": 37,
+        "pa": 0.8108108108108109,
+        "coverage": 0.972972972972973,
+        "answered_accuracy": 0.9166666666666666
+      }
+    },
+    "biz_121": {
+      "before": {
+        "correct": 27,
+        "wrong": 9,
+        "abstain": 12,
+        "n": 48,
+        "pa": 0.375,
+        "coverage": 0.75,
+        "answered_accuracy": 0.75
+      },
+      "after": {
+        "correct": 37,
+        "wrong": 4,
+        "abstain": 7,
+        "n": 48,
+        "pa": 0.6875,
+        "coverage": 0.8541666666666666,
+        "answered_accuracy": 0.9024390243902439
+      }
+    },
+    "biz_122": {
+      "before": {
+        "correct": 14,
+        "wrong": 7,
+        "abstain": 21,
+        "n": 42,
+        "pa": 0.16666666666666666,
+        "coverage": 0.5,
+        "answered_accuracy": 0.6666666666666666
+      },
+      "after": {
+        "correct": 26,
+        "wrong": 2,
+        "abstain": 14,
+        "n": 42,
+        "pa": 0.5714285714285714,
+        "coverage": 0.6666666666666666,
+        "answered_accuracy": 0.9285714285714286
+      }
+    },
+    "biz_123": {
+      "before": {
+        "correct": 11,
+        "wrong": 14,
+        "abstain": 20,
+        "n": 45,
+        "pa": -0.06666666666666667,
+        "coverage": 0.5555555555555556,
+        "answered_accuracy": 0.44
+      },
+      "after": {
+        "correct": 30,
+        "wrong": 7,
+        "abstain": 8,
+        "n": 45,
+        "pa": 0.5111111111111111,
+        "coverage": 0.8222222222222222,
+        "answered_accuracy": 0.8108108108108109
+      }
+    },
+    "biz_124": {
+      "before": {
+        "correct": 12,
+        "wrong": 17,
+        "abstain": 16,
+        "n": 45,
+        "pa": -0.1111111111111111,
+        "coverage": 0.6444444444444445,
+        "answered_accuracy": 0.41379310344827586
+      },
+      "after": {
+        "correct": 28,
+        "wrong": 8,
+        "abstain": 9,
+        "n": 45,
+        "pa": 0.4444444444444444,
+        "coverage": 0.8,
+        "answered_accuracy": 0.7777777777777778
+      }
+    },
+    "biz_125": {
+      "before": {
+        "correct": 9,
+        "wrong": 0,
+        "abstain": 0,
+        "n": 9,
+        "pa": 1.0,
+        "coverage": 1.0,
+        "answered_accuracy": 1.0
+      },
+      "after": {
+        "correct": 9,
+        "wrong": 0,
+        "abstain": 0,
+        "n": 9,
+        "pa": 1.0,
+        "coverage": 1.0,
+        "answered_accuracy": 1.0
+      }
+    },
+    "biz_126": {
+      "before": {
+        "correct": 11,
+        "wrong": 2,
+        "abstain": 0,
+        "n": 13,
+        "pa": 0.6923076923076923,
+        "coverage": 1.0,
+        "answered_accuracy": 0.8461538461538461
+      },
+      "after": {
+        "correct": 11,
+        "wrong": 2,
+        "abstain": 0,
+        "n": 13,
+        "pa": 0.6923076923076923,
+        "coverage": 1.0,
+        "answered_accuracy": 0.8461538461538461
+      }
+    },
+    "biz_127": {
+      "before": {
+        "correct": 30,
+        "wrong": 8,
+        "abstain": 12,
+        "n": 50,
+        "pa": 0.44,
+        "coverage": 0.76,
+        "answered_accuracy": 0.7894736842105263
+      },
+      "after": {
+        "correct": 37,
+        "wrong": 8,
+        "abstain": 5,
+        "n": 50,
+        "pa": 0.58,
+        "coverage": 0.9,
+        "answered_accuracy": 0.8222222222222222
+      }
+    },
+    "biz_128": {
+      "before": {
+        "correct": 31,
+        "wrong": 4,
+        "abstain": 10,
+        "n": 45,
+        "pa": 0.6,
+        "coverage": 0.7777777777777778,
+        "answered_accuracy": 0.8857142857142857
+      },
+      "after": {
+        "correct": 40,
+        "wrong": 3,
+        "abstain": 2,
+        "n": 45,
+        "pa": 0.8222222222222222,
+        "coverage": 0.9555555555555556,
+        "answered_accuracy": 0.9302325581395349
+      }
+    },
+    "biz_129": {
+      "before": {
+        "correct": 26,
+        "wrong": 8,
+        "abstain": 4,
+        "n": 38,
+        "pa": 0.47368421052631576,
+        "coverage": 0.8947368421052632,
+        "answered_accuracy": 0.7647058823529411
+      },
+      "after": {
+        "correct": 36,
+        "wrong": 1,
+        "abstain": 1,
+        "n": 38,
+        "pa": 0.9210526315789473,
+        "coverage": 0.9736842105263158,
+        "answered_accuracy": 0.972972972972973
+      }
+    },
+    "biz_130": {
+      "before": {
+        "correct": 20,
+        "wrong": 6,
+        "abstain": 9,
+        "n": 35,
+        "pa": 0.4,
+        "coverage": 0.7428571428571429,
+        "answered_accuracy": 0.7692307692307693
+      },
+      "after": {
+        "correct": 27,
+        "wrong": 4,
+        "abstain": 4,
+        "n": 35,
+        "pa": 0.6571428571428571,
+        "coverage": 0.8857142857142857,
+        "answered_accuracy": 0.8709677419354839
+      }
+    }
+  },
+  "regressions_count": 0,
+  "regressions": [],
+  "improvements_count": 235,
+  "improvements": [
+    {
+      "id": "q_00a6e23cbacf",
+      "business_id": "biz_109",
+      "question": "Trong tháng 1/2025, Mì Omachi sườn hầm nhập vào giá bình quân một thùng là bao nhiêu ạ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 200556,
+      "expected": 200556,
+      "trace_errors": []
+    },
+    {
+      "id": "q_00c4e64fe706",
+      "business_id": "biz_106",
+      "question": "Tháng 5/2025 cửa hàng bán đc tổng cộng bao nhiêu tiền?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 271866000,
+      "expected": 271866000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0139627bccae",
+      "business_id": "biz_104",
+      "question": "check gium hnay cua hang co bao nhiu don",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 18480,
+      "new_answer": 107,
+      "expected": 107,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0174cb13db2a",
+      "business_id": "biz_118",
+      "question": "tháng này cửa hàng đã chở giao bao nhiêu đợt hàng cho khách nhỉ",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 290,
+      "expected": 290,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0266c6b24cbf",
+      "business_id": "biz_106",
+      "question": "Tháng 5/2026 giá nhập bình quân một hộp Bánh croissant là bao nhiêu vậy?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 92897,
+      "expected": 92897,
+      "trace_errors": []
+    },
+    {
+      "id": "q_026fabde15fc",
+      "business_id": "biz_103",
+      "question": "Cho hỏi tổng doanh thu quý 2/2026 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 518445500,
+      "expected": 518445500,
+      "trace_errors": []
+    },
+    {
+      "id": "q_047586efd4bf",
+      "business_id": "biz_117",
+      "question": "Giúp mình đếm số đợt giao hàng trong tháng 1/2026.",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 680,
+      "new_answer": 872,
+      "expected": 872,
+      "trace_errors": []
+    },
+    {
+      "id": "q_047c8277cc35",
+      "business_id": "biz_108",
+      "question": "Giá trị trung bình một đơn tháng 10/2025 là bao nhiêu nhỉ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 158110,
+      "expected": 158110,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0496b83ca7c4",
+      "business_id": "biz_116",
+      "question": "Doanh thu ngày nào cao nhất trong tháng 7 năm 2026?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2026-07-29",
+      "expected": "2026-07-29",
+      "trace_errors": []
+    },
+    {
+      "id": "q_058bd677f168",
+      "business_id": "biz_130",
+      "question": "ê trung bình mỗi đơn tuần trc mang về bao nhiu dthu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 1073317,
+      "new_answer": 536658,
+      "expected": 536658,
+      "trace_errors": []
+    },
+    {
+      "id": "q_058e9b27fb45",
+      "business_id": "biz_108",
+      "question": "gia ban mot goi mi hao hao tom chua cay vao ngay 21/04/2026 la bnhiu ta",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 4700,
+      "new_answer": 4500,
+      "expected": 4500,
+      "trace_errors": []
+    },
+    {
+      "id": "q_05b478fbe670",
+      "business_id": "biz_122",
+      "question": "cho hỏi so số viên magne-B6 corbière hộp 5 vỉ x 10 viên bán ra trong 7 ngày kể từ ngày 29/11/2025, ngày tăng giá lên 2.200đ, vs 7 ngày ngay trước ngày đó: tăng hay giảm bao nhiu %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 123.46,
+      "expected": 123.46,
+      "trace_errors": []
+    },
+    {
+      "id": "q_060bfbc2a7a5",
+      "business_id": "biz_121",
+      "question": "Giá trị trung bình một đơn tuần trước là bao nhiêu vậy?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 68937,
+      "new_answer": 121495,
+      "expected": 121495,
+      "trace_errors": []
+    },
+    {
+      "id": "q_06adbccf5be5",
+      "business_id": "biz_119",
+      "question": "trong thang 4/2025, nhom tieu hoa dong gop bnhiu % doanh thu ca cua hang",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 15.84,
+      "expected": 15.84,
+      "trace_errors": []
+    },
+    {
+      "id": "q_06de33fa21cc",
+      "business_id": "biz_118",
+      "question": "sp bán dc nhiều nhất tuần rồi là gì",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Xi măng Hà Tiên PCB40 bao 50kg",
+      "expected": "Xi măng Hà Tiên PCB40 bao 50kg",
+      "trace_errors": []
+    },
+    {
+      "id": "q_06e8d7da339d",
+      "business_id": "biz_105",
+      "question": "Tuần trước doanh thu bình quân mỗi đơn là bao nhiêu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 71698,
+      "new_answer": 72137,
+      "expected": 72137,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0711d68fb12f",
+      "business_id": "biz_130",
+      "question": "trong các tháng 11/2025, 12/2025 và 1/2026, cửa hàng có dthu cao nhất vào tháng nào",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2025-12",
+      "expected": "2025-12",
+      "trace_errors": []
+    },
+    {
+      "id": "q_073aee886aef",
+      "business_id": "biz_106",
+      "question": "Xem giúp khách còn nợ cửa hàng tổng cộng bao nhiêu tính đến hết ngày 20/09/2025?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 40798500,
+      "new_answer": 1877506,
+      "expected": 1877506,
+      "trace_errors": []
+    },
+    {
+      "id": "q_076d6ba59076",
+      "business_id": "biz_112",
+      "question": "Trong tháng 7 năm 2026, số sản phẩm xuất hiện ở từ 140 đơn hàng khác nhau trở lên là bao nhiêu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 1,
+      "new_answer": 23,
+      "expected": 23,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0794a9a26cef",
+      "business_id": "biz_106",
+      "question": "Cuối ngày hôm nay Bánh croissant còn mấy hộp chẵn, mấy cái lẻ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        13,
+        2
+      ],
+      "expected": [
+        13,
+        2
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_087a4081a1a9",
+      "business_id": "biz_118",
+      "question": "Tháng 4/2026 xe đã giao tổng cộng mấy đợt hàng?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 774,
+      "new_answer": 946,
+      "expected": 946,
+      "trace_errors": []
+    },
+    {
+      "id": "q_08a334c5931f",
+      "business_id": "biz_122",
+      "question": "gia ban mot vien strepsils cool hop 2 vi x 12 vien vao ngay 11/11/2025 la bn",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 13260,
+      "new_answer": 1700,
+      "expected": 1700,
+      "trace_errors": []
+    },
+    {
+      "id": "q_09427a977b31",
+      "business_id": "biz_130",
+      "question": "Giúp mình liệt kê 5 mặt hàng bán chạy nhất tuần rồi.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Bia Sài Gòn Special lon",
+        "Bia Tiger Bạc lon",
+        "Bia Heineken lon",
+        "Bò lúc lắc khoai tây",
+        "Cánh gà chiên nước mắm"
+      ],
+      "expected": [
+        "Bia Sài Gòn Special lon",
+        "Bia Tiger Bạc lon",
+        "Bia Heineken lon",
+        "Bò lúc lắc khoai tây",
+        "Cánh gà chiên nước mắm"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_095e5097bfb5",
+      "business_id": "biz_119",
+      "question": "doanh thu trung bình trên một đơn tháng 5/2025 là bnhiu hả",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 72443.81,
+      "new_answer": 72444,
+      "expected": 72444,
+      "trace_errors": []
+    },
+    {
+      "id": "q_09840cd43a2c",
+      "business_id": "biz_112",
+      "question": "trong quy 2 nam 2026 co tong cong bnhiu don",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 13860,
+      "new_answer": 13535,
+      "expected": 13535,
+      "trace_errors": []
+    },
+    {
+      "id": "q_09ac426d8fa6",
+      "business_id": "biz_123",
+      "question": "Lô Oresol 245 DHG hộp 20 gói gần hết hạn nhất có hạn dùng ngày nào?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": "2025-08-14",
+      "new_answer": "2029-04-20",
+      "expected": "2029-04-20",
+      "trace_errors": []
+    },
+    {
+      "id": "q_09ae9e282fd3",
+      "business_id": "biz_106",
+      "question": "Tổng dthu tháng 2 năm 2025 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 216045000,
+      "expected": 216045000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_09fe8610d418",
+      "business_id": "biz_109",
+      "question": "Tổng số lon Bia Tiger 330ml bán trong tháng 4/2026 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 273,
+      "expected": 273,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0a14fc442eee",
+      "business_id": "biz_123",
+      "question": "check giùm doanh thu nhóm hàng giảm đau hạ sốt tháng 12 năm 2025 là bn",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 12170400,
+      "expected": 12170400,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0a626a4c76d0",
+      "business_id": "biz_119",
+      "question": "Doanh thu trung bình trên một đơn tháng 3/2026 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 78584,
+      "expected": 78584,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0a76d3680594",
+      "business_id": "biz_123",
+      "question": "cho hỏi tính đến hết ngày 12/07/2025, 5 khách nào đang nợ nhiều nhất, mỗi người còn nợ bao nhiu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        "Doãn Phương Ngân",
+        "Quách Hồng Hiếu",
+        "Phan Bảo Quang",
+        "Thái Hoa Phương",
+        "Huỳnh Quang Hoa"
+      ],
+      "new_answer": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Đỗ Đức An",
+            404500
+          ],
+          [
+            "Dương Tâm Bích",
+            158600
+          ],
+          [
+            "Phùng Hồng Nam",
+            126000
+          ],
+          [
+            "Bạch Dương Phúc",
+            116000
+          ],
+          [
+            "La Dương Thu",
+            92000
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Đỗ Đức An",
+            404500
+          ],
+          [
+            "Dương Tâm Bích",
+            158600
+          ],
+          [
+            "Phùng Hồng Nam",
+            126000
+          ],
+          [
+            "Bạch Dương Phúc",
+            116000
+          ],
+          [
+            "La Dương Thu",
+            92000
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_0b6552ce1b0d",
+      "business_id": "biz_122",
+      "question": "Tuần rồi khách nào mua nhiều tiền nhất?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Lâm Hoa Long",
+      "expected": "Lâm Hoa Long",
+      "trace_errors": []
+    },
+    {
+      "id": "q_0bb2685c3a94",
+      "business_id": "biz_122",
+      "question": "cho tooi 5 khách mua nhìu tiền nhất thangs 6/2026",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Tạ Hoàng Lan",
+        "Đoàn Thảo Quang",
+        "Doãn Bảo Đức",
+        "Huỳnh Đức Huy",
+        "Từ Nam Lan"
+      ],
+      "expected": [
+        "Tạ Hoàng Lan",
+        "Đoàn Thảo Quang",
+        "Doãn Bảo Đức",
+        "Huỳnh Đức Huy",
+        "Từ Nam Lan"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_0bcf0fcf8740",
+      "business_id": "biz_128",
+      "question": "thang 6/2025 gia nhap binh quan mot thung bia tiger lon la bao nhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 371368,
+      "expected": 371368,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0beb25b8c099",
+      "business_id": "biz_129",
+      "question": "thang 5/2025 cua hang thu duoc bao nhieu tien khach tra no",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 1175023251,
+      "new_answer": 6817251,
+      "expected": 6817251,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0bf0638eaa4d",
+      "business_id": "biz_123",
+      "question": "khach con no cua hang tong cong bao nhieu tinh den het ngay 15/05/2026",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 1271554,
+      "expected": 1271554,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0bf48a939a7e",
+      "business_id": "biz_109",
+      "question": "Trong tháng 5/2025, doanh thu ca chiều hơn hay kém ca sáng bao nhiêu phần trăm vậy?",
+      "old_outcome": "wrong",
+      "new_outcome": "abstain",
+      "old_answer": 153615800,
+      "new_answer": null,
+      "expected": 25.55,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0d01c7956980",
+      "business_id": "biz_128",
+      "question": "Cho mình hỏi trung bình mỗi đơn tháng 7/2025 mang về bao nhiêu doanh thu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 523625.24,
+      "new_answer": 523625,
+      "expected": 523625,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0d1d7ead3e7e",
+      "business_id": "biz_121",
+      "question": "Tháng này các thuốc có hoạt chất Cetirizin bán được bao nhiêu tiền?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 1400400,
+      "new_answer": 1475400,
+      "expected": 1475400,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0d3c74a07021",
+      "business_id": "biz_124",
+      "question": "Acemuc Kids 200mg hộp 30 gói tăng giá lên 3.200đ: so 7 ngày kể từ ngày tăng với 7 ngày ngay trước thì số gói bán ra tăng hay giảm bao nhiêu % nhỉ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 391.3,
+      "expected": 391.3,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0d3d69f04d88",
+      "business_id": "biz_120",
+      "question": "Tháng 7/2025 dthu bình quân mỗi đơn hàng là bao nhiêu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 114261.04,
+      "new_answer": 114261,
+      "expected": 114261,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0d5667212f41",
+      "business_id": "biz_106",
+      "question": "trong thang 2 nam 2025 cua hang ban duoc may ly tra sua o long (m)",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 149,
+      "expected": 149,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0dea4845a4cd",
+      "business_id": "biz_109",
+      "question": "so don bi huy trong thang 7 nam 2026 la bao nhieu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 62,
+      "expected": 62,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0dfc898d10a0",
+      "business_id": "biz_119",
+      "question": "dthu quý 2/2026 của cửa hàng là bnhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 408903100,
+      "expected": 408903100,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0e3a436c60d7",
+      "business_id": "biz_120",
+      "question": "coi gium thang 10/2025 nhap hang het bao nhieu tien",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 234634900,
+      "expected": 234634900,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0e46069808e0",
+      "business_id": "biz_121",
+      "question": "tuan roi hang nao chay nhat",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Decolgen Forte hộp 30 vỉ x 4 viên",
+      "expected": "Decolgen Forte hộp 30 vỉ x 4 viên",
+      "trace_errors": []
+    },
+    {
+      "id": "q_0ed6031586cc",
+      "business_id": "biz_123",
+      "question": "tiền vốn đang nằm ở các lô còn tồn có hạn dùng từ 28/06/2026 đến hết 26/09/2026 là bnhiu vậy",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 129596040600,
+      "new_answer": 7899400,
+      "expected": 7899400,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0eef1e74b13e",
+      "business_id": "biz_124",
+      "question": "Cho mình hỏi theo tồn kho ngày 25/05/2026, lô Siro ăn ngon Ích Nhi Plus chai 100ml gần hết hạn nhất có hạn dùng là ngày nào?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2028-08-06",
+      "expected": "2028-08-06",
+      "trace_errors": []
+    },
+    {
+      "id": "q_0ef3574c2b44",
+      "business_id": "biz_115",
+      "question": "So với tháng liền trước, doanh thu tháng 3 năm 2026 thay đổi bao nhiêu %?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 66.01,
+      "expected": 66.01,
+      "trace_errors": []
+    },
+    {
+      "id": "q_0f6f50127e77",
+      "business_id": "biz_127",
+      "question": "Top 3 khách hàng có công nợ lớn nhất đến hết ngày 28/07/2026 và số nợ của từng người?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": {
+        "columns": [
+          "khach_hang_ten",
+          "total_debt"
+        ],
+        "rows": [
+          [
+            "Lâm Bảo Ngọc",
+            632000
+          ],
+          [
+            "Nghiêm Duy Linh",
+            620000
+          ],
+          [
+            "Lương Huy Quang",
+            360500
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Lâm Bảo Ngọc",
+            632000
+          ],
+          [
+            "Nghiêm Duy Linh",
+            620000
+          ],
+          [
+            "Lương Huy Quang",
+            360500
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_0fc33ac2add7",
+      "business_id": "biz_124",
+      "question": "Từ tháng 4/2025 qua tháng 5/2025 rồi tháng 6/2025, doanh thu có tăng liên tục không?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": false,
+      "expected": false,
+      "trace_errors": []
+    },
+    {
+      "id": "q_10bc8425f884",
+      "business_id": "biz_124",
+      "question": "Tháng 8/2025 giá nhập bình quân một hộp Oresol 245 DHG hộp 20 gói là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 20455,
+      "expected": 20455,
+      "trace_errors": []
+    },
+    {
+      "id": "q_112c84a433a5",
+      "business_id": "biz_102",
+      "question": "Doanh thu tháng 5/2026 tăng hay giảm bao nhiêu phần trăm so với tháng trước?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -1.79,
+      "expected": -1.79,
+      "trace_errors": []
+    },
+    {
+      "id": "q_11d72b8e4f6a",
+      "business_id": "biz_123",
+      "question": "Tháng 1/2026 khách Vương Hạnh Chi ghi nợ thêm bao nhiêu và trả nợ đc bao nhiêu? Ghi hai số theo thứ tự: nợ thêm, trả được.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        139000,
+        46333
+      ],
+      "expected": [
+        139000,
+        46333
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_122c8d717bba",
+      "business_id": "biz_102",
+      "question": "revenue hnay la bao nhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 11111900,
+      "expected": 11111900,
+      "trace_errors": []
+    },
+    {
+      "id": "q_12952a011018",
+      "business_id": "biz_117",
+      "question": "tháng 8/2025 cửa hàng nhập thép pomina D10 cây 11.7m bình quân bao nhiêu tieenf một cây",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 104122,
+      "expected": 104122,
+      "trace_errors": []
+    },
+    {
+      "id": "q_12a9fedc1368",
+      "business_id": "biz_118",
+      "question": "xét 3 tháng 3/2025, 4/2025 và 5/2025, doanh thu tháng naof lớn nhất",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2025-05",
+      "expected": "2025-05",
+      "trace_errors": []
+    },
+    {
+      "id": "q_12acf57a8170",
+      "business_id": "biz_121",
+      "question": "Khách nào mua nhiều đơn hàng nhất tháng 10/2025?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Hứa Đạt Chi",
+      "expected": "Hứa Đạt Chi",
+      "trace_errors": []
+    },
+    {
+      "id": "q_1367a63a409f",
+      "business_id": "biz_105",
+      "question": "tinh tu ngay 1/1 den het hom nay, doanh thu nam nay la bao nhieu do",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 2086001100,
+      "expected": 2086001100,
+      "trace_errors": []
+    },
+    {
+      "id": "q_13db1a0a7ea9",
+      "business_id": "biz_102",
+      "question": "Liệt kê 3 khách chi tiêu nhiều nhất trong tháng 6 năm 2025.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Thân Cường Bình",
+        "Dương Duy Hồng",
+        "Bùi Ngân Hồng"
+      ],
+      "expected": [
+        "Thân Cường Bình",
+        "Dương Duy Hồng",
+        "Bùi Ngân Hồng"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_13fc08e94004",
+      "business_id": "biz_108",
+      "question": "nhom thuc pham thang 7/2025 ban duoc bao nhieu tien",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 8257000,
+      "expected": 8257000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_144f8e62d410",
+      "business_id": "biz_120",
+      "question": "Giá nhập bình quân một hộp Oresol 245 DHG hộp 20 gói trong tháng 2 năm 2026 là bao nhiêu ạ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 21463,
+      "expected": 21463,
+      "trace_errors": []
+    },
+    {
+      "id": "q_14693fd38657",
+      "business_id": "biz_124",
+      "question": "Đến hết ngày 12/11/2025, số khách còn công nợ với cửa hàng là bao nhiêu nhỉ?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 24,
+      "expected": 24,
+      "trace_errors": []
+    },
+    {
+      "id": "q_14ea21a5b6a1",
+      "business_id": "biz_108",
+      "question": "Cho mình hỏi doanh thu các đơn bán qua Zalo OA và doanh thu các đơn bán tại quầy tháng này lần lượt là bao nhiêu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        244446600,
+        16197500
+      ],
+      "new_answer": [
+        16970600,
+        244446600
+      ],
+      "expected": [
+        16970600,
+        244446600
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_151d139d77ca",
+      "business_id": "biz_102",
+      "question": "Top 3 khách hàng mua nhiều tiền nhất tháng 3/2026 là ai ạ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Chung Huy Sơn",
+        "Lý Bình Dũng",
+        "Giang Lan Ngọc"
+      ],
+      "expected": [
+        "Chung Huy Sơn",
+        "Lý Bình Dũng",
+        "Giang Lan Ngọc"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_153f4e995558",
+      "business_id": "biz_106",
+      "question": "tính đến hết ngày 27/10/2025, 3 khách nào đang nợ nhiều nhất, mỗi người còn nợ bao nhiêu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Mai Trang Dũng",
+            174667
+          ],
+          [
+            "Ngô Thảo Châu",
+            149500
+          ],
+          [
+            "Luu Ha An",
+            90000
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Mai Trang Dũng",
+            174667
+          ],
+          [
+            "Ngô Thảo Châu",
+            149500
+          ],
+          [
+            "Lưu Hà An",
+            90000
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_16f9cc98ab35",
+      "business_id": "biz_103",
+      "question": "so vs cùng kỳ tháng trước, doanh thu từ đầu tháng này đến hết bữa nay tăng hay giảm nhiêu % hả",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": -0.7,
+      "expected": -0.7,
+      "trace_errors": []
+    },
+    {
+      "id": "q_179b70dee72f",
+      "business_id": "biz_105",
+      "question": "Cho mình hỏi tháng 12/2025 có bao nhiêu ngày đạt doanh thu từ 12.000.000 đồng trở lên?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 14,
+      "expected": 14,
+      "trace_errors": []
+    },
+    {
+      "id": "q_181453dd6752",
+      "business_id": "biz_112",
+      "question": "so don tu dau nam toi het hnay la bnhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 7097,
+      "expected": 7097,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1837da83c4a5",
+      "business_id": "biz_128",
+      "question": "khach mua nhiu tien nhat thang 1/2026 la ai",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Tạ Quang Khánh",
+      "expected": "Tạ Quang Khánh",
+      "trace_errors": []
+    },
+    {
+      "id": "q_1885ab61433f",
+      "business_id": "biz_106",
+      "question": "Tháng 8 năm 2025 bán ra bao nhiêu cái Bánh tiramisu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 89,
+      "expected": 89,
+      "trace_errors": []
+    },
+    {
+      "id": "q_18a4f2eb5280",
+      "business_id": "biz_117",
+      "question": "tháng 1/2025 giá nhập bình quân một cây băng keo điện nano 20 yard là bao nhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 63522,
+      "expected": 63522,
+      "trace_errors": []
+    },
+    {
+      "id": "q_18adf5dc2e3f",
+      "business_id": "biz_109",
+      "question": "So với tháng trước đó, dthu tháng 10/2025 tăng hay giảm mấy phần trăm",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 6.8,
+      "expected": 6.8,
+      "trace_errors": []
+    },
+    {
+      "id": "q_18d173308b03",
+      "business_id": "biz_105",
+      "question": "Tháng 6/2025 ai mua hàng nhiều tiền nhất?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Trịnh Thanh Dương",
+      "expected": "Trịnh Thanh Dương",
+      "trace_errors": []
+    },
+    {
+      "id": "q_18e8c7f00fce",
+      "business_id": "biz_123",
+      "question": "Tính đến hết ngày 08/10/2025, tổng số tiền khách còn nợ ở các đơn đã đặt quá 15 ngày là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 51036,
+      "expected": 51036,
+      "trace_errors": []
+    },
+    {
+      "id": "q_18f8cdf43ae0",
+      "business_id": "biz_130",
+      "question": "nam nay, tinh tu dau nam den het bua nay, dthu cua cua hang la bao nhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 6199692000,
+      "expected": 6199692000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1915a6fd7b94",
+      "business_id": "biz_129",
+      "question": "Ngày 14/11/2025 cửa hàng bán Rau củ kho quẹt giá bao nhiêu một đĩa?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 80000,
+      "new_answer": 72500,
+      "expected": 72500,
+      "trace_errors": []
+    },
+    {
+      "id": "q_194556651253",
+      "business_id": "biz_106",
+      "question": "ca chieu thang 8/2025 doanh thu duoc bnhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 125457000,
+      "expected": 125457000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_197487e4b9a2",
+      "business_id": "biz_121",
+      "question": "cho tôi dthu của tháng 1/2026, tháng 2/2026 vaf tháng 3/2026, ghi lần luwowtj theo thứ tự đó",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        264082800,
+        250892100,
+        259652600
+      ],
+      "expected": [
+        264082800,
+        250892100,
+        259652600
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_19b422be1d9b",
+      "business_id": "biz_130",
+      "question": "cho tooi bieets số đơn tuần trước",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 502,
+      "expected": 502,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1a11488ed8c6",
+      "business_id": "biz_124",
+      "question": "tính đến hết ngày 10/08/2025, 3 khách nào đang nợ nhìu nhất, mỗi người còn nợ bao nhiêu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        "đặng trang khoa",
+        "đặng sơn duy",
+        "đào đạt phúc"
+      ],
+      "new_answer": {
+        "columns": [
+          "ten_kh",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Phạm Phong Hoàng",
+            243000
+          ],
+          [
+            "đàm ngọc trung",
+            210100
+          ],
+          [
+            "Kiều Trung Nam",
+            151600
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Phạm Phong Hoàng",
+            243000
+          ],
+          [
+            "Đàm Ngọc Trung",
+            210100
+          ],
+          [
+            "Kiều Trung Nam",
+            151600
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_1a5bcf04fe57",
+      "business_id": "biz_122",
+      "question": "Cho hỏi tổng doanh thu quý 1/2026 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 773229200,
+      "expected": 773229200,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1a70054e2f85",
+      "business_id": "biz_102",
+      "question": "xem giup dthu bua nay la bnhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 9709400,
+      "expected": 9709400,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1a8f8da9b500",
+      "business_id": "biz_104",
+      "question": "liet ke 5 khach chi tieu nhiu nhat trong thang 10 nam 2025",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Đàm Long Dũng",
+        "Nguyễn Quang Dũng",
+        "Kiều Thắng Hằng",
+        "Vương Huy Giang",
+        "Trần Bảo Đức"
+      ],
+      "expected": [
+        "Đàm Long Dũng",
+        "Nguyễn Quang Dũng",
+        "Kiều Thắng Hằng",
+        "Vương Huy Giang",
+        "Trần Bảo Đức"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_1b0010b8da08",
+      "business_id": "biz_113",
+      "question": "so bo van day gas namilux ban duoc trong thang 12/2025 la bn",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 17,
+      "expected": 17,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1b0a47e42b97",
+      "business_id": "biz_124",
+      "question": "Cho mình hỏi so với cùng kỳ tháng trước, doanh thu từ đầu tháng này đến hết hôm nay tăng hay giảm bao nhiêu %?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 7.35,
+      "expected": 7.35,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1b211d642140",
+      "business_id": "biz_111",
+      "question": "Tháng 2 năm 2025, 5 khách nào chi tiêu nhiều nhất?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Cao Long Minh",
+        "Ông Quang Hoàng",
+        "Hoàng Trung Hương",
+        "Chung Long Châu",
+        "Triệu Thảo Hùng"
+      ],
+      "expected": [
+        "Cao Long Minh",
+        "Ông Quang Hoàng",
+        "Hoàng Trung Hương",
+        "Chung Long Châu",
+        "Triệu Thảo Hùng"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_1bab154ec708",
+      "business_id": "biz_115",
+      "question": "hnay cua hang ban dc bao nhiu tien vay",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 25120700,
+      "expected": 25120700,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1c2e8610ac47",
+      "business_id": "biz_129",
+      "question": "dthu thang 3/2026 tang hay giam bnhiu phan tram so vs thang truoc do",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 42.69,
+      "expected": 42.69,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1dfefb6201cf",
+      "business_id": "biz_123",
+      "question": "Doanh thu tháng 11/2025 hơn hay kém tháng trước bao nhiêu phần trăm?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -0.11,
+      "expected": -0.11,
+      "trace_errors": []
+    },
+    {
+      "id": "q_1fa63c38c946",
+      "business_id": "biz_127",
+      "question": "Liệt kê 3 khách chi tiêu nhiều nhất trong tháng 5 năm 2026.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Ngô Minh Dũng",
+        "Lâm Đức Quân",
+        "Thân Thắng Phương"
+      ],
+      "expected": [
+        "Ngô Minh Dũng",
+        "Lâm Đức Quân",
+        "Thân Thắng Phương"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_1fe312ba9eed",
+      "business_id": "biz_105",
+      "question": "e dem so don ban trong ca sang tuan roi",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 599,
+      "new_answer": 605,
+      "expected": 605,
+      "trace_errors": []
+    },
+    {
+      "id": "q_20229203ac89",
+      "business_id": "biz_102",
+      "question": "cho toi 3 khach mua nhieu tien nhat thang 5/2025",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Ông Giang Tâm",
+        "Lưu Đạt Hạnh",
+        "Vương Long Phúc"
+      ],
+      "expected": [
+        "Ông Giang Tâm",
+        "Lưu Đạt Hạnh",
+        "Vương Long Phúc"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_20454bee0743",
+      "business_id": "biz_103",
+      "question": "dthu quý 2/2025 của cửa hàng là bao nhiêu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 488026800,
+      "expected": 488026800,
+      "trace_errors": []
+    },
+    {
+      "id": "q_20aa716764dc",
+      "business_id": "biz_119",
+      "question": "so voi thang lien trc, doanh thu thang 3 nam 2026 thay doi bao nhiu %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 1.51,
+      "expected": 1.51,
+      "trace_errors": []
+    },
+    {
+      "id": "q_20ad1fe3cbcd",
+      "business_id": "biz_106",
+      "question": "từ đầu năm đến hết hnay cửa hàng bán được nhiêu tiền",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 429490000,
+      "expected": 429490000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_20cfa482235e",
+      "business_id": "biz_105",
+      "question": "coi giùm tháng 5/2026 cuwar hàng nhập nhiều tiền hàng nhất từ nhaf cung cấp nào",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Cty Thân Ngọc",
+      "expected": "Cty Thân Ngọc",
+      "trace_errors": []
+    },
+    {
+      "id": "q_20ef7fe8e588",
+      "business_id": "biz_124",
+      "question": "Trung bình mỗi đơn tháng 2/2025 mang về bao nhiêu doanh thu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 115685,
+      "new_answer": 114391,
+      "expected": 114391,
+      "trace_errors": []
+    },
+    {
+      "id": "q_210839280113",
+      "business_id": "biz_118",
+      "question": "thang 8/2026 khach nao mua nhieu don nhat",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Mai Bích Dũng",
+      "expected": "Mai Bích Dũng",
+      "trace_errors": []
+    },
+    {
+      "id": "q_214e94e42454",
+      "business_id": "biz_129",
+      "question": "ngày naof trong tháng 6/2025 dthu cao nhaats",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2025-06-07",
+      "expected": "2025-06-07",
+      "trace_errors": []
+    },
+    {
+      "id": "q_21c12147e6d6",
+      "business_id": "biz_127",
+      "question": "Tháng 6/2025 khách nào mua nhiều tiền nhất?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Thân Hồng Nhung",
+      "expected": "Thân Hồng Nhung",
+      "trace_errors": []
+    },
+    {
+      "id": "q_21c312790767",
+      "business_id": "biz_119",
+      "question": "trong tháng 11/2025, acemuc kids 200mg hộp 30 gói nhập vào giá bình quân một hộp laf bao nhiêu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 71143,
+      "expected": 71143,
+      "trace_errors": []
+    },
+    {
+      "id": "q_22066f683e43",
+      "business_id": "biz_129",
+      "question": "Giá trị trung bình một đơn tháng 5/2025 là bao nhiêu vậy?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 533613.73,
+      "new_answer": 538804,
+      "expected": 538804,
+      "trace_errors": []
+    },
+    {
+      "id": "q_22184c4bfb6b",
+      "business_id": "biz_107",
+      "question": "gia ban mot goi keo alpenliebe 100g vao ngay 15/04/2025 la bn",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 12000,
+      "expected": 12000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2225d390b8bb",
+      "business_id": "biz_117",
+      "question": "3 khách hàng có tổng tiền mua cao nhất tuần rồi là ai nhỉ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Kiều Bảo Khoa",
+        "Huỳnh Phúc Huy",
+        "Phan Hạnh Khoa"
+      ],
+      "expected": [
+        "Kiều Bảo Khoa",
+        "Huỳnh Phúc Huy",
+        "Phan Hạnh Khoa"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_228efd786818",
+      "business_id": "biz_123",
+      "question": "check gium dthu cac don ban qua dien thoai va doanh thu cac don ban tai quay thang nay lan luot la bao nhieu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        6739400,
+        149738300
+      ],
+      "expected": [
+        6739400,
+        149738300
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_230963509814",
+      "business_id": "biz_108",
+      "question": "Nhân viên bán giỏi nhất tháng 12/2025 là ai?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "NV001",
+      "expected": "NV001",
+      "trace_errors": []
+    },
+    {
+      "id": "q_237a88f0c7e3",
+      "business_id": "biz_129",
+      "question": "So doanh thu các đơn trả bằng COD với doanh thu các đơn trả bằng tiền mặt tháng này: mỗi bên bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        21961500,
+        204504500
+      ],
+      "expected": [
+        21961500,
+        204504500
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_239ed3fe4a45",
+      "business_id": "biz_119",
+      "question": "Sản phẩm bán đc nhiều nhất trong tháng 6 năm 2026 là gì",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Panadol Extra hộp 15 vỉ x 12 viên",
+      "expected": "Panadol Extra hộp 15 vỉ x 12 viên",
+      "trace_errors": []
+    },
+    {
+      "id": "q_23cc3324f032",
+      "business_id": "biz_118",
+      "question": "ê dthu nhóm hàng gas & nước chiếm bao nhiêu phần trăm tổng doanh thu tháng 4 năm 2026",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 12.26,
+      "expected": 12.26,
+      "trace_errors": []
+    },
+    {
+      "id": "q_23cea7790c35",
+      "business_id": "biz_106",
+      "question": "Tính đến hết ngày 05/04/2025, tổng số tiền khách còn nợ ở các đơn đã đặt quá 7 ngày là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 650836,
+      "expected": 650836,
+      "trace_errors": []
+    },
+    {
+      "id": "q_23e155632945",
+      "business_id": "biz_116",
+      "question": "Tháng 5/2026 doanh thu thay đổi bao nhiêu % so với tháng liền trước?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 9.56,
+      "expected": 9.56,
+      "trace_errors": []
+    },
+    {
+      "id": "q_250cc0cd8ae0",
+      "business_id": "biz_123",
+      "question": "Trong tháng 6/2025, bao nhiêu đơn có tiền hàng đạt 41.000 đồng trở lên?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 1,
+      "new_answer": 979,
+      "expected": 979,
+      "trace_errors": []
+    },
+    {
+      "id": "q_250cf7d222c0",
+      "business_id": "biz_123",
+      "question": "lô acyclovir stella kem 5% tuýp 5g gần hết hạn nhất có hạn dùng ngày nào",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": "2025-06-24",
+      "new_answer": "2029-05-12",
+      "expected": "2029-05-12",
+      "trace_errors": []
+    },
+    {
+      "id": "q_2528eab85436",
+      "business_id": "biz_117",
+      "question": "khach nao mua nhieu don nhat thang 12/2025 ha",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Đinh Bảo Châu",
+      "expected": "Đinh Bảo Châu",
+      "trace_errors": []
+    },
+    {
+      "id": "q_25501a11062a",
+      "business_id": "biz_128",
+      "question": "hnay cửa hàng bán đc bao nhiêu tiền?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 27145500,
+      "expected": 27145500,
+      "trace_errors": []
+    },
+    {
+      "id": "q_257bf10688b9",
+      "business_id": "biz_123",
+      "question": "e thang 12/2025, cac khach thuoc nhom si mua tong cong bao nhiu tien hang",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 15773200,
+      "expected": 15773200,
+      "trace_errors": []
+    },
+    {
+      "id": "q_259342644826",
+      "business_id": "biz_109",
+      "question": "Tuần trước số đơn ca chiều chênh ca sáng bao nhiêu phần trăm?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 31.39,
+      "expected": 31.39,
+      "trace_errors": []
+    },
+    {
+      "id": "q_25c012ee0fce",
+      "business_id": "biz_124",
+      "question": "trong thang 8/2025, tien khach tra bot no cac don mua chiu duoc bao nhiu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 2996996,
+      "expected": 2996996,
+      "trace_errors": []
+    },
+    {
+      "id": "q_25e68617a9f7",
+      "business_id": "biz_106",
+      "question": "Quán bán được bao nhiêu ly size L trong tháng này, cộng mọi món?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 1088,
+      "expected": 1088,
+      "trace_errors": []
+    },
+    {
+      "id": "q_261be063aa99",
+      "business_id": "biz_127",
+      "question": "thang 10/2025 doanh thu thay doi bnhiu % so vs thang lien trc",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 1.47,
+      "expected": 1.47,
+      "trace_errors": []
+    },
+    {
+      "id": "q_26328d66cbe6",
+      "business_id": "biz_121",
+      "question": "check gium ti trong cua nhom thuc pham chuc nang trong dthu thang 3/2025 la bao nhieu %",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 25.51,
+      "expected": 25.51,
+      "trace_errors": []
+    },
+    {
+      "id": "q_277c700a360c",
+      "business_id": "biz_112",
+      "question": "Từ đầu năm đến hết hôm nay cửa hàng bán được bao nhiêu tiền?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 620091500,
+      "expected": 620091500,
+      "trace_errors": []
+    },
+    {
+      "id": "q_281d6d8a83c6",
+      "business_id": "biz_105",
+      "question": "Doanh thu 3 tháng liền nhau kết thúc ở tháng 3/2026 là bao nhiêu mỗi tháng, từ tháng cũ đến tháng mới?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        13250100,
+        12376300,
+        16802400,
+        13816200,
+        10662600,
+        12879900,
+        10550600,
+        12675800,
+        11289900,
+        12558400,
+        15979700,
+        11535600,
+        11403000,
+        13373300,
+        9175900,
+        12246700,
+        11716200,
+        14646100,
+        10462800,
+        11624900,
+        12164100,
+        9375500,
+        12259900,
+        14958400,
+        14232300,
+        10871500,
+        10456100,
+        13365500,
+        12959400,
+        15439600,
+        14405300,
+        14511600,
+        13559000,
+        13987600,
+        12565800,
+        14488000,
+        10597800,
+        13708300,
+        13274100,
+        11574600,
+        7746800,
+        7558900,
+        7802900,
+        6825400,
+        7895500,
+        6822400,
+        7990700,
+        5638500,
+        6463200,
+        7474900,
+        5452100,
+        8423700,
+        8680900,
+        7011700,
+        5787700,
+        8536900,
+        7252800,
+        12853200,
+        14546700,
+        15873800,
+        12228100,
+        13335000,
+        12791300,
+        9766900,
+        11873800,
+        13830500,
+        14035300,
+        11837200,
+        12809100,
+        12205700,
+        12719400,
+        12600700,
+        14565700,
+        13390600,
+        12342200,
+        10070200,
+        11759000,
+        13512400,
+        16043000,
+        12850500,
+        14022000,
+        10436200,
+        12951500,
+        11547900,
+        11219200,
+        14385600,
+        14396800,
+        14899300,
+        12456500,
+        12126200
+      ],
+      "new_answer": [
+        389514000,
+        269031700,
+        398881600
+      ],
+      "expected": [
+        389514000,
+        269031700,
+        398881600
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_284698f995b8",
+      "business_id": "biz_119",
+      "question": "trong thang 6/2025, yumangel hop 20 goi nhap vao gia binh quan mot hop la bao nhiu vay",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 86414,
+      "expected": 86414,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2889186ce0d8",
+      "business_id": "biz_124",
+      "question": "Giá nhập bình quân một hộp Gaviscon hộp 24 gói x 10ml trong tháng 11 năm 2025 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 150182,
+      "expected": 150182,
+      "trace_errors": []
+    },
+    {
+      "id": "q_28ce28381db2",
+      "business_id": "biz_121",
+      "question": "trong các tháng 11/2025, 12/2025 và 1/2026, cửa hàng có dthu cao nhất vào tháng nào",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2025-12",
+      "expected": "2025-12",
+      "trace_errors": []
+    },
+    {
+      "id": "q_29eb2ce0741a",
+      "business_id": "biz_106",
+      "question": "ee tuần rồi dthu ca chiều chênh ca sangs nhiêu %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -24.9,
+      "expected": -24.9,
+      "trace_errors": []
+    },
+    {
+      "id": "q_29f3255d8636",
+      "business_id": "biz_118",
+      "question": "Xét 3 tháng 10/2025, 11/2025 và 12/2025, doanh thu tháng nào lớn nhất?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2025-11",
+      "expected": "2025-11",
+      "trace_errors": []
+    },
+    {
+      "id": "q_2a0e86444947",
+      "business_id": "biz_106",
+      "question": "Trong tháng 7/2026, bao nhiêu đơn có tiền hàng đạt 130.000 đồng trở lên nhỉ?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 82,
+      "new_answer": 507,
+      "expected": 507,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2a9f4fc5fb1f",
+      "business_id": "biz_122",
+      "question": "Tháng 5/2026 doanh thu thay đổi bao nhiêu % so với tháng liền trước?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -4.09,
+      "expected": -4.09,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2b2a3485b81b",
+      "business_id": "biz_120",
+      "question": "trong thang 2/2025, berocca performance vien sui tuyp 10 vien nhap vao gia binh quan mot tuyp la bnhiu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 63478,
+      "expected": 63478,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2be345d37d89",
+      "business_id": "biz_120",
+      "question": "ê dthu tháng 2/2025 hơn hay kém th trước bn %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -8.51,
+      "expected": -8.51,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2bf6b2b1b7b7",
+      "business_id": "biz_106",
+      "question": "Tháng 10/2025 cửa hàng bán được tổng cộng bao nhiêu tiền vậy?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 296157500,
+      "expected": 296157500,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2c5b660fce33",
+      "business_id": "biz_119",
+      "question": "Trong tháng 10/2025, Gaviscon hộp 24 gói x 10ml nhập vào giá bình quân một hộp là bao nhiêu nhỉ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 147900,
+      "expected": 147900,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2ca8fd946a09",
+      "business_id": "biz_130",
+      "question": "doanh thu từ đầu năm tới heets hnay là bao nhiêu nhỉ",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 5888993000,
+      "expected": 5888993000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2cdc20d0256d",
+      "business_id": "biz_119",
+      "question": "Giá nhập bình quân một hộp Efferalgan 500mg viên sủi hộp 4 vỉ x 4 viên trong tháng 2 năm 2026 là bao nhiêu vậy?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 38933,
+      "expected": 38933,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2e8a1220169c",
+      "business_id": "biz_128",
+      "question": "Top 5 khách hàng mua nhiều tiền nhất tháng 5/2026 là ai?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Triệu Cường Thanh",
+        "Nghiêm Bình Hằng",
+        "Triệu Mai Huy",
+        "Châu Châu Anh",
+        "Tạ Quang Khánh"
+      ],
+      "expected": [
+        "Triệu Cường Thanh",
+        "Nghiêm Bình Hằng",
+        "Triệu Mai Huy",
+        "Châu Châu Anh",
+        "Tạ Quang Khánh"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_2f1cdd6dfdd2",
+      "business_id": "biz_115",
+      "question": "thang 10/2025 dthu thay doi bao nhieu % so vs thang lien trc z",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 89.31,
+      "new_answer": -10.69,
+      "expected": -10.69,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2f603f3adc11",
+      "business_id": "biz_105",
+      "question": "tháng 11/2025 cuwar hangf có bn % đơn bị huỷ nhỉ",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 100,
+      "new_answer": 2.26,
+      "expected": 2.26,
+      "trace_errors": []
+    },
+    {
+      "id": "q_2fd93c950188",
+      "business_id": "biz_122",
+      "question": "Doanh thu từ đầu tháng này đến hết hôm nay hơn hay kém cùng kỳ tháng trước bao nhiêu phần trăm?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -6.77,
+      "expected": -6.77,
+      "trace_errors": []
+    },
+    {
+      "id": "q_307ac5840cca",
+      "business_id": "biz_104",
+      "question": "doanh thu thang 5/2026 hon hay kem thang trc bao nhiu %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 3.7,
+      "expected": 3.7,
+      "trace_errors": []
+    },
+    {
+      "id": "q_30a019c7195f",
+      "business_id": "biz_130",
+      "question": "thangs 1/2026 bán nghêu hấp sả đc nhiêu tieenf",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 25442000,
+      "expected": 25442000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3163962d5127",
+      "business_id": "biz_128",
+      "question": "Quý 1 năm 2026 cửa hàng bán đc tổng cộng bao nhiêu tiền?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 2174852500,
+      "expected": 2174852500,
+      "trace_errors": []
+    },
+    {
+      "id": "q_31c024e7b485",
+      "business_id": "biz_116",
+      "question": "3 khách hàng có tổng tiền mua cao nhất tháng 3/2026 là ai?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Tăng Lan Hạnh",
+        "Đoàn Cường Thắng",
+        "Hứa Bảo Hùng"
+      ],
+      "expected": [
+        "Tăng Lan Hạnh",
+        "Đoàn Cường Thắng",
+        "Hứa Bảo Hùng"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_327ffb3f517d",
+      "business_id": "biz_103",
+      "question": "Liệt kê 3 khách chi tiêu nhiều nhất tuần rồi.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Đỗ Duy Khánh",
+        "Tô Phương Hương",
+        "Ngô Bảo Nam"
+      ],
+      "expected": [
+        "Đỗ Duy Khánh",
+        "Tô Phương Hương",
+        "Ngô Bảo Nam"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_32a692d7807b",
+      "business_id": "biz_106",
+      "question": "Tính đến hết ngày 16/12/2025, khách hàng còn nợ cửa hàng tổng cộng bao nhiêu tiền?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 57387500,
+      "new_answer": 1005670,
+      "expected": 1005670,
+      "trace_errors": []
+    },
+    {
+      "id": "q_338ae382671b",
+      "business_id": "biz_105",
+      "question": "Tuần trước ca chiều so với ca sáng thì doanh thu chênh bao nhiêu %?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -16.41,
+      "expected": -16.41,
+      "trace_errors": []
+    },
+    {
+      "id": "q_33a2f625cc8c",
+      "business_id": "biz_124",
+      "question": "tổng doanh thu tháng 5 năm 2025 là bao nhiêu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 348973500,
+      "new_answer": 346554700,
+      "expected": 346554700,
+      "trace_errors": []
+    },
+    {
+      "id": "q_33f75059825a",
+      "business_id": "biz_123",
+      "question": "Tháng 4/2026, doanh thu các đơn trả bằng COD và các đơn trả bằng ví điện tử mỗi loại bao nhiêu ạ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        10849600,
+        15777900
+      ],
+      "expected": [
+        10849600,
+        15777900
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_341141d1a85c",
+      "business_id": "biz_108",
+      "question": "Khách mua nhiều tiền nhất tháng 1/2026 là ai?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Kiều Hiếu Thắng",
+      "expected": "Kiều Hiếu Thắng",
+      "trace_errors": []
+    },
+    {
+      "id": "q_341ef54de645",
+      "business_id": "biz_127",
+      "question": "So với tháng trước đó, doanh thu tháng 11/2025 tăng hay giảm mấy phần trăm?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 0.74,
+      "expected": 0.74,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3479c2ab0f71",
+      "business_id": "biz_117",
+      "question": "Cho mình hỏi ngày 30/01/2025 Nước tinh khiết Bidrico 20L tăng giá từ 45.000đ lên 47.000đ. Số bình bán được trong 7 ngày kể từ ngày đó so với 7 ngày trước đó thay đổi bao nhiêu %?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": -50,
+      "new_answer": 16.67,
+      "expected": 16.67,
+      "trace_errors": []
+    },
+    {
+      "id": "q_35835bfa23d1",
+      "business_id": "biz_122",
+      "question": "Đếm số ngày trong tháng 3 năm 2026 mà doanh thu cả ngày từ 7.900.000 đồng trở lên.",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 31,
+      "new_answer": 15,
+      "expected": 15,
+      "trace_errors": []
+    },
+    {
+      "id": "q_35f07818e5ae",
+      "business_id": "biz_119",
+      "question": "Cho tôi 3 khách mua nhiều tiền nhất tháng 9/2025.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Mai Hoa Nhung",
+        "Tạ Thảo Tâm",
+        "Ông Hằng Bảo"
+      ],
+      "expected": [
+        "Mai Hoa Nhung",
+        "Tạ Thảo Tâm",
+        "Ông Hằng Bảo"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_362713b839b7",
+      "business_id": "biz_103",
+      "question": "doanh thu tu dau nam toi het hom nay la bao nhieu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 862456900,
+      "expected": 862456900,
+      "trace_errors": []
+    },
+    {
+      "id": "q_36cda8515d30",
+      "business_id": "biz_117",
+      "question": "tuần trc doanh thu bình quân mỗi đơn hàng là bao nhiêu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 1529206,
+      "expected": 1529206,
+      "trace_errors": []
+    },
+    {
+      "id": "q_36d4c28e5079",
+      "business_id": "biz_104",
+      "question": "so vs th truoc do, dthu thang 1/2026 tang hay giam may phan tram",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 0.14,
+      "expected": 0.14,
+      "trace_errors": []
+    },
+    {
+      "id": "q_36e95d0049de",
+      "business_id": "biz_109",
+      "question": "Tuần trước riêng ca chiều bán được tổng cộng bao nhiêu tiền nhỉ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 32063600,
+      "expected": 32063600,
+      "trace_errors": []
+    },
+    {
+      "id": "q_37177a05844b",
+      "business_id": "biz_104",
+      "question": "5 khách hàng có tổng tiền mua cao nhất tháng 9/2025 là ai?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Thân Anh An",
+        "Tăng Đức Hải",
+        "Lý Khánh Đức",
+        "Bùi Thanh Duy",
+        "Đào Ngọc Lan"
+      ],
+      "expected": [
+        "Thân Anh An",
+        "Tăng Đức Hải",
+        "Lý Khánh Đức",
+        "Bùi Thanh Duy",
+        "Đào Ngọc Lan"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_38030489a1b6",
+      "business_id": "biz_129",
+      "question": "giá trị trung bình một đơn tháng 4/2026 là bao nhieeu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 538830.95,
+      "new_answer": 544087,
+      "expected": 544087,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3811bb0ccc39",
+      "business_id": "biz_117",
+      "question": "Top 5 khách hàng mua nhiều tiền nhất tuần rồi là ai?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Thái Hồng Hiếu",
+        "Kiều Thanh Loan",
+        "Triệu Khánh Tâm",
+        "Kiều Lan Thắng",
+        "Vương Hạnh Linh"
+      ],
+      "expected": [
+        "Thái Hồng Hiếu",
+        "Kiều Thanh Loan",
+        "Triệu Khánh Tâm",
+        "Kiều Lan Thắng",
+        "Vương Hạnh Linh"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_392694afa261",
+      "business_id": "biz_124",
+      "question": "cho hoir giá trị trung bình một đơn tháng 5/2025 laf bao nhiu",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 119226,
+      "new_answer": 118399,
+      "expected": 118399,
+      "trace_errors": []
+    },
+    {
+      "id": "q_39c1d2ede943",
+      "business_id": "biz_108",
+      "question": "Cho mình hỏi tuần trước ca chiều so với ca sáng thì doanh thu chênh bao nhiêu %?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -5.36,
+      "expected": -5.36,
+      "trace_errors": []
+    },
+    {
+      "id": "q_39fd6a84690d",
+      "business_id": "biz_124",
+      "question": "Trong tháng 5/2025, tiền khách trả bớt nợ các đơn mua chịu được bao nhiêu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 348269700,
+      "new_answer": 2837562,
+      "expected": 2837562,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3a2bccc332db",
+      "business_id": "biz_106",
+      "question": "Giúp mình tính đến hết ngày 29/10/2025, 3 khách nào đang nợ nhiều nhất, mỗi người còn nợ bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Ngô Thảo Châu",
+            149500
+          ],
+          [
+            "Mai Trang Dũng",
+            122001
+          ],
+          [
+            "Luu Ha An",
+            90000
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Ngô Thảo Châu",
+            149500
+          ],
+          [
+            "Mai Trang Dũng",
+            122001
+          ],
+          [
+            "Lưu Hà An",
+            90000
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_3aae102f4eb2",
+      "business_id": "biz_122",
+      "question": "cuoi ngay hom nay salonpas cao dan hop 24 goi x 10 mieng trong kho con bao nhieu hop chan, le bao nhieu goi",
+      "old_outcome": "wrong",
+      "new_outcome": "abstain",
+      "old_answer": 240.06,
+      "new_answer": null,
+      "expected": [
+        4,
+        15
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_3b29ba188ca3",
+      "business_id": "biz_104",
+      "question": "Tháng 3/2026 doanh thu thay đổi bao nhiêu % so với tháng liền trước?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 141.46,
+      "new_answer": 42.46,
+      "expected": 42.46,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3cbc76c5b4a8",
+      "business_id": "biz_103",
+      "question": "So với cùng kỳ tháng trước, dthu từ đầu tháng này đến hết hnay tăng hay giảm bao nhiêu %",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 6.1,
+      "expected": 6.1,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3d6b67299c1d",
+      "business_id": "biz_123",
+      "question": "tháng này khách quách bình anh ghi nợ thêm bao nhiu và trả nợ đươc bao nhiêu? ghi hai số theo thứ tự: nợ thêm, trả được",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        900,
+        300
+      ],
+      "expected": [
+        900,
+        300
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_3db974fe3641",
+      "business_id": "biz_123",
+      "question": "liet ke 3 khach no nhieu nhat tinh den het ngay 28/06/2026, kem so tien con no",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        "Hoàng Ngọc Ngọc",
+        "Lê Giang Hiếu",
+        "Đặng Hải Đức"
+      ],
+      "new_answer": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Hoàng Ngọc Ngọc",
+            435734
+          ],
+          [
+            "Lê Giang Hiếu",
+            97000
+          ],
+          [
+            "Đặng Hải Đức",
+            90800
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Hoàng Ngọc Ngọc",
+            435734
+          ],
+          [
+            "Lê Giang Hiếu",
+            97000
+          ],
+          [
+            "Đặng Hải Đức",
+            90800
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_3de3612a7279",
+      "business_id": "biz_128",
+      "question": "dthu tháng 8/2025 hơn hay kém tháng trước bao nhiêu phần trăm?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -0.31,
+      "expected": -0.31,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3e57e05816fb",
+      "business_id": "biz_114",
+      "question": "check giùm sp bán dc nhieeuf nhất trong tháng 5 năm 2026 là chi",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Xi măng Hà Tiên PCB40 bao 50kg",
+      "expected": "Xi măng Hà Tiên PCB40 bao 50kg",
+      "trace_errors": []
+    },
+    {
+      "id": "q_3ec323f48d62",
+      "business_id": "biz_104",
+      "question": "khách mua nhìu tiền nhất tháng 1/2026 là ai z",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Kiều Khoa Thu",
+      "expected": "Kiều Khoa Thu",
+      "trace_errors": []
+    },
+    {
+      "id": "q_3f6ddf38634d",
+      "business_id": "biz_128",
+      "question": "coi gium so cung ky nam trc, dthu thang 8/2026 tang/giam may phan tram vay",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 10.88,
+      "expected": 10.88,
+      "trace_errors": []
+    },
+    {
+      "id": "q_3faf179fb5ee",
+      "business_id": "biz_120",
+      "question": "hnay cửa hàng bán đc bao nhiêu tiền?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 12275200,
+      "expected": 12275200,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4028a7af692a",
+      "business_id": "biz_116",
+      "question": "Cộng mọi mặt hàng tính theo bình, hôm qua bán ra đc mấy bình?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 12,
+      "new_answer": 13,
+      "expected": 13,
+      "trace_errors": []
+    },
+    {
+      "id": "q_402ecd8d8980",
+      "business_id": "biz_122",
+      "question": "Đếm số ngày trong tháng 6 năm 2026 mà dthu cả ngày từ 8.600.000 đồng trở lên.",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 20,
+      "new_answer": 14,
+      "expected": 14,
+      "trace_errors": []
+    },
+    {
+      "id": "q_411885af7ae3",
+      "business_id": "biz_120",
+      "question": "dthu tháng 4/2026 hown hay kém th trước bao nhiêu % vậy",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -10.51,
+      "expected": -10.51,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4161c903ad81",
+      "business_id": "biz_120",
+      "question": "coi gium thang 2/2026 gia nhap binh quan mot tuyp upsa-c 1g vien sui tuyp 10 vien la bao nhieu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 28302,
+      "expected": 28302,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4192ef63e140",
+      "business_id": "biz_106",
+      "question": "check gium thang 3/2026 co bao nhieu mat hang xuat hien trong it nhat 123 don",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 1,
+      "new_answer": 23,
+      "expected": 23,
+      "trace_errors": []
+    },
+    {
+      "id": "q_41c360c34398",
+      "business_id": "biz_104",
+      "question": "Tháng 4/2025 quán bán được bao nhiêu ly size M?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 104,
+      "new_answer": 3030,
+      "expected": 3030,
+      "trace_errors": []
+    },
+    {
+      "id": "q_420556897d22",
+      "business_id": "biz_106",
+      "question": "top 3 khách có công nợ lớn nhất đến hết ngày 14/09/2026 và số nợ cuar từng nguwowif",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Thái Nam Phương",
+            151000
+          ],
+          [
+            "Vương Hằng Phúc",
+            117500
+          ],
+          [
+            "Trương Bình Nam",
+            116500
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Thái Nam Phương",
+            151000
+          ],
+          [
+            "Vương Hằng Phúc",
+            117500
+          ],
+          [
+            "Trương Bình Nam",
+            116500
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_42157bbc3125",
+      "business_id": "biz_106",
+      "question": "tháng 5/2026 quán bán ra total mấy ly size M, cộng tất cả các món",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 4665,
+      "expected": 4665,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4229b5a0f8b2",
+      "business_id": "biz_109",
+      "question": "Tháng 6/2026 khách Tô Phúc Huy ghi nợ thêm bao nhiêu và trả nợ đc bao nhiêu? Ghi hai số theo thứ tự: nợ thêm, trả được.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        11000,
+        5500
+      ],
+      "expected": [
+        11000,
+        5500
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_426baab167a3",
+      "business_id": "biz_106",
+      "question": "Tháng 7/2025, Võ Thảo Khánh ghi nợ thêm bao nhiêu tiền và đã trả nợ được bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        78000,
+        25000
+      ],
+      "expected": [
+        78000,
+        25000
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_42707c40bd19",
+      "business_id": "biz_109",
+      "question": "coi giùm so vs tháng liền trc, dthu tháng 4 năm 2025 thay đổi bao nhiêu %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -1.21,
+      "expected": -1.21,
+      "trace_errors": []
+    },
+    {
+      "id": "q_42b56ae572e0",
+      "business_id": "biz_124",
+      "question": "Tháng 1/2025 cửa hàng bán đc tổng cộng bao nhiêu tiền?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 583571,
+      "new_answer": 314535600,
+      "expected": 314535600,
+      "trace_errors": []
+    },
+    {
+      "id": "q_42f415d692be",
+      "business_id": "biz_129",
+      "question": "Tháng 6/2026 khách trả nợ cho các đơn đã mua chịu tổng cộng bao nhiêu tiền?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 938076332,
+      "new_answer": 2358332,
+      "expected": 2358332,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4336aa159e7c",
+      "business_id": "biz_112",
+      "question": "quan ban duoc bn ly size l trong thang 4/2025, cong moi mon nhi",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 1.16,
+      "new_answer": 2152,
+      "expected": 2152,
+      "trace_errors": []
+    },
+    {
+      "id": "q_43b7d7553138",
+      "business_id": "biz_119",
+      "question": "Giá trị trung bình một đơn tháng 4/2026 là bao nhiêu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 81732,
+      "new_answer": 80636,
+      "expected": 80636,
+      "trace_errors": []
+    },
+    {
+      "id": "q_43df08e6cce8",
+      "business_id": "biz_109",
+      "question": "trong tháng 3/2025, khách Giang Phương Thu mua chịu thêm nhiêu và trả bớt nợ được bao nhiêu? Trả lời hai số: nợ thêm, trả được",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        130500,
+        43500
+      ],
+      "expected": [
+        130500,
+        43500
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_445d186c04dc",
+      "business_id": "biz_124",
+      "question": "Cho mình 5 khách mua nhiều tiền nhất tháng 6/2025.",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        "Lâm Đạt Linh",
+        "Hoàng Hằng Hiếu",
+        "Nghiêm Châu Trung",
+        "Đàm Thanh Hùng",
+        "Châu Khoa An"
+      ],
+      "new_answer": [
+        "Lâm Đạt Linh",
+        "Hoàng Hằng Hiếu",
+        "Nghiêm Châu Trung",
+        "Châu Khoa An",
+        "Đàm Thanh Hùng"
+      ],
+      "expected": [
+        "Lâm Đạt Linh",
+        "Hoàng Hằng Hiếu",
+        "Nghiêm Châu Trung",
+        "Châu Khoa An",
+        "Đàm Thanh Hùng"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_44621c48a0a2",
+      "business_id": "biz_108",
+      "question": "thang 3/2026 nhap hang het bao nhieu tien",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 259869400,
+      "expected": 259869400,
+      "trace_errors": []
+    },
+    {
+      "id": "q_44ab47ab8b70",
+      "business_id": "biz_128",
+      "question": "Tổng tiền hàng nhập vào tháng 12/2025 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 307548300,
+      "expected": 307548300,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4614c4e2ce14",
+      "business_id": "biz_109",
+      "question": "Tháng 4/2026 giá nhập bình quân một thùng Mì Hảo Hảo tôm chua cay là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 113069,
+      "expected": 113069,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4632f7122d38",
+      "business_id": "biz_117",
+      "question": "ddeems soos đợt giao hàng trong tháng 3/2025",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 781,
+      "expected": 781,
+      "trace_errors": []
+    },
+    {
+      "id": "q_465a4bdab726",
+      "business_id": "biz_106",
+      "question": "thang 4/2025 quan ban ra tong cong may ly size l, cong tat ca cac mon",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 2015,
+      "expected": 2015,
+      "trace_errors": []
+    },
+    {
+      "id": "q_46a6577343f1",
+      "business_id": "biz_121",
+      "question": "Cho tôi dthu của tháng 2/2026, tháng 3/2026 và tháng 4/2026, ghi lần lượt theo thứ tự đó",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        250892100,
+        259652600,
+        259231600
+      ],
+      "expected": [
+        250892100,
+        259652600,
+        259231600
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_46c28b67e33a",
+      "business_id": "biz_123",
+      "question": "So với tháng trước đó, doanh thu tháng 3/2026 tăng hay giảm mấy phần trăm?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 14.89,
+      "expected": 14.89,
+      "trace_errors": []
+    },
+    {
+      "id": "q_46e5d20e6422",
+      "business_id": "biz_127",
+      "question": "So với tháng liền trước, doanh thu tháng 6 năm 2026 thay đổi bao nhiêu %?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -4.73,
+      "expected": -4.73,
+      "trace_errors": []
+    },
+    {
+      "id": "q_47a1c26a50dd",
+      "business_id": "biz_122",
+      "question": "trong tháng 9/2025, xét theo dthu, ngày naof bán đắt nhất",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "2025-09-01",
+      "expected": "2025-09-01",
+      "trace_errors": []
+    },
+    {
+      "id": "q_47f3584a37c9",
+      "business_id": "biz_124",
+      "question": "Khách mua nhiều tiền nhất tháng 7/2025 là ai?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Ông Trang Đạt",
+      "expected": "Ông Trang Đạt",
+      "trace_errors": []
+    },
+    {
+      "id": "q_486e3139b1e7",
+      "business_id": "biz_105",
+      "question": "Cho tôi doanh thu của tháng 8/2025, tháng 9/2025 và tháng 10/2025, ghi lần lượt theo thứ tự đó.",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        368766700,
+        348311500,
+        379300800
+      ],
+      "expected": [
+        368766700,
+        348311500,
+        379300800
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_48910c66e7e6",
+      "business_id": "biz_119",
+      "question": "Tháng 2/2026 giá nhập bình quân một hộp Phosphalugel hộp 26 gói là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 101304,
+      "expected": 101304,
+      "trace_errors": []
+    },
+    {
+      "id": "q_48fe8e662427",
+      "business_id": "biz_112",
+      "question": "tuần nayf dthu đươc bao nhiêu",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 62109000,
+      "expected": 62109000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_498456d33c36",
+      "business_id": "biz_123",
+      "question": "thang 9/2025 cua hang nhap phosphalugel hop 26 goi binh quan bn tien mot hop",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 103443,
+      "expected": 103443,
+      "trace_errors": []
+    },
+    {
+      "id": "q_49d3650e803b",
+      "business_id": "biz_122",
+      "question": "cho toi biet doanh thu tuan nay",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 56714400,
+      "new_answer": 42928100,
+      "expected": 42928100,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4a064ae1541b",
+      "business_id": "biz_120",
+      "question": "tháng này nhà thuốc thu dc bn tiền từ các thuốc có hoạt chất povidon iod",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 3852000,
+      "expected": 3852000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4afd238d098c",
+      "business_id": "biz_103",
+      "question": "liet ke 5 khach chi tieu nhiu nhat trong thang 9 nam 2025",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Dương Lan Hồng",
+        "Đỗ Cường Nam",
+        "Phùng Tâm Ngân",
+        "Nghiêm Thu Hoàng",
+        "Huỳnh Thắng Minh"
+      ],
+      "expected": [
+        "Dương Lan Hồng",
+        "Đỗ Cường Nam",
+        "Phùng Tâm Ngân",
+        "Nghiêm Thu Hoàng",
+        "Huỳnh Thắng Minh"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_4b2450e3eaed",
+      "business_id": "biz_103",
+      "question": "Tháng 1/2026 ai là khách mua nhiều lần nhất, tính theo số đơn?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": "Mai Dương Hoa",
+      "expected": "Mai Dương Hoa",
+      "trace_errors": []
+    },
+    {
+      "id": "q_4ba19937fdda",
+      "business_id": "biz_122",
+      "question": "Povidine 10% chai 90ml lên giá 19.000đ từ ngày 14/03/2026; so 7 ngày kể từ ngày tăng giá với 7 ngày ngay trước, lượng bán tính theo chai tăng hay giảm nhiêu %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 33.33,
+      "expected": 33.33,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4bdb1a8972ce",
+      "business_id": "biz_121",
+      "question": "check gium thang 11/2025 co bao nhieu ngay dat dthu tu 9.600.000 dong tro len",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 7,
+      "expected": 7,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4bf0ba4d3872",
+      "business_id": "biz_103",
+      "question": "Doanh thu từ đầu tháng này đến hết hôm nay tăng hay giảm bao nhiêu phần trăm so với cùng kỳ tháng trước nhỉ?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 9.64,
+      "expected": 9.64,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4bfce7dd9238",
+      "business_id": "biz_104",
+      "question": "Tháng 12/2025 quán bán được bao nhiêu ly size L?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 8466,
+      "new_answer": 1492,
+      "expected": 1492,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4c7f65214480",
+      "business_id": "biz_106",
+      "question": "xem giup so voi cung ky th truoc, doanh thu tu dau thang nay den het hom nay tang hay giam bn %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -3.33,
+      "expected": -3.33,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4c974b445a53",
+      "business_id": "biz_127",
+      "question": "Tính đến hết ngày 28/07/2026, 5 khách nào đang nợ nhiều nhất, mỗi người còn nợ bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": {
+        "columns": [
+          "khach_hang_ten",
+          "total_debt"
+        ],
+        "rows": [
+          [
+            "Lâm Bảo Ngọc",
+            632000
+          ],
+          [
+            "Nghiêm Duy Linh",
+            620000
+          ],
+          [
+            "Lương Huy Quang",
+            360500
+          ],
+          [
+            "Lương Thanh Hương",
+            230000
+          ],
+          [
+            "Tống Ngọc Trung",
+            168000
+          ]
+        ]
+      },
+      "expected": {
+        "columns": [
+          "khach_hang",
+          "so_tien_no"
+        ],
+        "rows": [
+          [
+            "Lâm Bảo Ngọc",
+            632000
+          ],
+          [
+            "Nghiêm Duy Linh",
+            620000
+          ],
+          [
+            "Lương Huy Quang",
+            360500
+          ],
+          [
+            "Lương Thanh Hương",
+            230000
+          ],
+          [
+            "Tống Ngọc Trung",
+            168000
+          ]
+        ]
+      },
+      "trace_errors": []
+    },
+    {
+      "id": "q_4cca5b4efafc",
+      "business_id": "biz_123",
+      "question": "Dịp Tết 2026, mặt hàng nào bán chạy nhất ạ?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": "SP0001",
+      "new_answer": "Berberin 100mg Mekophar chai 100 viên",
+      "expected": "Berberin 100mg Mekophar chai 100 viên",
+      "trace_errors": []
+    },
+    {
+      "id": "q_4d62702edd62",
+      "business_id": "biz_121",
+      "question": "Cho mình 3 mặt hàng bán chạy nhất tuần rồi.",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        "Amoxicillin 500mg Domesco hộp 10 vỉ x 10 viên",
+        "Tiffy Dey hộp 25 vỉ x 4 viên",
+        "Hapacol 150 hộp 24 gói"
+      ],
+      "new_answer": [
+        "Tiffy Dey hộp 25 vỉ x 4 viên",
+        "Hapacol 250 hộp 24 gói",
+        "Smecta hộp 30 gói"
+      ],
+      "expected": [
+        "Tiffy Dey hộp 25 vỉ x 4 viên",
+        "Hapacol 250 hộp 24 gói",
+        "Smecta hộp 30 gói"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_4db85350a07d",
+      "business_id": "biz_123",
+      "question": "Tháng 6/2025 các mặt hàng nhóm vitamin khoáng chất thu đc tổng cộng bao nhiêu tiền?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 44825900,
+      "expected": 44825900,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4dd381828fe4",
+      "business_id": "biz_118",
+      "question": "xem giup ti trong cua nhom dien trong dthu thang 5/2026 la bn %",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": 0,
+      "new_answer": 24.95,
+      "expected": 24.95,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4e07beda2f37",
+      "business_id": "biz_109",
+      "question": "xem giup tu thang 3/2025 den thang 5/2025, doanh thu moi thang la bao nhieu? ghi 3 so theo thu tu thoi gian",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        266675100,
+        263443400,
+        275971900
+      ],
+      "expected": [
+        266675100,
+        263443400,
+        275971900
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_4e40a26151f8",
+      "business_id": "biz_119",
+      "question": "dthu trung bình trên một đơn tháng 2/2026 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 76914,
+      "expected": 76914,
+      "trace_errors": []
+    },
+    {
+      "id": "q_4f742bfda263",
+      "business_id": "biz_103",
+      "question": "5 khach co tong tien mua cao nhat tuan roi la ai",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Thái Sơn Sơn",
+        "Đỗ Bảo Long",
+        "Đỗ Duy Khánh",
+        "Tống Hùng Minh",
+        "Phan Hải Phúc"
+      ],
+      "expected": [
+        "Thái Sơn Sơn",
+        "Đỗ Bảo Long",
+        "Đỗ Duy Khánh",
+        "Tống Hùng Minh",
+        "Phan Hải Phúc"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_5023d3652206",
+      "business_id": "biz_130",
+      "question": "trong tháng 7 năm 2026, số đơn có doanh thu ≥ 1.100.000 đồng là bnhiu",
+      "old_outcome": "wrong",
+      "new_outcome": "abstain",
+      "old_answer": 0,
+      "new_answer": null,
+      "expected": 250,
+      "trace_errors": []
+    },
+    {
+      "id": "q_5029b166aa34",
+      "business_id": "biz_102",
+      "question": "so vs cung thang nam truoc, dthu thang 4 nam 2026 thay doi may %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 2.25,
+      "expected": 2.25,
+      "trace_errors": []
+    },
+    {
+      "id": "q_5055becf7714",
+      "business_id": "biz_106",
+      "question": "xem giúp tháng 3 năm 2026, 3 khách nào chi tiêu nhìu nhất",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": [
+        "Vương Phương Loan",
+        "Kiều Hà Tâm",
+        "Đào Dương Giang"
+      ],
+      "expected": [
+        "Vương Phương Loan",
+        "Kiều Hà Tâm",
+        "Đào Dương Giang"
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_50e6defb9ba3",
+      "business_id": "biz_102",
+      "question": "dthu thang 4/2026 tang hay giam bao nhieu phan tram so voi th truoc",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -0.23,
+      "expected": -0.23,
+      "trace_errors": []
+    },
+    {
+      "id": "q_515805e7992a",
+      "business_id": "biz_129",
+      "question": "doanh thu ngay nao cao nhat trong thang 8 nam 2025",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": "2025-08-01",
+      "new_answer": "2025-08-30",
+      "expected": "2025-08-30",
+      "trace_errors": []
+    },
+    {
+      "id": "q_5186dc3dd581",
+      "business_id": "biz_106",
+      "question": "Doanh thu từng tháng của 3 tháng 11/2025, 12/2025, 1/2026 lần lượt là bao nhiêu?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": [
+        271419000,
+        312227500,
+        302611000
+      ],
+      "new_answer": [
+        264914500,
+        305793500,
+        295438500
+      ],
+      "expected": [
+        264914500,
+        305793500,
+        295438500
+      ],
+      "trace_errors": []
+    },
+    {
+      "id": "q_51963984e8da",
+      "business_id": "biz_116",
+      "question": "thang 11/2025 nhom sat thep ban dc bnhiu tien vay",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 131458000,
+      "expected": 131458000,
+      "trace_errors": []
+    },
+    {
+      "id": "q_526287894668",
+      "business_id": "biz_103",
+      "question": "dthu tháng 3/2026 hơn hay kém th trước bn %",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": -42.91,
+      "expected": -42.91,
+      "trace_errors": []
+    },
+    {
+      "id": "q_52dca90024ce",
+      "business_id": "biz_108",
+      "question": "Giá nhập bình quân một thùng Nước mắm Nam Ngư 750ml trong tháng 6 năm 2025 là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 395429,
+      "expected": 395429,
+      "trace_errors": []
+    },
+    {
+      "id": "q_533a10584189",
+      "business_id": "biz_129",
+      "question": "Tháng 6/2026 ngày nào cửa hàng bán được nhiều tiền nhất?",
+      "old_outcome": "wrong",
+      "new_outcome": "correct",
+      "old_answer": "2026-06-01",
+      "new_answer": "2026-06-07",
+      "expected": "2026-06-07",
+      "trace_errors": []
+    },
+    {
+      "id": "q_53a8ce394d3b",
+      "business_id": "biz_120",
+      "question": "Xem giúp trong tháng 2/2025, Yumangel hộp 20 gói nhập vào giá bình quân một hộp là bao nhiêu?",
+      "old_outcome": "abstain",
+      "new_outcome": "correct",
+      "old_answer": null,
+      "new_answer": 89200,
+      "expected": 89200,
+      "trace_errors": []
+    }
+  ]
+}
