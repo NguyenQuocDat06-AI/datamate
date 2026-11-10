@@ -1,0 +1,559 @@
+"""layer.build: sales without an order column, service tickets, status mapping and report counts.
+
+Source files mirror ingestion: every table carries __source_row and __raw_json.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from bizreason.contracts import BusinessContext, ColumnMeta, SourceRef, TableMeta
+from bizreason.semantic import layer
+
+# name -> (column names, rows)
+Specs = dict[str, tuple[list[str], list[tuple[Any, ...]]]]
+
+
+def _source(tmp_path: Path, specs: Specs) -> Path:
+    path = tmp_path / "source.sqlite"
+    con = sqlite3.connect(path)
+    for name, (columns, rows) in specs.items():
+        defs = ", ".join(f'"{c}" TEXT' for c in columns)
+        con.execute(f'CREATE TABLE "{name}" ({defs}, __source_row INTEGER, __raw_json TEXT)')
+        marks = ",".join("?" * (len(columns) + 2))
+        for number, row in enumerate(rows, start=1):
+            con.execute(f'INSERT INTO "{name}" VALUES ({marks})', (*row, number, "{}"))
+    con.commit()
+    con.close()
+    return path
+
+
+def _context(path: Path, specs: Specs) -> BusinessContext:
+    tables = [
+        TableMeta(
+            name=name,
+            sources=[SourceRef(path=f"{name}.csv")],
+            columns=[ColumnMeta(name=c, original_name=c, dtype="text") for c in columns],
+            row_count=len(rows),
+            raw_row_count=len(rows),
+        )
+        for name, (columns, rows) in specs.items()
+    ]
+    return BusinessContext(
+        business_id="test", revision="r1", database=path, readme="", manifest={}, tables=tables,
+    )
+
+
+def _record(columns: list[str], kind: str, roles: dict[str, str]) -> dict[str, Any]:
+    return {"columns": columns, "kind": kind, "roles": roles}
+
+
+def _query(out: Path, sql: str) -> list[tuple]:
+    con = sqlite3.connect(out)
+    try:
+        return con.execute(sql).fetchall()
+    finally:
+        con.close()
+
+
+def test_sales_table_without_order_id_gives_one_order_per_row(tmp_path: Path) -> None:
+    columns = ["item", "amount"]
+    specs: Specs = {
+        "sales_a": (columns, [("tea", "100"), ("coffee", "50")]),
+        "sales_b": (columns, [("tea", "30")]),  # same column names: shares the record, ids still differ
+    }
+    records = [_record(columns, "sales", {"item": "product_name", "amount": "line_amount"})]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert report["sales_tables"] == 2
+    assert report["orders"] == 3
+    ids = [row[0] for row in _query(out, "SELECT order_id FROM orders ORDER BY order_id")]
+    assert ids == ["sales_a:1", "sales_a:2", "sales_b:1"]
+    assert _query(out, "SELECT SUM(amount) FROM lines") == [(180.0,)]
+    assert _query(out, "SELECT SUM(revenue) FROM orders") == [(180.0,)]
+
+
+def test_service_tickets_produce_revenue_and_employee(tmp_path: Path) -> None:
+    columns = ["ticket", "visit", "mechanic", "job", "bill"]
+    specs: Specs = {
+        "repairs": (columns, [
+            ("T1", "2026-03-01", "An", "oil change", "200"),
+            ("T2", "2026-03-02", "Binh", "brake pads", "450"),
+        ]),
+    }
+    records = [_record(columns, "service_ticket", {
+        "ticket": "ticket_id", "visit": "ordered_at", "mechanic": "employee_name",
+        "job": "service_item", "bill": "ticket_amount",
+    })]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert report["service_tables"] == 1
+    assert report["sales_tables"] == 0
+    assert _query(out, "SELECT order_id, employee, revenue FROM orders ORDER BY order_id") == [
+        ("T1", "An", 200.0),
+        ("T2", "Binh", 450.0),
+    ]
+    assert _query(out, "SELECT order_id, product_name, amount FROM lines ORDER BY order_id") == [
+        ("T1", "oil change", 200.0),
+        ("T2", "brake pads", 450.0),
+    ]
+
+
+def test_employee_name_fills_employee_for_sales_when_employee_id_absent(tmp_path: Path) -> None:
+    columns = ["order", "staff", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "Lan", "tea", "10")])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "staff": "employee_name", "item": "product_name", "amount": "line_amount",
+    })]
+    out = tmp_path / "canonical.sqlite"
+
+    layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert _query(out, "SELECT employee FROM orders") == [("Lan",)]
+
+
+def test_status_map_rewrites_values_and_counts_mapped(tmp_path: Path) -> None:
+    columns = ["order", "state", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "delivered", "100"),
+        ("O2", "void", "50"),
+        ("O3", "weird", "70"),  # not in the map: becomes NULL
+        ("O4", "completed", "10"),
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "state": "order_status", "amount": "line_amount"})]
+    status_map = {"delivered": "completed", "void": "cancelled"}
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out, status_map=status_map)
+
+    assert report["status_mapped"] == 2
+    assert report["status_null_orders"] == 1
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("O1", "completed"), ("O2", "cancelled"), ("O3", None), ("O4", "completed"),
+    ]
+
+
+def test_unmapped_value_becomes_null_and_is_counted_and_canonical_is_kept(tmp_path: Path) -> None:
+    columns = ["order", "state", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "delivered", "100"),  # mapped
+        ("O2", "void", "50"),        # unmapped
+        ("O3", "weird", "70"),       # unmapped
+        ("O4", "completed", "10"),   # canonical: a map entry for it must not change it
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "state": "order_status", "amount": "line_amount"})]
+    status_map = {"delivered": "completed", "completed": "returned"}
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out, status_map=status_map)
+
+    assert report["status_mapped"] == 1
+    assert report["status_null_orders"] == 2
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("O1", "completed"), ("O2", None), ("O3", None), ("O4", "completed"),
+    ]
+
+
+def test_status_map_defaults_to_none_and_keeps_report_keys(tmp_path: Path) -> None:
+    columns = ["order", "state", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "completed", "10")])}
+    records = [_record(columns, "sales", {"order": "order_id", "state": "order_status", "amount": "line_amount"})]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert report["status_mapped"] == 0
+    assert report["status_null_orders"] == 0
+    assert report["orders"] == 1
+
+
+def test_order_listed_by_returns_table_is_returned_whole_and_ids_are_trimmed(tmp_path: Path) -> None:
+    columns = ["order", "state", "item", "amount"]
+    specs: Specs = {
+        "sales": (columns, [
+            ("O1", "completed", "tea", "100"), ("O1", "completed", "cake", "50"),
+            ("O2", "completed", "tea", "80"), ("O3", "completed", "tea", "30"),
+        ]),
+        "returns": (["order", "memo"], [(" O1 ", "partial"), (None, "blank id"), ("O2", "whole")]),
+    }
+    records = [
+        _record(columns, "sales", {
+            "order": "order_id", "state": "order_status", "item": "product_name", "amount": "line_amount",
+        }),
+        _record(["order", "memo"], "sales_return", {"order": "order_id", "memo": "note"}),
+    ]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert report["return_tables"] == 1
+    assert report["orders_marked_returned"] == 2
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("O1", "returned"), ("O2", "returned"), ("O3", "completed"),
+    ]
+    assert _query(out, "SELECT SUM(revenue) FROM orders WHERE status IN ('completed','shipping')") == [(30.0,)]
+    assert _query(out, "SELECT DISTINCT status FROM lines ORDER BY status") == [("completed",), ("returned",)]
+    assert _query(out, "SELECT status FROM status_domain ORDER BY status") == [
+        ("completed",), ("returned",),
+    ]
+
+
+def test_cancelled_order_listed_by_returns_table_stays_cancelled(tmp_path: Path) -> None:
+    columns = ["order", "state", "item", "amount"]
+    specs: Specs = {
+        "sales": (columns, [("O1", "cancelled", "tea", "100"), ("O2", "completed", "tea", "80")]),
+        "returns": (["order", "memo"], [("O1", "x"), ("O2", "y")]),
+    }
+    records = [
+        _record(columns, "sales", {
+            "order": "order_id", "state": "order_status", "item": "product_name", "amount": "line_amount",
+        }),
+        _record(["order", "memo"], "sales_return", {"order": "order_id", "memo": "note"}),
+    ]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert report["orders_marked_returned"] == 1
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("O1", "cancelled"), ("O2", "returned"),
+    ]
+
+
+def test_discount_and_shipping_lines_are_excluded_from_revenue_and_lines(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "tea", "100"),
+        ("O1", "voucher", "-20"),
+        ("O1", "delivery", "15"),
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"})]
+    line_kinds = {"Voucher": "discount", "Delivery": "shipping_fee"}
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out, line_kinds=line_kinds)
+
+    assert report["non_product_lines"] == 2
+    assert _query(out, "SELECT revenue FROM orders") == [(100.0,)]
+    assert _query(out, "SELECT product_name FROM lines") == [("tea",)]
+
+
+def test_service_fee_counts_in_revenue_but_is_not_an_item(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O1", "service charge", "10")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"})]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(
+        _context(_source(tmp_path, specs), specs), records, out,
+        line_kinds={"Service Charge": "service_fee"},
+    )
+
+    assert report["non_product_lines"] == 1
+    assert _query(out, "SELECT revenue FROM orders") == [(110.0,)]
+    assert _query(out, "SELECT product_name, is_item FROM lines ORDER BY product_name") == [
+        ("service charge", 0), ("tea", 1),
+    ]
+
+
+def test_without_line_kinds_every_line_is_a_product(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O1", "voucher", "-20")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"})]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert report["non_product_lines"] == 0
+    assert _query(out, "SELECT revenue FROM orders") == [(80.0,)]
+    assert _query(out, "SELECT is_item FROM lines ORDER BY product_name") == [(1,), (1,)]
+
+
+def test_unknown_line_kind_is_rejected(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"})]
+
+    with pytest.raises(ValueError):
+        layer.build(_context(_source(tmp_path, specs), specs), records, tmp_path / "c.sqlite",
+                    line_kinds={"tea": "gift"})
+
+
+def test_lines_expose_unit_price_from_source_line(tmp_path: Path) -> None:
+    columns = ["order", "item", "price", "qty", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "25", "2", "50")])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "item": "product_name", "price": "unit_price", "qty": "qty", "amount": "line_amount",
+    })]
+    out = tmp_path / "canonical.sqlite"
+
+    layer.build(_context(_source(tmp_path, specs), specs), records, out)
+
+    assert _query(out, "SELECT unit_price, amount FROM lines") == [(25.0, 50.0)]
+
+
+def _run(tmp_path: Path, specs: Specs, records: list[dict[str, Any]], **kwargs: Any) -> tuple[dict, Path]:
+    out = tmp_path / "canonical.sqlite"
+    report = layer.build(_context(_source(tmp_path, specs), specs), records, out, **kwargs)
+    return report, out
+
+
+SALES_ROLES = {"order": "order_id", "item": "product_name", "amount": "line_amount"}
+
+
+def test_identical_rows_of_one_order_are_counted_once(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O1", "tea", "100"), ("O2", "tea", "100")])}
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)])
+
+    assert report["duplicate_lines_removed"] == 1
+    assert _query(out, "SELECT order_id, amount FROM lines ORDER BY order_id") == [("O1", 100.0), ("O2", 100.0)]
+
+
+def test_identical_rows_of_different_orders_are_both_kept(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O2", "tea", "100")])}
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)])
+
+    assert report["duplicate_lines_removed"] == 0
+    assert _query(out, "SELECT COUNT(*), SUM(amount) FROM lines") == [(2, 200.0)]
+
+
+def test_rows_of_one_order_differing_in_one_cell_are_both_kept(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O1", "tea", "90")])}
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)])
+
+    assert report["duplicate_lines_removed"] == 0
+    assert _query(out, "SELECT COUNT(*), SUM(amount) FROM lines") == [(2, 190.0)]
+
+
+def test_table_without_order_id_is_not_deduplicated(tmp_path: Path) -> None:
+    columns = ["item", "amount"]
+    specs: Specs = {"sales": (columns, [("tea", "100"), ("tea", "100")])}
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", {"item": "product_name", "amount": "line_amount"})])
+
+    assert report["duplicate_lines_removed"] == 0
+    assert _query(out, "SELECT order_id FROM orders ORDER BY order_id") == [("sales:1",), ("sales:2",)]
+    assert _query(out, "SELECT SUM(amount) FROM lines") == [(200.0,)]
+
+
+def test_grouped_thousands_column_is_read_and_decimal_comma_column_is_not(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount", "qty"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "75,000", "12,5"), ("O2", "tea", "1,250,000", "7,25")])}
+    records = [_record(columns, "sales", {**SALES_ROLES, "qty": "qty"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["columns_with_locale_inferred"] == 1
+    assert _query(out, "SELECT order_id, amount, qty FROM lines ORDER BY order_id") == [
+        ("O1", 75000.0, 12.5), ("O2", 1250000.0, 7.25),
+    ]
+
+
+def test_mixed_comma_column_keeps_todays_reading(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "75,000"), ("O2", "tea", "12,5")])}
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)])
+
+    assert report["columns_with_locale_inferred"] == 0
+    assert _query(out, "SELECT order_id, amount FROM lines ORDER BY order_id") == [("O1", None), ("O2", 12.5)]
+
+
+def test_dot_grouped_column_with_currency_suffix_is_read_as_vietnamese_thousands(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "1.500.000"), ("O2", "tea", "250.000đ")])}
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)])
+
+    assert report["columns_with_locale_inferred"] == 1
+    assert _query(out, "SELECT order_id, amount FROM lines ORDER BY order_id") == [
+        ("O1", 1500000.0), ("O2", 250000.0),
+    ]
+
+
+def test_locale_inference_refuses_columns_that_mix_separator_shapes() -> None:
+    assert layer.infer_locale(["1,000", "2.000"]) is None
+    assert layer.infer_locale(["12,5", "7,25"]) is None
+    assert layer.infer_locale(["1.5", "1,000"]) == "en"
+    assert layer.infer_locale(["1.000.000đ", "300.000"]) == "vi"
+
+
+def test_order_time_is_combined_with_the_row_date(tmp_path: Path) -> None:
+    columns = ["order", "day", "clock", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "2026-03-01", "14:05", "tea", "100"),
+        ("O2", "2026-03-01", "6:30:15", "tea", "50"),
+        ("O3", "2026-03-02", "", "tea", "10"),
+    ])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "day": "ordered_at", "clock": "order_time", "item": "product_name",
+        "amount": "line_amount",
+    })]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, date, ts FROM orders ORDER BY order_id") == [
+        ("O1", "2026-03-01", "2026-03-01 14:05:00"),
+        ("O2", "2026-03-01", "2026-03-01 06:30:15"),
+        ("O3", "2026-03-02", "2026-03-02"),  # blank time: the date text stands
+    ]
+
+
+def test_full_datetime_in_order_time_is_kept(tmp_path: Path) -> None:
+    columns = ["order", "placed", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "2026-03-01 09:30:00", "tea", "100")])}
+    _, out = _run(tmp_path, specs, [_record(columns, "sales", {
+        "order": "order_id", "placed": "order_time", "item": "product_name", "amount": "line_amount",
+    })])
+    assert _query(out, "SELECT ts FROM orders") == [("2026-03-01 09:30:00",)]
+
+
+def test_ordered_at_datetime_without_order_time_keeps_working(tmp_path: Path) -> None:
+    columns = ["order", "stamp", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "2026-03-01 09:30:00", "tea", "100")])}
+    _, out = _run(tmp_path, specs, [_record(columns, "sales", {
+        "order": "order_id", "stamp": "ordered_at", "item": "product_name", "amount": "line_amount",
+    })])
+    assert _query(out, "SELECT ts, date FROM orders") == [("2026-03-01 09:30:00", "2026-03-01")]
+
+
+def test_customer_group_is_filled_from_catalog_by_id_and_never_by_name_when_an_id_is_given(tmp_path: Path) -> None:
+    sales_columns = ["order", "cust_id", "cust_name", "item", "amount"]
+    catalog_columns = ["code", "name", "segment"]
+    specs: Specs = {
+        "sales": (sales_columns, [
+            ("O1", "C1", "An", "tea", "100"),
+            ("O2", None, "Binh", "tea", "50"),     # no id: matched by name
+            ("O3", "C9", "Cuong", "tea", "30"),    # id not in the catalog: stays empty
+            ("O4", "C9", "An", "tea", "10"),       # same name as C1 but another code: stays empty
+        ]),
+        "customers": (catalog_columns, [("C1", "An", "Gold"), ("C2", "Binh", "Silver")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {
+            "order": "order_id", "cust_id": "customer_id", "cust_name": "customer_name",
+            "item": "product_name", "amount": "line_amount",
+        }),
+        _record(catalog_columns, "customer_catalog", {
+            "code": "customer_id", "name": "customer_name", "segment": "customer_group",
+        }),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, customer_group FROM orders ORDER BY order_id") == [
+        ("O1", "Gold"), ("O2", "Silver"), ("O3", None), ("O4", None),
+    ]
+    assert _query(out, "SELECT customer_group FROM lines WHERE order_id='O2'") == [("Silver",)]
+
+
+def test_customer_group_from_name_only_catalog(tmp_path: Path) -> None:
+    sales_columns = ["order", "cust_name", "item", "amount"]
+    catalog_columns = ["name", "segment"]
+    specs: Specs = {
+        "sales": (sales_columns, [("O1", "An", "tea", "100")]),
+        "customers": (catalog_columns, [("An", "Gold")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {"order": "order_id", "cust_name": "customer_name",
+                                         "item": "product_name", "amount": "line_amount"}),
+        _record(catalog_columns, "customer_catalog", {"name": "customer_name", "segment": "customer_group"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT customer_group FROM orders") == [("Gold",)]
+
+
+def test_product_category_and_base_unit_come_from_the_catalog(tmp_path: Path) -> None:
+    sales_columns = ["order", "pid", "pname", "cat", "amount"]
+    catalog_columns = ["code", "name", "group", "unit_base"]
+    specs: Specs = {
+        "sales": (sales_columns, [
+            ("O1", "P1", "Tra sua", None, "100"),       # by id
+            ("O2", None, "Tra  Sua", None, "50"),       # by normalized name
+            ("O3", "P9", "Ca phe", "Own", "30"),        # own category kept; base unit by name
+        ]),
+        "products": (catalog_columns, [("P1", "Tra sua", "Drink", "ly"), ("P2", "Ca phe", "Coffee", "goi")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {
+            "order": "order_id", "pid": "product_id", "pname": "product_name",
+            "cat": "product_category", "amount": "line_amount",
+        }),
+        _record(catalog_columns, "product_catalog", {
+            "code": "product_id", "name": "product_name", "group": "product_category", "unit_base": "base_unit",
+        }),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, category, base_unit FROM lines ORDER BY order_id") == [
+        ("O1", "Drink", "ly"), ("O2", "Drink", "ly"), ("O3", "Own", "goi"),
+    ]
+
+
+def test_base_unit_comes_from_unit_conversion_by_name(tmp_path: Path) -> None:
+    sales_columns = ["item", "amount"]
+    conversion_columns = ["item", "base", "factor"]
+    specs: Specs = {
+        "sales": (sales_columns, [("Ca phe", "30"), ("Tra sua", "10")]),
+        "conversions": (conversion_columns, [("Ca phe", "goi", "24")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {"item": "product_name", "amount": "line_amount"}),
+        _record(conversion_columns, "unit_conversion", {
+            "item": "product_name", "base": "base_unit", "factor": "conversion_factor",
+        }),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT product_name, base_unit FROM lines ORDER BY product_name") == [
+        ("Ca phe", "goi"), ("Tra sua", None),
+    ]
+
+
+def test_alias_sheet_pools_spellings_under_the_full_name(tmp_path: Path) -> None:
+    sales_columns = ["order", "item", "amount"]
+    alias_columns = ["short", "full"]
+    specs: Specs = {
+        "sales": (sales_columns, [
+            ("O1", "TS", "100"),
+            ("O2", "tra sua lon", "50"),
+            ("O3", "Tra Sua Lon", "30"),
+            ("O4", "TS ", "20"),
+            ("O5", "TSX", "10"),     # not an exact normalized match
+            ("O6", "T S", "5"),      # normalizes to t s, not ts
+        ]),
+        "aliases": (alias_columns, [("TS", "Tra sua lon")]),
+    }
+    records = [
+        _record(sales_columns, "sales", SALES_ROLES),
+        _record(alias_columns, "alias", {"short": "alias_key", "full": "product_name"}),
+    ]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["alias_lines_resolved"] == 2
+    assert _query(out, "SELECT order_id, product_name, product_key FROM lines ORDER BY order_id") == [
+        ("O1", "Tra sua lon", "tra sua lon"),
+        ("O2", "tra sua lon", "tra sua lon"),
+        ("O3", "Tra Sua Lon", "tra sua lon"),
+        ("O4", "Tra sua lon", "tra sua lon"),
+        ("O5", "TSX", "tsx"),
+        ("O6", "T S", "t s"),
+    ]
+
+
+def test_service_fee_is_revenue_but_not_an_item_without_line_kinds(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O1", "Phí phục vụ", "10")])}
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)])
+
+    assert report["non_product_lines"] == 0
+    assert _query(out, "SELECT revenue FROM orders") == [(110.0,)]
+    assert _query(out, "SELECT product_name, is_item FROM lines ORDER BY product_name") == [
+        ("Phí phục vụ", 0), ("tea", 1),
+    ]

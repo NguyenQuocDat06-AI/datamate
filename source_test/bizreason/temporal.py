@@ -17,6 +17,10 @@ def next_month(day: date) -> date:
     return date(day.year + (day.month == 12), 1 if day.month == 12 else day.month + 1, 1)
 
 
+def _year_month(month: str, year: str) -> tuple[int, int]:
+    return (int(year) if len(year) == 4 else 2000 + int(year), int(month))
+
+
 def previous_month_same_days(as_of: date) -> tuple[date, date]:
     year = as_of.year - (as_of.month == 1)
     month = 12 if as_of.month == 1 else as_of.month - 1
@@ -150,6 +154,19 @@ def _extract_explicit_months(question: str, text: str) -> list[MonthMatch]:
                 if not any(r.month == mn and r.year == year for r in results):
                     results.append(MonthMatch(mn, year, m.start(), m.end()))
 
+    # 4. Dash form "M-YYYY" (e.g. "6-2025"), used only as the sole month named in the question:
+    # with two or more such tokens the question is ambiguous (range or comparison), so no month.
+    if not results:
+        dashed = [
+            m
+            for m in re.finditer(r"(?<![\d/.\-])(\d{1,2})-(20\d{2})(?![\d/\-])", question)
+            if 1 <= int(m.group(1)) <= 12
+            and not re.search(r"qu[yý]", question[max(0, m.start() - 6) : m.start()].lower())
+        ]
+        if len(dashed) == 1:
+            m = dashed[0]
+            results.append(MonthMatch(int(m.group(1)), int(m.group(2)), m.start(), m.end()))
+
     results.sort(key=lambda r: (r.year, r.month, r.start_pos))
     return results
 
@@ -163,11 +180,26 @@ class TemporalResolver:
         text = re.sub(r"\btrc\b", "truoc", raw_text)
         text = re.sub(r"\bvs\b", "voi", text)
         text = re.sub(r"\b(?:hqua|hom\s+qa|bua\s+qua)\b", "hom qua", text)
+        # Informal spellings of "hôm nay" (hnay, hoom nay, bữa nay) and "tháng này" (th nay, thangs nay, tháng ni).
+        text = re.sub(r"\b(?:hnay|hoom\s+nay|hum\s+nay|bua\s+nay)\b", "hom nay", text)
+        text = re.sub(r"\b(?:thangs?|th)\s+(?:nay|ni)\b", "thang nay", text)
+        text = re.sub(r"\bnam\s+ni\b", "nam nay", text)
         today_end = as_of + timedelta(days=1)
         evidence = ["question", "as_of_date"]
 
         def window(start: date, end: date, role: str = "target") -> TimeWindow:
             return TimeWindow(role=role, start=start, end_exclusive=end, evidence=evidence)
+
+        # Rulebook §2: from the start of this year through the end of today.
+        if re.search(r"\bdau nam\b(?! \d)(?! ngoai)(?! truoc)", text) or re.search(
+            r"\bnam (?:nay|ni)\b.*\b(?:toi|den)\b.*\bhom nay\b", text
+        ):
+            return [window(date(as_of.year, 1, 1), today_end)]
+
+        # Rulebook §2: "từ D/M tới (hết) hôm nay" = from D/M of as_of's year through today.
+        span = re.search(r"\btu (\d{1,2}) (\d{1,2}) (?:toi|den) (?:het )?hom nay\b", text)
+        if span:
+            return [window(date(as_of.year, int(span.group(2)), int(span.group(1))), today_end)]
 
         # Stage 1: Anchor Resolution
         anchor = self._resolve_anchor(question, text, as_of, window, today_end)
@@ -186,6 +218,46 @@ class TemporalResolver:
             return [anchor.window, comp_window]
         return [anchor.window]
 
+    def resolve_periods(self, question: str, as_of: date) -> list[TimeWindow]:
+        """Several whole months named or implied by one question, in the order asked."""
+        text = normalize_lookup(question)
+        months: list[tuple[int, int]] = []
+        for month, year in re.findall(r"(?<![\d/-])(\d{1,2})[/-](\d{4}|\d{2})(?![\d/-])", question):
+            value = (int(year) if len(year) == 4 else 2000 + int(year), int(month))
+            if 1 <= value[1] <= 12 and value not in months:
+                months.append(value)
+        run = re.search(r"\b(\d{1,2}) thang lien", text)
+        if run and len(months) == 1:
+            year, month = months[0]
+            months = []
+            for offset in range(int(run.group(1)) - 1, -1, -1):
+                index = year * 12 + month - 1 - offset
+                months.append((index // 12, index % 12 + 1))
+        # Rulebook §2: "từ M/Y tới|đến M/Y" = every month from the first to the last, in order.
+        span = re.search(
+            r"\btu (?:thang )?(\d{1,2}) (\d{4}|\d{2}) (?:toi|den) (?:thang )?(\d{1,2}) (\d{4}|\d{2})\b",
+            text,
+        )
+        if span and 1 <= int(span.group(1)) <= 12 and 1 <= int(span.group(3)) <= 12:
+            first = _year_month(span.group(1), span.group(2))
+            last = _year_month(span.group(3), span.group(4))
+            if first <= last:
+                expanded: list[tuple[int, int]] = []
+                index = first[0] * 12 + first[1] - 1
+                while index <= last[0] * 12 + last[1] - 1:
+                    expanded.append((index // 12, index % 12 + 1))
+                    index += 1
+                months = expanded + [value for value in months if value not in expanded]
+        if len(months) < 2:
+            return []
+        return [
+            TimeWindow(
+                role="target", start=date(y, m, 1), end_exclusive=next_month(date(y, m, 1)),
+                evidence=["question", "as_of_date"],
+            )
+            for y, m in months
+        ]
+
     def _resolve_anchor(
         self,
         question: str,
@@ -194,6 +266,30 @@ class TemporalResolver:
         window: Any,
         today_end: date,
     ) -> AnchorPeriod | None:
+        # Rulebook §2: "N ngày kể từ ngày D" = D through D+N-1; "so với N ngày ngày trước đó" = the N days before D.
+        # The start day is either written in the same phrase, or ("ngày đó") the single full date named elsewhere.
+        counted = re.search(
+            r"\b(\d{1,2}) ngay ke tu (?:ngay )?(?:(\d{1,2}) (\d{1,2}) (20\d{2})|do|nay)\b", text
+        )
+        if counted and int(counted.group(1)) > 0:
+            n = int(counted.group(1))
+            if counted.group(2):
+                day_parts = [(counted.group(2), counted.group(3), counted.group(4))]
+            else:
+                day_parts = list(set(re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})/(20\d{2})(?!\d)", question)))
+                if len(day_parts) != 1:
+                    return None
+            try:
+                start = date(int(day_parts[0][2]), int(day_parts[0][1]), int(day_parts[0][0]))
+            except ValueError:
+                return None
+            target = window(start, start + timedelta(days=n))
+            # Comparison only when the question asks for it: "so với / vs / hơn" N days "liền trước" the start.
+            if re.search(rf"\b(?:so voi|voi|hon) {n} ngay (?:lien )?(?:ngay )?truoc\b", text):
+                comp = window(start - timedelta(days=n), start, role="comparison")
+                return AnchorPeriod(target, Granularity.RANGE, {"comp_window": comp})
+            return AnchorPeriod(target, Granularity.RANGE)
+
         explicit_days = re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})/(20\d{2})(?!\d)", question)
         if len(explicit_days) == 2 and "tu " in text and " den " in f" {text} ":
             first, last = [
@@ -376,6 +472,17 @@ class TemporalResolver:
                 {"month": m.month, "year": m.year},
             )
 
+        # "tháng M năm rồi / năm ngoái / năm trước": month M of the previous calendar year.
+        last_year_month = re.search(r"\b(?:thang|th|t)\s*(\d{1,2}) nam (?:roi|ngoai|truoc)\b", text)
+        if last_year_month and 1 <= int(last_year_month.group(1)) <= 12:
+            month = int(last_year_month.group(1))
+            start = date(as_of.year - 1, month, 1)
+            return AnchorPeriod(
+                window(start, next_month(start)),
+                Granularity.MONTH,
+                {"month": month, "year": as_of.year - 1, "year_word": True},
+            )
+
         # Unyeared month: "tháng M", "th M"
         m_match = re.search(r"\b(?:thang|th)\s*(\d{1,2})\b", text)
         if m_match:
@@ -504,10 +611,13 @@ class TemporalResolver:
                     "thang ngay truoc",
                     "so thang truoc",
                     "thang roi",
+                    "ky truoc",
+                    "ky lien truoc",
                 ]
             ):
                 return ComparisonOperator.PREVIOUS_PERIOD, None
-            if any(
+            # "tháng M năm rồi" names the year itself; its "năm rồi" is not a comparison request.
+            if not anchor.meta.get("year_word") and any(
                 k in text
                 for k in [
                     "cung ky nam ngoai",
