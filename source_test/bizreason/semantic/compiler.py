@@ -229,6 +229,60 @@ def _shift_key(text: Any) -> str:
     return keys[0]
 
 
+# Shapes that a two-part question can be mislabelled as by the question parser.
+TWO_PART_SHAPES = frozenset({"breakdown", "compare_periods"})
+
+
+def _two_part_window(intent: Intent, windows: list[TimeWindow]) -> TimeWindow | None:
+    """The single window of a two-part question, or None when grouping, a threshold or a comparison rules it out."""
+    if intent.shape not in TWO_PART_SHAPES or intent.group_by is not None or intent.top_k is not None:
+        return None
+    if intent.threshold is not None or len(windows) != 1 or windows[0].role == "comparison":
+        return None
+    return windows[0]
+
+
+def _repeated_dims(filters: list[dict[str, Any]]) -> dict[Any, list[int]]:
+    """Positions of the non-excluded filters per dimension, keeping only the dimensions that appear more than once."""
+    positions: dict[Any, list[int]] = {}
+    for index, item in enumerate(filters):
+        if item.get("exclude") is True:
+            continue
+        positions.setdefault(item.get("dim"), []).append(index)
+    return {dim: where for dim, where in positions.items() if len(where) > 1}
+
+
+def _as_scalar_pair(intent: Intent, windows: list[TimeWindow]) -> Intent:
+    """The parser mislabels the shape of a two-measure question, so one window with two measures is a scalar pair."""
+    if intent.measure2 is None or intent.measure2 == intent.measure:
+        return intent
+    # A compare of two different measures may ask for their difference, so only a breakdown becomes a pair.
+    if intent.shape != "breakdown":
+        return intent
+    if _two_part_window(intent, windows) is None or _repeated_dims(intent.filters):
+        return intent
+    return replace(intent, shape="scalar")
+
+
+def _same_measure_pair(intent: Intent, windows: list[TimeWindow]) -> tuple[TimeWindow, list[Intent]] | None:
+    """The parser mislabels two members of one dimension as a compare; each member is answered as its own scalar."""
+    if intent.measure2 != intent.measure:
+        return None
+    window = _two_part_window(intent, windows)
+    if window is None:
+        return None
+    repeated = _repeated_dims(intent.filters)
+    if len(repeated) != 1 or len(next(iter(repeated.values()))) != 2:
+        return None
+    first, second = next(iter(repeated.values()))
+    # The member for the first filter drops the second filter, and the other way round; the order of the filters is kept.
+    members = [
+        replace(intent, measure2=None, shape="scalar", filters=[f for i, f in enumerate(intent.filters) if i != drop])
+        for drop in (second, first)
+    ]
+    return window, members
+
+
 class Compiler:
     def __init__(self, connection: sqlite3.Connection):
         self.db = connection
@@ -940,6 +994,15 @@ class Compiler:
         if intent.age_days is not None and shape in THRESHOLD_SHAPES:
             # The threshold path reads its own metric, so an age would be dropped silently.
             raise Unsupported(f"age on shape {shape}")
+        pair = _same_measure_pair(intent, windows)
+        if pair is not None:
+            window, members = pair
+            values = [self._scalar(member, window) for member in members]
+            if any(value is None for value in values):
+                raise Unsupported("member value missing")
+            return Answer("list", [self._format(intent.measure, value).value for value in values])
+        intent = _as_scalar_pair(intent, windows)
+        shape = intent.shape
         if intent.measure2 is not None and shape != "scalar":
             raise Unsupported(f"second measure on shape {shape}")
         target = [w for w in windows if w.role != "comparison"]

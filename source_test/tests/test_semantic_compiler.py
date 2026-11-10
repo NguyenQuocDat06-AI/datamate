@@ -1025,3 +1025,43 @@ def test_weekday_without_average_only_filters() -> None:
                    compare_as="average_per_weekday")
     # Valid March Monday lines in base units: A1 2, A2 tea 1, A2 cake 3, A3 1 (no qty_base, so qty). Total 7.
     assert compiler.answer(other, [MARCH]) == Answer("number", 7)
+
+
+# The parser sometimes labels a two-part question with the wrong shape; these cases are answered as a scalar pair.
+# Timed March: revenue 350, order count 8. Revenue by channel: dine 285 (A1, A2, A4, A5, A7, A12), take 65 (A3, A10).
+def test_breakdown_with_second_measure_is_answered_as_scalar_pair() -> None:
+    compiler = Compiler(make_timed_db())
+    intent = Intent(measure="revenue", measure2="order_count", shape="breakdown")
+    scalar = Intent(measure="revenue", measure2="order_count", shape="scalar")
+    assert compiler.answer(intent, [MARCH]) == compiler.answer(scalar, [MARCH]) == Answer("list", [350, 8])
+
+
+def test_compare_periods_with_two_members_of_one_dim_is_answered_per_member() -> None:
+    compiler = Compiler(make_timed_db())
+    intent = Intent(measure="revenue", measure2="revenue", shape="compare_periods",
+                    filters=[channel("dine"), channel("take")], compare_as="value")
+    dine = compiler.answer(Intent(measure="revenue", shape="scalar", filters=[channel("dine")]), [MARCH])
+    take = compiler.answer(Intent(measure="revenue", shape="scalar", filters=[channel("take")]), [MARCH])
+    assert dine == Answer("number", 285) and take == Answer("number", 65)
+    assert compiler.answer(intent, [MARCH]) == Answer("list", [285, 65])
+    # The order of the filters decides the order of the answer.
+    reversed_intent = Intent(measure="revenue", measure2="revenue", shape="compare_periods",
+                             filters=[channel("take"), channel("dine")], compare_as="value")
+    assert compiler.answer(reversed_intent, [MARCH]) == Answer("list", [65, 285])
+
+
+def test_pair_with_a_missing_member_value_abstains() -> None:
+    # The "bar" channel only has an order in February, so its March revenue is missing.
+    february_bar = ("B1", "2026-02-11", "2026-02-11 09:00:00", "completed", "c1", "Lan", "bar", 10, 10)
+    compiler = Compiler(make_timed_db(orders=T_ORDERS + [february_bar]))
+    intent = Intent(measure="revenue", measure2="revenue", shape="compare_periods",
+                    filters=[channel("dine"), channel("bar")], compare_as="value")
+    with pytest.raises(Unsupported, match="member value missing"):
+        compiler.answer(intent, [MARCH])
+
+
+def test_breakdown_with_group_by_and_second_measure_still_raises() -> None:
+    compiler = Compiler(make_timed_db())
+    intent = Intent(measure="revenue", measure2="order_count", shape="breakdown", group_by="channel")
+    with pytest.raises(Unsupported, match="second measure"):
+        compiler.answer(intent, [MARCH])
