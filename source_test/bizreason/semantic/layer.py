@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from bizreason.contracts import BusinessContext, TableMeta
+from bizreason.data.notes_facets import classify_note_status
 from bizreason.data.parsing import ParseStatus, parse_date, parse_number
 from bizreason.semantic.vocabulary import (
     ADDRESS_HEADER_TOKENS,
@@ -184,6 +185,24 @@ def _text(column: str | None) -> str:
     return f"NULLIF(TRIM(CAST(src.{q(column)} AS TEXT)),'')" if column else "NULL"
 
 
+def _position(table: TableMeta, column: str) -> int:
+    """Index of a column in the source row. Ingestion stores each source row as a JSON array in that order."""
+    return [c.name for c in table.columns].index(column)
+
+
+def _status_text(table: TableMeta, column: str) -> str:
+    """The order status as text. Ingestion stores an unrecognized status as NULL and keeps the original cell in __raw_json."""
+    raw = f"NULLIF(TRIM(CAST(json_extract(src.{q('__raw_json')}, '$[{_position(table, column)}]') AS TEXT)),'')"
+    return f"COALESCE({_text(column)}, {raw})"
+
+
+def _note_status(note: Any) -> str | None:
+    """The status a note states, by the notes_facets rules. A note that states none means completed; a note
+    that states conflicting statuses gives NULL."""
+    status, is_error = classify_note_status(note)
+    return None if is_error else status
+
+
 def _sql_text(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -213,6 +232,7 @@ def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[
             distinct: bool = False, report: dict[str, Any] | None = None,
             defaults: dict[str, str] | None = None) -> int:
     names, exprs = [], []
+    note_column = roles.get("order_note") or roles.get("note")
     for field, role in texts.items():
         column = roles.get(role)
         names.append(field)
@@ -222,6 +242,11 @@ def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[
             # the order time supplies the clock; the stored date text is the fallback when it is blank
             day = f"src.{q(column)}" if column else "NULL"
             exprs.append(f"COALESCE(to_timestamp(src.{q(roles['order_time'])}, {day}), {_text(column)})")
+        elif role == "order_status" and column is not None:
+            exprs.append(_status_text(table, column))
+        elif role == "order_status" and note_column is not None:
+            # a ledger with no status column records its status in the notes (rulebook section 8)
+            exprs.append(f"note_status(src.{q(note_column)})")
         elif field == "order_id" and column is None and synthetic_prefix is not None:
             # no order column: each row is its own order, keyed by the table and the row's source position
             exprs.append(f"{_sql_text(synthetic_prefix)} || src.{q(SOURCE_ROW)}")
@@ -295,6 +320,72 @@ def _load_product_facts(dst: sqlite3.Connection, table: TableMeta, roles: dict[s
         f"{_text(roles.get('base_unit'))} AS base FROM source.{q(table.name)} AS src) "
         "WHERE pid IS NOT NULL OR nm IS NOT NULL"
     )
+
+
+def _load_unit_factors(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> None:
+    """Base units per large unit, for each product that a conversion or catalog row gives one for."""
+    if not (roles.get("product_id") or roles.get("product_name")):
+        return
+    if not (roles.get("large_unit") and roles.get("conversion_factor")):
+        return
+    column = roles["conversion_factor"]
+    locale = _column_locale(dst, table, column)
+    factor = f"to_number_{locale}(src.{q(column)})" if locale else f"to_number(src.{q(column)})"
+    dst.execute(
+        "INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) "
+        f"SELECT pid, NULLIF(lookup(nm), ''), lk, fc FROM (SELECT {_text(roles.get('product_id'))} AS pid, "
+        f"{_text(roles.get('product_name'))} AS nm, NULLIF(lookup({_text(roles['large_unit'])}), '') AS lk, "
+        f"{factor} AS fc FROM source.{q(table.name)} AS src) "
+        "WHERE (pid IS NOT NULL OR nm IS NOT NULL) AND lk IS NOT NULL AND fc IS NOT NULL"
+    )
+
+
+def _derive_qty_base(dst: sqlite3.Connection) -> int:
+    """Fill qty_base where a line has a quantity and none. Returns the number of lines filled.
+
+    The sold unit is the base unit: the quantity stands. A packing unit with a factor: quantity times factor.
+    A product with a known base unit that gives no factor for the sold unit stays NULL. A product with no
+    base unit and no factor row at all sells in its base unit (rulebook section 10).
+    """
+    base_by_id: dict[str, str] = {}
+    base_by_name: dict[str, str] = {}
+    for pid, name_key, base in dst.execute(
+            "SELECT product_id, name_key, base_unit FROM temp.product_facts WHERE base_unit IS NOT NULL"):
+        key = normalize_lookup(base)
+        if pid is not None:
+            base_by_id.setdefault(pid, key)
+        if name_key is not None:
+            base_by_name.setdefault(name_key, key)
+    factors_by_id: dict[str, dict[str, float]] = {}
+    factors_by_name: dict[str, dict[str, float]] = {}
+    for pid, name_key, large, factor in dst.execute("SELECT product_id, name_key, large_key, factor FROM temp.unit_factors"):
+        if pid is not None:
+            factors_by_id.setdefault(pid, {}).setdefault(large, factor)
+        if name_key is not None:
+            factors_by_name.setdefault(name_key, {}).setdefault(large, factor)
+    updates: list[tuple[float, int]] = []
+    lines = dst.execute(
+        "SELECT rowid, product_id, product_name, unit, qty FROM raw_lines "
+        "WHERE qty_base IS NULL AND qty IS NOT NULL AND has_product=1"
+    ).fetchall()
+    for rowid, pid, name, unit, qty in lines:
+        unit_key = normalize_lookup(unit) if unit is not None else ""
+        if not unit_key:
+            continue
+        name_key = normalize_lookup(name) if name is not None else ""
+        base = base_by_id.get(pid) if pid is not None else None
+        if base is None and name_key:
+            base = base_by_name.get(name_key)
+        factor_map = (factors_by_id.get(pid) if pid is not None else None) or (
+            factors_by_name.get(name_key) if name_key else None) or {}
+        if base is not None and unit_key == base:
+            updates.append((qty, rowid))
+        elif unit_key in factor_map:
+            updates.append((qty * factor_map[unit_key], rowid))
+        elif base is None and not factor_map:
+            updates.append((qty, rowid))
+    dst.executemany("UPDATE raw_lines SET qty_base=? WHERE rowid=?", updates)
+    return len(updates)
 
 
 def _load_aliases(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> None:
@@ -435,6 +526,7 @@ def _register(con: sqlite3.Connection) -> None:
     con.create_function("to_date", 1, to_date)
     con.create_function("to_timestamp", 2, to_timestamp)
     con.create_function("lookup", 1, lambda v: None if v is None else normalize_lookup(v))
+    con.create_function("note_status", 1, _note_status)
 
 
 def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
@@ -464,11 +556,13 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.execute("CREATE TEMP TABLE product_facts (product_id TEXT, name_key TEXT, category TEXT, base_unit TEXT)")
     dst.execute("CREATE TEMP TABLE product_attrs (product_id TEXT, name_key TEXT, prescription INTEGER, "
                 "active_ingredient TEXT, product_kind TEXT)")
+    dst.execute("CREATE TEMP TABLE unit_factors (product_id TEXT, name_key TEXT, large_key TEXT, factor REAL)")
     dst.execute("CREATE TEMP TABLE catalog_ids (role TEXT, id TEXT, name TEXT)")
     dst.execute("CREATE TEMP TABLE alias_map (alias_key TEXT PRIMARY KEY, full_name TEXT)")
     report: dict[str, Any] = {
         "sales_tables": 0, "service_tables": 0, "purchase_tables": 0, "return_tables": 0, "unannotated": [],
         "duplicate_lines_removed": 0, "columns_with_locale_inferred": 0, "tickets_defaulted_completed": 0,
+        "qty_base_derived": 0,
     }
     annotated: list[tuple[TableMeta, dict[str, Any]]] = []
     for table in context.tables:
@@ -500,8 +594,9 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
                 ticket["line_amount"] = roles["ticket_amount"]
             if roles.get("service_item"):
                 ticket["product_name"] = roles["service_item"]
-            # a ledger with no status column records it in its notes, and a note with no status means completed
-            status_defaulted = "order_status" not in ticket
+            # a ledger with no status column records it in its notes, and a note with no status means completed;
+            # only a ledger with neither a status nor a note column is completed by default
+            status_defaulted = "order_status" not in ticket and not (ticket.get("order_note") or ticket.get("note"))
             rows = _load_lines(dst, table, ticket, synthetic, 1, report,
                                defaults={"status": "completed"} if status_defaulted else None)
             if status_defaulted:
@@ -521,6 +616,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             _load_customer_groups(dst, table, roles)
         elif note["kind"] in ("product_catalog", "unit_conversion"):
             _load_product_facts(dst, table, roles)
+            _load_unit_factors(dst, table, roles)
         elif note["kind"] == "alias":
             _load_aliases(dst, table, roles)
         if note["kind"] in PRODUCT_ATTR_KINDS:
@@ -530,6 +626,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["alias_lines_resolved"] = _resolve_aliases(dst)
     report["non_product_lines"] = _classify_lines(dst, pairs)
     report["status_mapped"] = _map_status(dst, status_map or {})
+    report["qty_base_derived"] = _derive_qty_base(dst)
     _derive(dst)
     report["orders_marked_returned"] = _mark_returned(dst)
     _write_shop_facts(dst, context)

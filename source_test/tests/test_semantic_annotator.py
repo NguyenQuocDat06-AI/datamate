@@ -15,6 +15,7 @@ from bizreason.semantic.annotator import (
     load_or_annotate,
     load_status_map,
     needs_reannotation,
+    order_status_values,
     relevant_readme,
 )
 from bizreason.utils import normalize_lookup
@@ -660,3 +661,37 @@ def test_needs_reannotation_cases() -> None:
     assert needs_reannotation({"table": "t_two", "kind": "other"}, unmapped) is False
     assert needs_reannotation({"table": "t_one", "kind": "inventory"}, mapped) is False
     assert needs_reannotation({"table": "t_two", "kind": "sales"}, unmapped) is False
+
+
+def _ingested_status_context(tmp_path: Path) -> tuple[BusinessContext, list[dict[str, Any]]]:
+    """A sales table as ingestion leaves it: an unrecognized status is NULL, its original is in __raw_json."""
+    database = tmp_path / "source.sqlite"
+    con = sqlite3.connect(database)
+    con.execute('CREATE TABLE "sales" ("state" TEXT, __source_row INTEGER, __raw_json TEXT)')
+    rows = [(None, ["Bom hang"]), ("completed", ["completed"]), (None, ["Mystery"]), (None, [None])]
+    con.executemany(
+        'INSERT INTO "sales" VALUES (?, ?, ?)',
+        [(stored, number, json.dumps(raw)) for number, (stored, raw) in enumerate(rows, start=1)],
+    )
+    con.commit()
+    con.close()
+    context = BusinessContext(
+        business_id="shop_a", revision="rev-1", database=database, readme="", manifest={},
+        tables=[_table("sales", ["state"])],
+    )
+    return context, [{"columns": ["state"], "kind": "sales", "roles": {"state": "order_status"}}]
+
+
+def test_order_status_values_includes_unrecognized_originals_from_raw(tmp_path: Path) -> None:
+    context, records = _ingested_status_context(tmp_path)
+
+    assert order_status_values(context, records) == ["Bom hang", "Mystery"]
+
+
+def test_annotate_status_maps_a_recovered_original(tmp_path: Path) -> None:
+    context, records = _ingested_status_context(tmp_path)
+    model = StatusModel(reply={"Bom hang": "cancelled", "Mystery": "unknown"})
+
+    result = Annotator(model, workers=1).annotate_status(context, records)
+
+    assert result == {"Bom hang": "cancelled"}

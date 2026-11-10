@@ -211,7 +211,11 @@ def _role_list(options: dict[str, str]) -> str:
 
 
 def order_status_values(context: BusinessContext, records: list[dict[str, Any]]) -> list[str]:
-    """Distinct raw order_status values of the tables that feed raw_lines, excluding canonical ones."""
+    """Distinct raw order_status values of the tables that feed raw_lines, excluding canonical ones.
+
+    Ingestion stores a status it does not recognize as NULL; the original cell is read from __raw_json, where
+    each source row is a JSON array in column order.
+    """
     notes = annotations_by_signature(records)
     found: set[str] = set()
     con = sqlite3.connect(f"file:{context.database}?mode=ro", uri=True)
@@ -223,8 +227,11 @@ def order_status_values(context: BusinessContext, records: list[dict[str, Any]])
             column = effective_roles(table, note).get("order_status")
             if not column:
                 continue
+            position = [c.name for c in table.columns].index(column)
             rows = con.execute(
-                f"SELECT DISTINCT NULLIF(TRIM(CAST({q(column)} AS TEXT)),'') FROM {q(table.name)}"
+                f"SELECT DISTINCT COALESCE(NULLIF(TRIM(CAST({q(column)} AS TEXT)),''), "
+                f"NULLIF(TRIM(CAST(json_extract({q('__raw_json')}, '$[{position}]') AS TEXT)),'')) "
+                f"FROM {q(table.name)}"
             ).fetchall()
             found.update(row[0] for row in rows if row[0] is not None)
     finally:

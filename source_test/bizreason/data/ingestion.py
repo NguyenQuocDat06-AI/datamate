@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import itertools
 import re
 import sqlite3
@@ -59,7 +60,127 @@ GROUP_ROLES = {
 }
 
 
-def header_score(row: tuple[Any, ...], readme: str) -> float:
+HEADER_LOOKAHEAD = 10  # Following prefix rows that show what a column holds below a candidate header.
+HEADER_TEXT_LIMIT = 60  # Header cells are short labels, not sentences.
+HEADER_MIN_SCORE = 2.5  # Below this the sheet has no plausible header row.
+HEADER_STACKED_PENALTY = 1.0  # A solid text row directly under another solid text row is data.
+
+
+@functools.lru_cache(maxsize=16)
+def _readme_terms(readme: str) -> str:
+    return f" {normalize_lookup(readme)} "
+
+
+def _in_readme(text: str, terms: str) -> bool:
+    normalized = normalize_lookup(text)
+    return len(normalized) >= 3 and f" {normalized} " in terms
+
+
+def _cell_kind(cell: Any) -> str | None:
+    if blank(cell):
+        return None
+    if isinstance(cell, (int, float, Decimal)) and not isinstance(cell, bool):
+        return "number"
+    if isinstance(cell, date):
+        return "date"
+    if isinstance(cell, str):
+        if parse_number(cell).status in {ParseStatus.OK, ParseStatus.AMBIGUOUS}:
+            return "number"
+        if parse_date(cell).status in {ParseStatus.OK, ParseStatus.AMBIGUOUS}:
+            return "date"
+        return "text"
+    return "other"
+
+
+def _contrast_share(index: int, following: tuple[tuple[Any, ...], ...]) -> float:
+    """Share of the values below a label column that are numbers or dates."""
+    below = [
+        _cell_kind(row[index])
+        for row in following
+        if index < len(row) and not blank(row[index])
+    ]
+    if len(below) < 2:
+        return 0.0
+    return sum(kind in {"number", "date"} for kind in below) / len(below)
+
+
+def header_score(
+    row: tuple[Any, ...],
+    readme: str,
+    following: tuple[tuple[Any, ...], ...] = (),
+    width: int | None = None,
+) -> float:
+    """Structural header score: short text, fill, distinct labels, numbers below labels.
+
+    ``following`` holds the rows after ``row`` in the prefix and ``width`` the widest
+    non-blank row in the prefix. Known header names only add a small bonus.
+    """
+    present = [(index, cell) for index, cell in enumerate(row) if not blank(cell)]
+    if len(present) < 2:
+        return -1
+    count = len(present)
+    cells = [str(cell).strip() for _, cell in present]
+    short = [
+        (index, text)
+        for (index, cell), text in zip(present, cells)
+        if _cell_kind(cell) == "text" and len(text) <= HEADER_TEXT_LIMIT
+    ]
+    text = len(short) / count
+    if text < 0.5:
+        return -1  # Mostly numbers or dates: a data row, not a header.
+    fill = count / max(width or count, count)
+    unique = len(set(cells)) / count
+    long = sum(len(cell) > 80 for cell in cells) / count
+    labels = sum(infer_role(cell, readme) is not None for cell in cells) / count
+    terms = _readme_terms(readme)
+    mentioned = sum(_in_readme(value, terms) for _, value in short) / count
+    contrast = sum(_contrast_share(index, following) for index, _ in short) / count
+    return (
+        fill
+        + text
+        + unique
+        + 3.0 * contrast
+        + 1.5 * mentioned
+        + 0.5 * labels
+        - 2.0 * long
+    )
+
+
+def _solid_text_row(row: tuple[Any, ...], width: int) -> bool:
+    present = [cell for cell in row if not blank(cell)]
+    return (
+        len(present) >= 2
+        and len(present) >= 0.8 * max(width, len(present))
+        and all(
+            _cell_kind(cell) == "text" and len(str(cell).strip()) <= HEADER_TEXT_LIMIT
+            for cell in present
+        )
+    )
+
+
+def choose_header_row(prefix: list[tuple[Any, ...]], readme: str) -> tuple[int, float]:
+    """Return the index and score of the best header candidate; earliest row wins ties."""
+    width = max((sum(not blank(cell) for cell in row) for row in prefix), default=0)
+    scored = []
+    for index, row in enumerate(prefix):
+        following = tuple(prefix[index + 1 : index + 1 + HEADER_LOOKAHEAD])
+        score = header_score(row, readme, following, width)
+        # A header usually follows a title, blank or other non-table row. A text row under
+        # another text row is more likely the first data row.
+        if (
+            score > 0
+            and index > 0
+            and _solid_text_row(row, width)
+            and _solid_text_row(prefix[index - 1], width)
+        ):
+            score -= HEADER_STACKED_PENALTY
+        scored.append((score, index))
+    score, position = max(scored, key=lambda item: (item[0], -item[1]))
+    return position, score
+
+
+def _alias_shape_score(row: tuple[Any, ...], readme: str) -> float:
+    """Previous alias-driven score, kept for region splits where known names are present."""
     cells = [str(cell).strip() for cell in row if not blank(cell)]
     if len(cells) < 2:
         return -1
@@ -68,6 +189,22 @@ def header_score(row: tuple[Any, ...], readme: str) -> float:
     unique = len(set(cells)) / len(cells)
     long = sum(len(cell) > 80 for cell in cells) / len(cells)
     return 4 * labels + texts + unique - 2 * long
+
+
+def _readme_region_header(row: tuple[Any, ...], readme: str, width: int) -> bool:
+    """A region header without known names: strong text-only, high-fill, README-confirmed row."""
+    present = [cell for cell in row if not blank(cell)]
+    if len(present) < 2:
+        return False
+    if any(
+        _cell_kind(cell) != "text" or len(str(cell).strip()) > HEADER_TEXT_LIMIT
+        for cell in present
+    ):
+        return False
+    if len(present) < 0.8 * max(width, len(present)):
+        return False
+    terms = _readme_terms(readme)
+    return sum(_in_readme(str(cell).strip(), terms) for cell in present) >= 2
 
 
 def unique_columns(headers: tuple[Any, ...]) -> list[str]:
@@ -322,14 +459,14 @@ class BusinessBuilder:
         prefix = list(itertools.islice(sheet.rows, 40))
         if not prefix:
             return []
+        width = max((sum(not blank(cell) for cell in row) for row in prefix), default=0)
         if sheet.declared_columns:
             headers = tuple(sheet.declared_columns)
             header_row = 0
             rows = enumerate(itertools.chain(prefix, sheet.rows), 1)
         else:
-            scored = [(header_score(row, readme), index) for index, row in enumerate(prefix)]
-            score, position = max(scored, key=lambda item: (item[0], -item[1]))
-            if score < 1.5:
+            position, score = choose_header_row(prefix, readme)
+            if score < HEADER_MIN_SCORE:
                 diagnostics.append(
                     Diagnostic(
                         code="UNRESOLVED_HEADER",
@@ -350,11 +487,13 @@ class BusinessBuilder:
             known = sum(
                 infer_role(str(cell), readme) is not None for cell in row if not blank(cell)
             )
-            if (
-                known >= 2
-                and header_score(row, readme) >= 4.0
-                and tuple(row) != tuple(current_headers)
-            ):
+            # Rows with known names keep the previous split rule exactly. Rows without them
+            # may split only on README-confirmed, strong text-only, high-fill shape.
+            if known >= 2:
+                splits = _alias_shape_score(row, readme) >= 4.0
+            else:
+                splits = _readme_region_header(row, readme, width)
+            if splits and tuple(row) != tuple(current_headers):
                 regions.append((current_headers, current_header_row, buffered))
                 current_headers, current_header_row, buffered = row, row_number, []
             else:

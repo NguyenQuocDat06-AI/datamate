@@ -5,6 +5,7 @@ Source files mirror ingestion: every table carries __source_row and __raw_json.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -835,4 +836,152 @@ def test_shop_facts_are_false_without_address_group_or_dated_orders(tmp_path: Pa
 
     assert _query(out, "SELECT key, value FROM shop_facts ORDER BY key") == [
         ("has_address", 0), ("has_customer_group", 0), ("has_orders", 0),
+    ]
+
+
+def _with_raw_rows(path: Path, table: str, raw_rows: list[list[Any]]) -> None:
+    """Write each source row's original cells as ingestion does: a JSON array in column order, by __source_row."""
+    con = sqlite3.connect(path)
+    for number, row in enumerate(raw_rows, start=1):
+        con.execute(f'UPDATE "{table}" SET __raw_json=? WHERE __source_row=?', (json.dumps(row, ensure_ascii=False), number))
+    con.commit()
+    con.close()
+
+
+def test_unrecognized_status_is_recovered_from_raw_and_mapped(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount", "state"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "tea", "100", None), ("O2", "tea", "50", "completed"), ("O3", "tea", "10", None),
+    ])}
+    source = _source(tmp_path, specs)
+    _with_raw_rows(source, "sales", [["O1", "tea", "100", "Bom hang"], ["O2", "tea", "50", "completed"],
+                                     ["O3", "tea", "10", "Mystery"]])
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount",
+                                          "state": "order_status"})]
+    out = tmp_path / "canonical.sqlite"
+
+    report = layer.build(_context(source, specs), records, out, status_map={"Bom hang": "cancelled"})
+
+    assert report["status_mapped"] == 1
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("O1", "cancelled"), ("O2", "completed"), ("O3", None),
+    ]
+
+
+def test_note_states_cancelled_on_a_sales_ledger_without_status_column(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount", "note"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100", "khach huy don"), ("O2", "tea", "50", "giao buoi sang")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount",
+                                          "note": "note"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("O1", "cancelled"), ("O2", "completed"),
+    ]
+    assert report["status_null_orders"] == 0
+
+
+def test_service_ticket_note_states_its_status_else_completed(tmp_path: Path) -> None:
+    columns = ["ticket", "visit", "job", "bill", "memo"]
+    specs: Specs = {"repairs": (columns, [
+        ("T1", "2026-03-01", "oil change", "200", "dang giao"),
+        ("T2", "2026-03-02", "brake pads", "450", "thay dau"),
+    ])}
+    records = [_record(columns, "service_ticket", {
+        "ticket": "ticket_id", "visit": "ordered_at", "job": "service_item", "bill": "ticket_amount", "memo": "note",
+    })]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["tickets_defaulted_completed"] == 0
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("T1", "shipping"), ("T2", "completed"),
+    ]
+
+
+def test_note_naming_a_person_huy_is_not_cancelled(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount", "note"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100", "anh Huy giao hang sau")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount",
+                                          "note": "note"})]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT status FROM orders") == [("completed",)]
+
+
+def _unit_catalog(name: str, columns: list[str], rows: list[tuple[Any, ...]], roles: dict[str, str],
+                  kind: str) -> tuple[Specs, dict[str, Any]]:
+    return {name: (columns, rows)}, _record(columns, kind, roles)
+
+
+SALES_UNIT_ROLES = {"order": "order_id", "item": "product_name", "unit": "unit", "qty": "qty", "amount": "line_amount"}
+SALES_UNIT_COLUMNS = ["order", "item", "unit", "qty", "amount"]
+
+
+def test_qty_base_is_the_quantity_when_the_sold_unit_is_the_base_unit(tmp_path: Path) -> None:
+    catalog_specs, catalog = _unit_catalog("catalog", ["item", "base"], [("tea", "cup")],
+                                           {"item": "product_name", "base": "base_unit"}, "product_catalog")
+    specs: Specs = {"sales": (SALES_UNIT_COLUMNS, [("O1", "tea", "CUP", "2", "100"), ("O2", "tea", "Cup", "3", "150")]),
+                    **catalog_specs}
+    records = [_record(SALES_UNIT_COLUMNS, "sales", SALES_UNIT_ROLES), catalog]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, qty_base FROM lines ORDER BY order_id") == [("O1", 2.0), ("O2", 3.0)]
+    assert report["qty_base_derived"] == 2
+
+
+def test_qty_base_is_quantity_times_the_factor_of_the_sold_unit(tmp_path: Path) -> None:
+    catalog_specs, catalog = _unit_catalog("conversions", ["item", "large", "base", "factor"],
+                                           [("tea", "box", "cup", "10")],
+                                           {"item": "product_name", "large": "large_unit", "base": "base_unit",
+                                            "factor": "conversion_factor"}, "unit_conversion")
+    specs: Specs = {"sales": (SALES_UNIT_COLUMNS, [("O1", "tea", "box", "2", "200"), ("O2", "tea", "cup", "3", "150")]),
+                    **catalog_specs}
+    records = [_record(SALES_UNIT_COLUMNS, "sales", SALES_UNIT_ROLES), catalog]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, qty_base FROM lines ORDER BY order_id") == [("O1", 20.0), ("O2", 3.0)]
+    assert report["qty_base_derived"] == 2
+
+
+def test_qty_base_stays_null_when_the_sold_unit_has_no_conversion(tmp_path: Path) -> None:
+    catalog_specs, catalog = _unit_catalog("conversions", ["item", "large", "base", "factor"],
+                                           [("tea", "box", "cup", "10")],
+                                           {"item": "product_name", "large": "large_unit", "base": "base_unit",
+                                            "factor": "conversion_factor"}, "unit_conversion")
+    specs: Specs = {"sales": (SALES_UNIT_COLUMNS, [("O1", "tea", "box", "2", "200"), ("O2", "tea", "bottle", "1", "50")]),
+                    **catalog_specs}
+    records = [_record(SALES_UNIT_COLUMNS, "sales", SALES_UNIT_ROLES), catalog]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, qty_base FROM lines ORDER BY order_id") == [("O1", 20.0), ("O2", None)]
+    assert report["qty_base_derived"] == 1
+
+
+def test_qty_base_is_the_quantity_when_the_product_has_no_conversion_at_all(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (SALES_UNIT_COLUMNS, [("O1", "tea", "pack", "4", "80")])}
+    records = [_record(SALES_UNIT_COLUMNS, "sales", SALES_UNIT_ROLES)]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT qty_base FROM lines") == [(4.0,)]
+    assert report["qty_base_derived"] == 1
+
+
+def test_sales_loads_when_every_ingestion_role_is_none(tmp_path: Path) -> None:
+    columns = ["order", "day", "item", "state", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "2026-03-01", "tea", "cancelled", "100"),
+                                        ("O2", "2026-03-02", "tea", "completed", "50")])}
+    records = [_record(columns, "sales", {"order": "order_id", "day": "ordered_at", "item": "product_name",
+                                          "state": "order_status", "amount": "line_amount"})]
+    path = _source(tmp_path, specs)
+    context = _context(path, specs)
+    blank = [table.model_copy(update={"columns": [c.model_copy(update={"semantic_role": None}) for c in table.columns]})
+             for table in context.tables]
+    context = context.model_copy(update={"tables": blank})
+    assert all(c.semantic_role is None for t in context.tables for c in t.columns)
+    out = tmp_path / "canonical.sqlite"
+
+    layer.build(context, records, out)
+
+    assert _query(out, "SELECT order_id, date, status FROM orders ORDER BY order_id") == [
+        ("O1", "2026-03-01", "cancelled"), ("O2", "2026-03-02", "completed"),
     ]
