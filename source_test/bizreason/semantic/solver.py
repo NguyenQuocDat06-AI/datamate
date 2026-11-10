@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Protocol
 
 from bizreason.contracts import AnswerType, Prediction, Question, TimeWindow
-from bizreason.semantic.compiler import Compiler, Intent, Unsupported
+from bizreason.semantic.compiler import DEBT_MEASURES, Compiler, Intent, Unsupported
+from bizreason.semantic.quality import QualityFlags, assess
 from bizreason.temporal import TemporalResolver
 
 POINT_IN_TIME = {"debt_outstanding", "debtor_count", "inventory_qty", "inventory_value", "out_of_stock_count"}
@@ -17,6 +18,17 @@ ORDER_MEASURES = {
     "revenue", "order_count", "cancelled_count", "cancel_rate", "avg_per_order",
     "qty_base_sold", "distinct_customers", "gross_profit",
 }
+# Which data-quality flags an intent depends on (see quality.py). Unlisted measures depend on none of them.
+QUANTITY_MEASURES = {
+    "qty_base_sold", "gross_profit", "unit_sale_price_on_date", "no_sale_count",
+    "orders_containing_product", "unit_purchase_price",
+}
+QUANTITY_FILTERS = {"unit", "size"}
+MONEY_MEASURES = {"revenue", "avg_per_order", "gross_profit", "purchase_amount", "order_total_due"} | DEBT_MEASURES
+ORDER_BASED_MEASURES = ORDER_MEASURES | DEBT_MEASURES
+FLAG_NAMES = (
+    "qty_unreliable", "money_unreliable", "order_structure_broken", "status_unreliable", "payments_unlinked",
+)
 PERIOD_SHAPES = {"breakdown", "argmax_period", "trend_check"}
 # Stored values offered to the parser, per filter dimension: (table, column).
 CHOICE_COLUMNS = {
@@ -47,6 +59,8 @@ class SolveTrace:
     windows: list[TimeWindow]
     decision: str  # "value" | "unanswerable" | "abstain"
     reason: str
+    # Names of the data-quality flags that fired for this question, when they were checked.
+    quality: list[str] = field(default_factory=list)
 
 
 def filter_choices(connection: sqlite3.Connection) -> dict[str, list[str]]:
@@ -79,11 +93,44 @@ def _outside(window: TimeWindow, low: date, high: date) -> bool:
     return window.end_exclusive <= low or window.start > high
 
 
+def _required_flags(intent: Intent) -> list[str]:
+    """The data-quality flags whose failure would make this intent's answer wrong."""
+    required = []
+    filter_dims = {item.get("dim") for item in intent.filters}
+    if intent.measure in QUANTITY_MEASURES or filter_dims & QUANTITY_FILTERS:
+        required.append("qty_unreliable")
+    # A threshold reads its own metric, whatever the measure says.
+    threshold_metric = (intent.threshold or {}).get("metric")
+    if threshold_metric == "qty":
+        required.append("qty_unreliable")
+    if threshold_metric == "revenue":
+        required.append("money_unreliable")
+    if intent.measure in MONEY_MEASURES:
+        required.append("money_unreliable")
+    if intent.measure in ORDER_BASED_MEASURES:
+        required.extend(["order_structure_broken", "status_unreliable"])
+    if intent.measure in DEBT_MEASURES:
+        required.append("payments_unlinked")
+    return required
+
+
+def _quality_reason(flags: QualityFlags, name: str) -> str:
+    """The first reason the assessment gives for one flag; reasons are written as 'flag name: detail'."""
+    return next(reason for reason in flags.reasons if reason.startswith(f"{name}:"))
+
+
 class SemanticSolver:
     def __init__(self, parser: IntentParser, temporal: TemporalResolver, connection: sqlite3.Connection):
         self.parser = parser
         self.temporal = temporal
         self.connection = connection
+        self._flags: QualityFlags | None = None
+
+    def _quality(self) -> QualityFlags:
+        """The data-quality flags of this database, assessed once per solver."""
+        if self._flags is None:
+            self._flags = assess(self.connection)
+        return self._flags
 
     def solve(self, question: Question) -> tuple[Prediction, SolveTrace]:
         trace = SolveTrace(question_id=question.id, intent=None, windows=[], decision="abstain", reason="")
@@ -153,6 +200,12 @@ class SemanticSolver:
                     question, trace, "unanswerable",
                     f"comparison period lies wholly outside the shop's data range {low.isoformat()} to {high.isoformat()}",
                 )
+
+        flags = self._quality()
+        trace.quality = [name for name in FLAG_NAMES if getattr(flags, name)]
+        for name in _required_flags(intent):
+            if getattr(flags, name):
+                return self._finish(question, trace, "abstain", f"data quality: {_quality_reason(flags, name)}")
 
         try:
             answer = Compiler(self.connection).answer(intent, windows)

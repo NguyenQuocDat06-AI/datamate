@@ -388,3 +388,105 @@ def test_multi_period_shape_falls_back_to_resolve_when_no_periods():
     temporal = FakeTemporal(single=[win("2026-01-01", "2026-02-01")])
     solve(ParseResult(intent), temporal)
     assert temporal.calls == ["resolve_periods", "resolve"]
+
+
+def add_stats(conn: sqlite3.Connection, **stats: object) -> None:
+    conn.execute("CREATE TABLE build_stats (key TEXT, value TEXT)")
+    conn.executemany("INSERT INTO build_stats VALUES (?, ?)", [(k, str(v)) for k, v in stats.items()])
+
+
+def test_broken_quantity_abstains_for_a_quantity_measure(reached: list[str]):
+    conn = make_db()
+    add_stats(conn, qty_cells_nonblank=1000, qty_cells_unparsed=50)
+    prediction, trace = solve(ParseResult(Intent(measure="qty_base_sold")),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason.startswith("data quality: qty_unreliable:")
+    assert trace.decision == "abstain"
+    assert trace.quality == ["qty_unreliable"]
+    assert reached == []
+
+
+def test_broken_quantity_abstains_for_a_unit_filter(reached: list[str]):
+    conn = make_db()
+    add_stats(conn, qty_cells_nonblank=1000, qty_cells_unparsed=50)
+    intent = Intent(measure="order_count", filters=[{"dim": "unit", "value": "box", "exclude": False}])
+    prediction, _ = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason.startswith("data quality: qty_unreliable:")
+    assert reached == []
+
+
+def test_broken_quantity_does_not_stop_a_measure_that_does_not_use_quantity():
+    conn = make_db()
+    add_stats(conn, qty_cells_nonblank=1000, qty_cells_unparsed=50)
+    prediction, trace = solve(ParseResult(Intent(measure="revenue")),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.NUMBER
+    assert prediction.answer == 150
+    assert trace.quality == ["qty_unreliable"]
+
+
+def test_broken_money_does_not_stop_an_order_count():
+    conn = make_db()
+    add_stats(conn, money_cells_nonblank=200, money_cells_unparsed=20)
+    prediction, _ = solve(ParseResult(Intent(measure="order_count")),
+                          FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.NUMBER
+    assert prediction.answer == 2
+
+
+def test_broken_money_abstains_for_a_money_measure(reached: list[str]):
+    conn = make_db()
+    add_stats(conn, money_cells_nonblank=200, money_cells_unparsed=20)
+    prediction, _ = solve(ParseResult(Intent(measure="revenue")),
+                          FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason.startswith("data quality: money_unreliable:")
+    assert reached == []
+
+
+def test_broken_order_structure_abstains_for_an_order_measure(reached: list[str]):
+    conn = make_db()
+    add_stats(conn, product_rows_without_order=3)
+    prediction, trace = solve(ParseResult(Intent(measure="revenue")),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason.startswith("data quality: order_structure_broken:")
+    assert trace.quality == ["order_structure_broken"]
+    assert reached == []
+
+
+def test_unlinked_payments_abstain_for_a_debt_measure(reached: list[str]):
+    conn = make_db()
+    conn.execute("CREATE TABLE payments (order_id TEXT, date TEXT, amount REAL, method TEXT)")
+    conn.execute("INSERT INTO payments (order_id, amount) VALUES ('o1', 10)")
+    prediction, trace = solve(ParseResult(Intent(measure="debt_outstanding")), FakeTemporal(), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason.startswith("data quality: payments_unlinked:")
+    assert trace.quality == ["payments_unlinked"]
+    assert reached == []
+
+
+def test_quality_is_assessed_once_per_solver(monkeypatch: pytest.MonkeyPatch):
+    calls: list[int] = []
+    real_assess = solver_module.assess
+
+    def counting_assess(connection):
+        calls.append(1)
+        return real_assess(connection)
+
+    monkeypatch.setattr(solver_module, "assess", counting_assess)
+    solver = SemanticSolver(FakeParser(ParseResult(Intent(measure="revenue"))),
+                            FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), make_db())
+    solver.solve(question())
+    solver.solve(question())
+    assert len(calls) == 1
+
+
+def test_missing_build_stats_leaves_answers_unchanged():
+    prediction, trace = solve(ParseResult(Intent(measure="revenue")),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]))
+    assert prediction.type == AnswerType.NUMBER
+    assert prediction.answer == 150
+    assert trace.quality == []

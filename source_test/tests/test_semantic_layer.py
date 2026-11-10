@@ -147,7 +147,7 @@ def test_unmapped_value_becomes_null_and_is_counted_and_canonical_is_kept(tmp_pa
     columns = ["order", "state", "amount"]
     specs: Specs = {"sales": (columns, [
         ("O1", "delivered", "100"),  # mapped
-        ("O2", "void", "50"),        # unmapped
+        ("O2", "hold", "50"),        # unmapped: no reading and no map entry
         ("O3", "weird", "70"),       # unmapped
         ("O4", "completed", "10"),   # canonical: a map entry for it must not change it
     ])}
@@ -985,3 +985,198 @@ def test_sales_loads_when_every_ingestion_role_is_none(tmp_path: Path) -> None:
     assert _query(out, "SELECT order_id, date, status FROM orders ORDER BY order_id") == [
         ("O1", "2026-03-01", "cancelled"), ("O2", "2026-03-02", "completed"),
     ]
+
+
+def _stats(out: Path) -> dict[str, int]:
+    return dict(_query(out, "SELECT key, value FROM build_stats"))
+
+
+def test_quantity_with_unit_word_is_read_and_counted(tmp_path: Path) -> None:
+    columns = ["order", "item", "qty", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "1 ly", "100"), ("O2", "tea", "two", "100"),
+                                        ("O3", "tea", "", "100")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "qty": "qty",
+                                          "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, qty FROM lines ORDER BY order_id") == [
+        ("O1", 1.0), ("O2", None), ("O3", None),
+    ]
+    stats = _stats(out)
+    assert stats["qty_cells_nonblank"] == 2
+    assert stats["qty_cells_unparsed"] == 1
+    assert stats["money_cells_nonblank"] == 3
+    assert stats["money_cells_unparsed"] == 0
+
+
+def test_money_with_unit_word_stays_invalid(tmp_path: Path) -> None:
+    columns = ["order", "item", "qty", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "1", "1 ly")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "qty": "qty",
+                                          "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT qty, amount FROM lines") == [(1.0, None)]
+    assert _stats(out)["money_cells_unparsed"] == 1
+
+
+def test_order_fields_fill_down_onto_product_rows_without_order_id(tmp_path: Path) -> None:
+    columns = ["order", "date", "status", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "2024-01-02", "completed", "tea", "100"),
+        ("", "", "", "coffee", "50"),
+        ("O2", "2024-01-03", "shipping", "milk", "30"),
+        ("", "", "", "sugar", "10"),
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "date": "ordered_at", "status": "order_status",
+                                          "item": "product_name", "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, date, status, amount FROM lines ORDER BY order_id, amount") == [
+        ("O1", "2024-01-02", "completed", 50.0), ("O1", "2024-01-02", "completed", 100.0),
+        ("O2", "2024-01-03", "shipping", 10.0), ("O2", "2024-01-03", "shipping", 30.0),
+    ]
+    assert report["orders"] == 2
+    assert _stats(out)["product_rows_without_order"] == 0
+
+
+def test_product_row_above_any_order_stays_orphan_and_is_counted(tmp_path: Path) -> None:
+    columns = ["order", "date", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("", "", "tea", "100"),
+        ("O1", "2024-01-02", "coffee", "50"),
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "date": "ordered_at", "item": "product_name",
+                                          "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["orders"] == 1
+    assert report["lines"] == 1
+    assert _query(out, "SELECT order_id, amount FROM lines") == [("O1", 50.0)]
+    assert _stats(out)["product_rows_without_order"] == 1
+
+
+def test_blank_order_rows_are_never_deduplicated(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "tea", "100"),
+        ("", "tea", "100"),  # identical to the row above in every cell but the order: not a duplicate
+        ("", "tea", "100"),  # and not a duplicate of the row before it either
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["duplicate_lines_removed"] == 0
+    assert _query(out, "SELECT COUNT(*), SUM(amount) FROM lines") == [(3, 300.0)]
+    assert _stats(out)["product_rows_without_order"] == 0
+
+
+def test_blank_order_rows_with_no_order_above_are_all_kept(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("", "tea", "100"), ("", "tea", "100")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["duplicate_lines_removed"] == 0
+    assert _stats(out)["product_rows_without_order"] == 2
+    assert report["lines"] == 0
+
+
+def test_status_read_by_the_order_parser_needs_no_map(tmp_path: Path) -> None:
+    columns = ["order", "state", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "da giao", "100"),
+        ("O2", "dang giao hang", "50"),
+        ("O3", "weird", "70"),
+    ])}
+    records = [_record(columns, "sales", {"order": "order_id", "state": "order_status", "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("O1", "completed"), ("O2", "shipping"), ("O3", None),
+    ]
+    assert _stats(out)["status_unmapped_values"] == 1
+
+
+def test_mistyped_order_key_keeps_its_role_when_it_names_a_column(tmp_path: Path) -> None:
+    columns = ["order_numbers", "date", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "2024-01-02", "tea", "100"),
+        ("O1", "2024-01-02", "coffee", "50"),
+        ("O2", "2024-01-03", "tea", "30"),
+    ])}
+    records = [_record(columns, "sales", {"order_number": "order_id", "date": "ordered_at",
+                                          "item": "product_name", "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["orders"] == 2
+    assert _query(out, "SELECT order_id, SUM(amount) FROM lines GROUP BY order_id ORDER BY order_id") == [
+        ("O1", 150.0), ("O2", 30.0),
+    ]
+    assert _stats(out)["annotation_keys_unresolved"] == 0
+
+
+def test_mistyped_order_key_equal_after_lookup_normalization_is_resolved(tmp_path: Path) -> None:
+    columns = ["order_id", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O2", "tea", "30")])}
+    records = [_record(columns, "sales", {"Order-ID": "order_id", "item": "product_name",
+                                          "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id FROM orders ORDER BY order_id") == [("O1",), ("O2",)]
+
+
+def test_unresolved_order_key_skips_a_table_with_order_signals_and_is_counted(tmp_path: Path) -> None:
+    lost_columns = ["ref_code", "date", "item", "amount"]
+    kept_columns = ["order", "item", "amount"]
+    specs: Specs = {
+        "sales_lost": (lost_columns, [("R1", "2024-01-02", "tea", "100")]),
+        "sales_kept": (kept_columns, [("O1", "tea", "30")]),
+    }
+    records = [
+        _record(lost_columns, "sales", {"order_reference": "order_id", "date": "ordered_at",
+                                        "item": "product_name", "amount": "line_amount"}),
+        _record(kept_columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"}),
+    ]
+    report, out = _run(tmp_path, specs, records)
+
+    stats = _stats(out)
+    assert stats["tables_skipped_missing_order_id"] == 1
+    assert stats["annotation_keys_unresolved"] == 1
+    assert report["sales_tables"] == 1
+    assert _query(out, "SELECT order_id FROM lines") == [("O1",)]
+
+
+def test_unresolved_key_without_order_signals_keeps_synthetic_orders(tmp_path: Path) -> None:
+    columns = ["item", "amount"]
+    specs: Specs = {"sales": (columns, [("tea", "100")])}
+    records = [_record(columns, "sales", {"order_reference": "order_id", "item": "product_name",
+                                          "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id FROM orders") == [("sales:1",)]
+    assert _stats(out)["tables_skipped_missing_order_id"] == 0
+    assert _stats(out)["annotation_keys_unresolved"] == 1
+
+
+def test_money_cell_that_does_not_parse_is_counted(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O2", "coffee", "abc")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    stats = _stats(out)
+    assert stats["money_cells_nonblank"] == 2
+    assert stats["money_cells_unparsed"] == 1
+    assert stats["qty_cells_nonblank"] == 0
+
+
+def test_build_stats_exists_with_every_key_when_there_are_no_tables(tmp_path: Path) -> None:
+    specs: Specs = {}
+    report, out = _run(tmp_path, specs, [])
+
+    assert _stats(out) == {
+        "qty_cells_nonblank": 0, "qty_cells_unparsed": 0, "money_cells_nonblank": 0, "money_cells_unparsed": 0,
+        "product_rows_without_order": 0, "annotation_keys_unresolved": 0,
+        "tables_skipped_missing_order_id": 0, "status_unmapped_values": 0,
+    }

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import difflib
 import re
 import sqlite3
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from bizreason.contracts import BusinessContext, TableMeta
 from bizreason.data.notes_facets import classify_note_status
-from bizreason.data.parsing import ParseStatus, parse_date, parse_number
+from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
 from bizreason.semantic.vocabulary import (
     ADDRESS_HEADER_TOKENS,
     CANCEL_TOKENS,
@@ -55,6 +57,21 @@ LINE_KINDS = ("sales", "service_ticket")  # kinds whose rows become raw_lines
 SOURCE_ROW = "__source_row"  # ingestion adds this column to every source table
 LINE_ITEM_KINDS = ("product", "discount", "shipping_fee", "service_fee")  # what a sale line can be classified as
 NOT_REVENUE_LINE_KINDS = ("discount", "shipping_fee")  # lines that neither add to revenue nor appear in lines
+QUANTITY_FIELDS = ("qty", "qty_base")  # parsed without a money unit; every other numeric field is money
+# Roles that describe the order a row belongs to. A product row with no order id takes these from the order above it.
+ORDER_ROLES = ("order_id", "ordered_at", "order_time", "order_status", "customer_id", "customer_name",
+               "customer_group", "employee_id", "payment_method", "channel")
+# A sales table with one of these but no order id has lost its order column; it is not loaded with synthetic orders.
+ORDER_SIGNAL_ROLES = ("ordered_at", "order_status", "customer_id", "customer_name")
+# Annotation roles whose keys must resolve to a column; an unresolved key is counted in build_stats.
+COUNTED_ROLES = ("order_id", "product_name", "product_id", "qty", "line_amount", "ordered_at", "order_status",
+                 "order_total_due", "paid_amount", "customer_id")
+FUZZY_KEY_RATIO = 0.85  # minimum difflib ratio for an annotation key to name a column it does not spell exactly
+BUILD_STAT_KEYS = (
+    "qty_cells_nonblank", "qty_cells_unparsed", "money_cells_nonblank", "money_cells_unparsed",
+    "product_rows_without_order", "annotation_keys_unresolved", "tables_skipped_missing_order_id",
+    "status_unmapped_values",
+)
 
 _CURRENCY = "(?:" + "|".join(re.escape(suffix) for suffix in CURRENCY_SUFFIXES) + ")?"
 COMMA_GROUPED = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+\s*" + _CURRENCY, re.IGNORECASE)
@@ -62,13 +79,23 @@ DOT_GROUPED = re.compile(r"[+-]?\d{1,3}(?:\.\d{3})+\s*" + _CURRENCY, re.IGNORECA
 TIME_OF_DAY = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
 
 
-def _number(value: Any, locale: str) -> float | None:
-    result = parse_number(value, locale=locale, unit="VND")
+def _number(value: Any, locale: str, unit: str | None = "VND") -> float | None:
+    result = parse_number(value, locale=locale, unit=unit)
     return float(result.value) if result.status == ParseStatus.OK else None
 
 
 def to_number(value: Any) -> float | None:
     return _number(value, "unknown")
+
+
+def to_quantity(value: Any) -> float | None:
+    """A quantity may carry a unit word ("1 ly"); the word is not a currency, so no unit is required."""
+    return _number(value, "unknown", unit=None)
+
+
+def _parse_fn(field: str, locale: str | None) -> str:
+    base = "to_qty" if field in QUANTITY_FIELDS else "to_number"
+    return f"{base}_{locale}" if locale else base
 
 
 def to_date(value: Any) -> str | None:
@@ -123,12 +150,12 @@ def effective_roles(table: TableMeta, note: dict[str, Any], dst: sqlite3.Connect
     When the model gives one role to several columns, the source data (read through dst) picks one.
     Without dst the first such column wins.
     """
-    given = note.get("roles") or {}
+    given, _ = _given_by_column(table, note.get("roles") or {})
     candidates: dict[str, list[str]] = {}
     fallback: dict[str, str] = {}
     for column in table.columns:
         role = given.get(column.name)
-        if isinstance(role, str) and role != "other":
+        if _is_role(role):
             candidates.setdefault(role, []).append(column.name)
         mapped = INGESTION_ROLES.get(column.semantic_role or "")
         if mapped:
@@ -140,6 +167,42 @@ def effective_roles(table: TableMeta, note: dict[str, Any], dst: sqlite3.Connect
     for role, column in fallback.items():
         chosen.setdefault(role, column)
     return chosen
+
+
+def _is_role(role: Any) -> bool:
+    return isinstance(role, str) and role != "other"
+
+
+def _given_by_column(table: TableMeta, given: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The model's roles keyed by column name. A key that names no column (a typo) moves its role to the
+    unassigned column it names (see _column_named). Returns the roles and the roles whose keys stayed unresolved."""
+    names = {column.name for column in table.columns}
+    by_column = {name: given[name] for name in names if name in given}
+    unresolved: list[str] = []
+    for key, role in given.items():
+        if key in names or not _is_role(role):
+            continue
+        target = _column_named(key, table, by_column)
+        if target is None:
+            unresolved.append(role)
+        else:
+            by_column[target] = role
+    return by_column, unresolved
+
+
+def _column_named(key: str, table: TableMeta, by_column: dict[str, Any]) -> str | None:
+    """The unassigned column a mistyped key names: equal after lookup normalization, else the one column
+    whose name is close enough. Two equal matches, or two close ones, name nothing."""
+    wanted = normalize_lookup(key)
+    free = [column.name for column in table.columns if not _is_role(by_column.get(column.name))]
+    equal = [name for name in free if normalize_lookup(name) == wanted]
+    if equal:
+        return equal[0] if len(equal) == 1 else None
+    close = [
+        name for name in free
+        if difflib.SequenceMatcher(None, wanted, normalize_lookup(name)).ratio() >= FUZZY_KEY_RATIO
+    ]
+    return close[0] if len(close) == 1 else None
 
 
 def _choose_column(dst: sqlite3.Connection | None, table: TableMeta, role: str, columns: list[str]) -> str:
@@ -215,23 +278,67 @@ def _column_locale(dst: sqlite3.Connection, table: TableMeta, column: str) -> st
     return infer_locale(row[0] for row in rows)
 
 
-def _distinct_where(dst: sqlite3.Connection, table: TableMeta) -> str | None:
-    """Keep the first of each run of source rows identical in every column (bookkeeping columns aside)."""
-    columns = [
-        row[0] for row in dst.execute("SELECT name FROM pragma_table_info(?, 'source')", (table.name,))
-        if not row[0].startswith("__")
-    ]
-    if not columns:
-        return None
-    group = ",".join(q(column) for column in columns)
-    return f"src.rowid IN (SELECT MIN(rowid) FROM source.{q(table.name)} GROUP BY {group})"
+def _source_columns(dst: sqlite3.Connection, table: TableMeta) -> list[str]:
+    return [row[0] for row in dst.execute("SELECT name FROM pragma_table_info(?, 'source')", (table.name,))]
+
+
+def _order_source(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], report: dict[str, Any],
+                  stats: Counter) -> str:
+    """Copy a sales table with an order column to temp.order_source, ready to load.
+
+    Rows identical in every source cell are one export error and keep only their first copy. A row whose order
+    id is blank is never a duplicate of another, so it is kept. A product row with no order id then takes the
+    order-level values of the nearest order above it, in source-row order (blank cells only, as ingestion does).
+    A product row with no order above it stays an orphan and is counted.
+    """
+    order_column = roles["order_id"]
+    columns = _source_columns(dst, table)
+    group = ",".join(q(column) for column in columns if not column.startswith("__"))
+    keep = (f"{_text(order_column)} IS NULL OR src.rowid IN "
+            f"(SELECT MIN(rowid) FROM source.{q(table.name)} GROUP BY {group})")
+    dst.execute("DROP TABLE IF EXISTS temp.order_source")
+    dst.execute(f"CREATE TEMP TABLE order_source AS SELECT src.rowid AS __rid, src.* FROM source.{q(table.name)} "
+                f"AS src WHERE {keep}")
+    total = dst.execute(f"SELECT COUNT(*) FROM source.{q(table.name)}").fetchone()[0]
+    kept = dst.execute("SELECT COUNT(*) FROM temp.order_source").fetchone()[0]
+    report["duplicate_lines_removed"] += total - kept
+
+    fill = [order_column] + [roles[role] for role in ORDER_ROLES if role != "order_id" and roles.get(role)]
+    fill = list(dict.fromkeys(fill))
+    product = [roles[role] for role in ("product_name", "product_id") if roles.get(role)]
+    cursor = dst.execute("SELECT * FROM temp.order_source ORDER BY __source_row, __rid")
+    names = [description[0] for description in cursor.description]
+    rows = cursor.fetchall()
+    carried: dict[str, Any] | None = None
+    updates: list[tuple[Any, ...]] = []
+    orphans = 0
+    for record in rows:
+        values = dict(zip(names, record))
+        if not blank(values[order_column]):
+            carried = {column: values[column] for column in fill}
+            continue
+        if not any(not blank(values[column]) for column in product):
+            continue
+        if carried is None:
+            orphans += 1
+            continue
+        filled = [carried[column] if blank(values[column]) else values[column] for column in fill]
+        updates.append((*filled, values["__rid"]))
+    if updates:
+        assignments = ",".join(f"{q(column)}=?" for column in fill)
+        dst.executemany(f"UPDATE temp.order_source SET {assignments} WHERE __rid=?", updates)
+    stats["product_rows_without_order"] += orphans
+    return "temp.order_source"
 
 
 def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[str, str],
             texts: dict[str, str], numbers: dict[str, str], synthetic_prefix: str | None = None, *,
-            distinct: bool = False, report: dict[str, Any] | None = None,
-            defaults: dict[str, str] | None = None) -> int:
+            origin: str | None = None, report: dict[str, Any] | None = None,
+            defaults: dict[str, str] | None = None, stats: Counter | None = None) -> int:
+    """Insert rows of a source table (or of origin, a prepared copy of it) into target."""
+    source = origin or f"source.{q(table.name)}"
     names, exprs = [], []
+    counted: set[tuple[str, str]] = set()
     note_column = roles.get("order_note") or roles.get("note")
     for field, role in texts.items():
         column = roles.get(role)
@@ -263,25 +370,49 @@ def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[
         locale = _column_locale(dst, table, column)
         if locale and report is not None:
             report["columns_with_locale_inferred"] += 1
-        exprs.append(f"to_number_{locale}(src.{q(column)})" if locale else f"to_number(src.{q(column)})")
-    where = _distinct_where(dst, table) if distinct else None
+        exprs.append(f"{_parse_fn(field, locale)}(src.{q(column)})")
+        if stats is not None:
+            _count_cells(dst, source, field, column, locale, stats, counted)
     cursor = dst.execute(
-        f"INSERT INTO {target} ({','.join(names)}) SELECT {','.join(exprs)} "
-        f"FROM source.{q(table.name)} AS src" + (f" WHERE {where}" if where else "")
+        f"INSERT INTO {target} ({','.join(names)}) SELECT {','.join(exprs)} FROM {source} AS src"
     )
-    if where and report is not None:
-        total = dst.execute(f"SELECT COUNT(*) FROM source.{q(table.name)}").fetchone()[0]
-        report["duplicate_lines_removed"] += total - cursor.rowcount
     return cursor.rowcount
 
 
+def _count_cells(dst: sqlite3.Connection, source: str, field: str, column: str, locale: str | None,
+                 stats: Counter, counted: set[tuple[str, str]]) -> None:
+    """Non-blank cells of a numeric column, and those whose parse failed. A column counts once per table."""
+    kind = "qty" if field in QUANTITY_FIELDS else "money"
+    if (kind, column) in counted:
+        return
+    counted.add((kind, column))
+    text = _text(column)
+    nonblank, unparsed = dst.execute(
+        f"SELECT COUNT({text}), SUM(CASE WHEN {text} IS NOT NULL AND {_parse_fn(field, locale)}(src.{q(column)}) "
+        f"IS NULL THEN 1 ELSE 0 END) FROM {source} AS src"
+    ).fetchone()
+    stats[f"{kind}_cells_nonblank"] += nonblank or 0
+    stats[f"{kind}_cells_unparsed"] += unparsed or 0
+
+
 def _load_lines(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str],
-                synthetic_prefix: str, has_product: int, report: dict[str, Any], *, distinct: bool = False,
-                defaults: dict[str, str] | None = None) -> int:
+                synthetic_prefix: str, has_product: int, report: dict[str, Any], stats: Counter, *,
+                origin: str | None = None, defaults: dict[str, str] | None = None) -> int:
     rows = _insert(dst, "raw_lines", table, roles, LINE_FIELDS, LINE_NUMBERS, synthetic_prefix,
-                   distinct=distinct, report=report, defaults=defaults)
+                   origin=origin, report=report, defaults=defaults, stats=stats)
     dst.execute("UPDATE raw_lines SET has_product=? WHERE has_product IS NULL", (has_product,))
     return rows
+
+
+def _load_sales(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], synthetic: str,
+                has_product: int, report: dict[str, Any], stats: Counter) -> None:
+    """A sales table's lines. With an order column, the rows are first copied and ordered (see _order_source)."""
+    if not roles.get("order_id"):
+        _load_lines(dst, table, roles, synthetic, has_product, report, stats)
+        return
+    origin = _order_source(dst, table, roles, report, stats)
+    _load_lines(dst, table, roles, synthetic, has_product, report, stats, origin=origin)
+    dst.execute("DROP TABLE temp.order_source")
 
 
 def _load_returns(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> None:
@@ -330,7 +461,7 @@ def _load_unit_factors(dst: sqlite3.Connection, table: TableMeta, roles: dict[st
         return
     column = roles["conversion_factor"]
     locale = _column_locale(dst, table, column)
-    factor = f"to_number_{locale}(src.{q(column)})" if locale else f"to_number(src.{q(column)})"
+    factor = f"{_parse_fn('qty', locale)}(src.{q(column)})"  # a ratio of quantities, not money
     dst.execute(
         "INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) "
         f"SELECT pid, NULLIF(lookup(nm), ''), lk, fc FROM (SELECT {_text(roles.get('product_id'))} AS pid, "
@@ -503,18 +634,29 @@ def _classify_lines(dst: sqlite3.Connection, pairs: list[tuple[str, str]]) -> in
     return dst.execute("SELECT COUNT(*) FROM raw_lines WHERE line_kind<>'product'").fetchone()[0]
 
 
-def _map_status(dst: sqlite3.Connection, status_map: dict[str, str]) -> int:
-    """Canonical values stay; mapped values are rewritten; everything else becomes NULL. Returns mapped count."""
+def _status_target(value: str, status_map: dict[str, str]) -> str | None:
+    """The canonical status for a value: the deterministic reading when it has one, else the map, else None."""
+    parsed = parse_status(value, domain="order")
+    if parsed.status == ParseStatus.OK and parsed.value in CANONICAL_STATUS:
+        return parsed.value
+    target = status_map.get(value)
+    return target if target in CANONICAL_STATUS else None
+
+
+def _map_status(dst: sqlite3.Connection, status_map: dict[str, str], stats: Counter) -> int:
+    """Canonical values stay; other values take their canonical reading; anything else becomes NULL.
+    Returns the number of distinct values rewritten to a different canonical status."""
     values = [row[0] for row in dst.execute("SELECT DISTINCT status FROM raw_lines WHERE status IS NOT NULL")]
     mapped = 0
     for value in values:
         if value in CANONICAL_STATUS:
             continue
-        target = status_map.get(value)
-        if target in CANONICAL_STATUS:
+        target = _status_target(value, status_map)
+        if target is not None:
             mapped += 1
             dst.execute("UPDATE raw_lines SET status=? WHERE status=?", (target, value))
         else:
+            stats["status_unmapped_values"] += 1
             dst.execute("UPDATE raw_lines SET status=NULL WHERE status=?", (value,))
     return mapped
 
@@ -523,6 +665,9 @@ def _register(con: sqlite3.Connection) -> None:
     con.create_function("to_number", 1, to_number)
     con.create_function("to_number_en", 1, lambda v: _number(v, "en"))
     con.create_function("to_number_vi", 1, lambda v: _number(v, "vi"))
+    con.create_function("to_qty", 1, to_quantity)
+    con.create_function("to_qty_en", 1, lambda v: _number(v, "en", unit=None))
+    con.create_function("to_qty_vi", 1, lambda v: _number(v, "vi", unit=None))
     con.create_function("to_date", 1, to_date)
     con.create_function("to_timestamp", 2, to_timestamp)
     con.create_function("lookup", 1, lambda v: None if v is None else normalize_lookup(v))
@@ -559,6 +704,8 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.execute("CREATE TEMP TABLE unit_factors (product_id TEXT, name_key TEXT, large_key TEXT, factor REAL)")
     dst.execute("CREATE TEMP TABLE catalog_ids (role TEXT, id TEXT, name TEXT)")
     dst.execute("CREATE TEMP TABLE alias_map (alias_key TEXT PRIMARY KEY, full_name TEXT)")
+    dst.execute("CREATE TABLE build_stats (key TEXT, value INTEGER)")
+    stats: Counter[str] = Counter({key: 0 for key in BUILD_STAT_KEYS})
     report: dict[str, Any] = {
         "sales_tables": 0, "service_tables": 0, "purchase_tables": 0, "return_tables": 0, "unannotated": [],
         "duplicate_lines_removed": 0, "columns_with_locale_inferred": 0, "tickets_defaulted_completed": 0,
@@ -575,15 +722,22 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     for table, note in annotated:
         _load_catalog_keys(dst, table, note["kind"], effective_roles(table, note))
     for table, note in annotated:
+        unresolved = _given_by_column(table, note.get("roles") or {})[1]
+        stats["annotation_keys_unresolved"] += sum(role in COUNTED_ROLES for role in unresolved)
         roles = effective_roles(table, note, dst)
         if not roles.get("employee_id") and roles.get("employee_name"):
             roles["employee_id"] = roles["employee_name"]
         synthetic = f"{table.name}:"  # order id prefix for rows that have no order column
         if note["kind"] == "sales":
+            # an order column that was named but matches no column, on a table with order-level columns: the
+            # rows cannot be tied to their orders, so synthetic per-row orders would only break payment links
+            lost_order = "order_id" in unresolved and not roles.get("order_id") and any(
+                roles.get(role) for role in ORDER_SIGNAL_ROLES)
+            if lost_order:
+                stats["tables_skipped_missing_order_id"] += 1
+                continue
             product = roles.get("product_name") or roles.get("product_id")
-            # rows of one order that repeat in every cell are one export error; rows without an order id are not
-            _load_lines(dst, table, roles, synthetic, 1 if product else 0, report,
-                        distinct=bool(roles.get("order_id")))
+            _load_sales(dst, table, roles, synthetic, 1 if product else 0, report, stats)
             report["sales_tables"] += 1
         elif note["kind"] == "service_ticket":
             # one row per visit: the ticket is the order, its amount is the line, the work done is the product
@@ -597,18 +751,18 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             # a ledger with no status column records it in its notes, and a note with no status means completed;
             # only a ledger with neither a status nor a note column is completed by default
             status_defaulted = "order_status" not in ticket and not (ticket.get("order_note") or ticket.get("note"))
-            rows = _load_lines(dst, table, ticket, synthetic, 1, report,
+            rows = _load_lines(dst, table, ticket, synthetic, 1, report, stats,
                                defaults={"status": "completed"} if status_defaulted else None)
             if status_defaulted:
                 report["tickets_defaulted_completed"] += rows
             report["service_tables"] += 1
         elif note["kind"] == "purchase" and (roles.get("purchase_id") or roles.get("purchased_at")):
-            _insert(dst, "purchases", table, roles, PURCHASE_FIELDS, PURCHASE_NUMBERS, report=report)
+            _insert(dst, "purchases", table, roles, PURCHASE_FIELDS, PURCHASE_NUMBERS, report=report, stats=stats)
             report["purchase_tables"] += 1
         elif note["kind"] == "payment" and (roles.get("order_id") or roles.get("paid_at")):
-            _insert(dst, "payments", table, roles, PAYMENT_FIELDS, PAYMENT_NUMBERS, report=report)
+            _insert(dst, "payments", table, roles, PAYMENT_FIELDS, PAYMENT_NUMBERS, report=report, stats=stats)
         elif note["kind"] == "delivery" and (roles.get("order_id") or roles.get("delivered_at")):
-            _insert(dst, "deliveries", table, roles, DELIVERY_FIELDS, DELIVERY_NUMBERS, report=report)
+            _insert(dst, "deliveries", table, roles, DELIVERY_FIELDS, DELIVERY_NUMBERS, report=report, stats=stats)
         elif note["kind"] == "sales_return":
             _load_returns(dst, table, roles)
             report["return_tables"] += 1
@@ -625,11 +779,12 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     _fill_from_catalogs(dst)
     report["alias_lines_resolved"] = _resolve_aliases(dst)
     report["non_product_lines"] = _classify_lines(dst, pairs)
-    report["status_mapped"] = _map_status(dst, status_map or {})
+    report["status_mapped"] = _map_status(dst, status_map or {}, stats)
     report["qty_base_derived"] = _derive_qty_base(dst)
     _derive(dst)
     report["orders_marked_returned"] = _mark_returned(dst)
     _write_shop_facts(dst, context)
+    dst.executemany("INSERT INTO build_stats VALUES (?,?)", [(key, stats[key]) for key in BUILD_STAT_KEYS])
     report["status_null_orders"] = dst.execute("SELECT COUNT(*) FROM orders WHERE status IS NULL").fetchone()[0]
     report["orders"] = dst.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     report["lines"] = dst.execute("SELECT COUNT(*) FROM lines").fetchone()[0]
