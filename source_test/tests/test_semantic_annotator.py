@@ -14,6 +14,7 @@ from bizreason.semantic.annotator import (
     group_tables,
     load_or_annotate,
     load_status_map,
+    needs_reannotation,
     relevant_readme,
 )
 from bizreason.utils import normalize_lookup
@@ -44,7 +45,8 @@ def _columns_in(prompt: str) -> list[str]:
     return [line[2:].split(" | ", 1)[0] for line in prompt.splitlines() if line.startswith("- ")]
 
 
-def _table(name: str, columns: list[str], path: str = "data/source_a.csv", original: dict[str, str] | None = None) -> TableMeta:
+def _table(name: str, columns: list[str], path: str = "data/source_a.csv", original: dict[str, str] | None = None,
+           grain: str = "unknown") -> TableMeta:
     original = original or {}
     return TableMeta(
         name=name,
@@ -53,6 +55,7 @@ def _table(name: str, columns: list[str], path: str = "data/source_a.csv", origi
             ColumnMeta(name=c, original_name=original.get(c, c), dtype="string", examples=["x", "y"])
             for c in columns
         ],
+        grain=grain,
         row_count=2,
         raw_row_count=2,
     )
@@ -95,6 +98,7 @@ def test_two_stage_calls_run_and_roles_are_returned() -> None:
             "table": "t_one",
             "columns": ["ref_no", "amount"],
             "kind": "sales",
+            "kind_source": "model",
             "roles": {"ref_no": "order_id", "amount": "line_amount"},
             "seconds": records[0]["seconds"],
         }
@@ -562,3 +566,97 @@ def test_annotate_line_kinds_without_catalog_makes_no_call() -> None:
 
     assert result == {}
     assert model.calls == []
+
+
+def test_failing_kind_call_uses_grain() -> None:
+    table = _table("t_one", ["ref_no"], grain="purchase_line")
+    model = RoleScriptModel(kind_fails=True)
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert "error" not in record
+    assert record["kind"] == "purchase"
+    assert record["kind_source"] == "grain"
+
+
+def test_model_other_is_overridden_by_mapped_grain() -> None:
+    table = _table("t_one", ["sku"], grain="product_dimension")
+    model = FakeModel(kind="other", roles={"sku": "product_id"})
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "product_catalog"
+    assert record["kind_source"] == "grain"
+    assert record["roles"] == {"sku": "product_id"}
+    assert "Give the meaning" in model.calls[-1][0]
+    assert "Roles:\n- order_id:" not in model.calls[-1][0]
+
+
+def test_unmapped_grain_keeps_other_from_model() -> None:
+    table = _table("t_one", ["memo"], grain="unknown")
+    model = FakeModel(kind="other")
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "other"
+    assert record["kind_source"] == "model"
+
+
+def test_unmapped_grain_keeps_other_after_failed_kind_call() -> None:
+    table = _table("t_one", ["memo"], grain="unknown")
+    model = RoleScriptModel(kind_fails=True)
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert "error" not in record
+    assert record["kind"] == "other"
+    assert record["kind_source"] == "model"
+
+
+def test_sales_without_sales_roles_is_downgraded_for_unmapped_grain() -> None:
+    table = _table("t_one", ["code", "unit"], grain="unknown")
+    model = FakeModel(kind="sales", roles={"code": "product_id", "unit": "unit"})
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "other"
+    assert record["kind_source"] == "model"
+    # "unit" is a sales-only role, so it is no longer valid and becomes "other".
+    assert record["roles"] == {"code": "product_id", "unit": "other"}
+
+
+def test_sales_without_sales_roles_is_downgraded_for_non_sales_grain() -> None:
+    table = _table("t_one", ["sku"], grain="product_dimension")
+    model = FakeModel(kind="sales", roles={"sku": "product_id"})
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "other"
+    assert record["roles"] == {"sku": "product_id"}
+
+
+def test_sales_grain_is_never_downgraded() -> None:
+    table = _table("t_one", ["code"], grain="order_header")
+    model = FakeModel(kind="sales", roles={"code": "product_id"})
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "sales"
+    assert record["kind_source"] == "model"
+    assert record["roles"] == {"code": "product_id"}
+
+
+def test_delivery_scope_has_delivery_qty_role() -> None:
+    assert SCOPE["delivery"]["delivery_qty"] == "quantity delivered"
+
+
+def test_needs_reannotation_cases() -> None:
+    mapped = [_table("t_one", ["a"], grain="snapshot")]
+    unmapped = [_table("t_two", ["a"], grain="unknown")]
+
+    assert needs_reannotation({"table": "t_one", "error": "RuntimeError: boom"}, unmapped) is True
+    assert needs_reannotation({"table": "t_one", "error": "RuntimeError: boom"}, mapped) is True
+    assert needs_reannotation({"table": "t_one", "kind": "other"}, mapped) is True
+    assert needs_reannotation({"table": "t_two", "kind": "other"}, unmapped) is False
+    assert needs_reannotation({"table": "t_one", "kind": "inventory"}, mapped) is False
+    assert needs_reannotation({"table": "t_two", "kind": "sales"}, unmapped) is False

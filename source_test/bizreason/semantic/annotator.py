@@ -111,7 +111,8 @@ SCOPE = {
     | {"ticket_id": "ticket number", "ordered_at": "visit date", "service_item": "work done",
        "ticket_amount": "total money of the ticket", "vehicle_plate": "license plate", "vehicle_model": "vehicle model"},
     "delivery": {k: C[k] for k in ("order_id", "note", "other")}
-    | {"delivered_at": "delivery date", "delivery_trip": "trip number of the order"},
+    | {"delivered_at": "delivery date", "delivery_trip": "trip number of the order",
+       "delivery_qty": "quantity delivered"},
     "debt_ledger": {k: C[k] for k in ("order_id", "customer_id", "customer_name", "ordered_at", "note", "other")}
     | {"order_outstanding": "amount still owed", "paid_amount": "amount paid later", "due_at": "due date",
        "credit_days": "allowed days of credit", "installment_count": "number of installments", "installment_amount": "money per installment"},
@@ -133,6 +134,20 @@ LINE_NAME_KINDS = {
     "service_fee": "a service charge added to the bill",
 }
 LINE_NAME_BATCH = 120
+# Table kind implied by the grain ingestion measured from the data. Used when the kind call fails or answers "other".
+GRAIN_KIND = {
+    "order_line": "sales",
+    "order_header": "sales",
+    "purchase_line": "purchase",
+    "purchase_header": "purchase",
+    "product_dimension": "product_catalog",
+    "payment_event": "payment",
+    "unit_conversion": "unit_conversion",
+    "inventory_event": "inventory",
+    "snapshot": "inventory",
+}
+# A sales table needs at least one of these roles, unless its grain is a sales grain.
+SALES_EVIDENCE_ROLES = ("order_id", "ordered_at", "qty", "line_amount", "order_goods_total", "order_total_due")
 
 
 def group_tables(context: BusinessContext) -> list[list[TableMeta]]:
@@ -141,6 +156,13 @@ def group_tables(context: BusinessContext) -> list[list[TableMeta]]:
     for table in context.tables:
         grouped.setdefault(tuple(column.name for column in table.columns), []).append(table)
     return list(grouped.values())
+
+
+def needs_reannotation(record: dict[str, Any], group: list[TableMeta]) -> bool:
+    """True when a stored record failed, or answered "other" for a table whose grain implies a kind."""
+    if "error" in record:
+        return True
+    return record.get("kind") == "other" and bool(group) and group[0].grain in GRAIN_KIND
 
 
 def relevant_readme(readme: str, table: TableMeta, limit: int = 3500) -> str:
@@ -364,6 +386,7 @@ class Annotator:
         }
         started = time.time()
         try:
+            kind_source = "model"
             try:
                 kind_reply = self.model.generate_json(
                     'Classify a Vietnamese shop data table. Reply with JSON only: {"kind": "<kind>"}.\n'
@@ -378,8 +401,18 @@ class Annotator:
                 kind = None
             if not isinstance(kind, str) or kind not in KINDS:
                 kind = "other"
+            if kind == "other" and table.grain in GRAIN_KIND:
+                kind = GRAIN_KIND[table.grain]
+                kind_source = "grain"
             roles, partial = self._assign_roles(doc, table, SCOPE[kind])
+            if kind == "sales" and GRAIN_KIND.get(table.grain) != "sales" and not any(
+                role in SALES_EVIDENCE_ROLES for role in roles.values()
+            ):
+                # Not a sales table: keep only the roles that the "other" scope also defines.
+                kind = "other"
+                roles = {column: (role if role in SCOPE["other"] else "other") for column, role in roles.items()}
             record["kind"] = kind
+            record["kind_source"] = kind_source
             record["roles"] = roles
             if partial:
                 record["partial"] = True

@@ -70,6 +70,8 @@ DIMENSIONS: dict[str, str] = {
     "unit": "a sales or base unit",
     "brand": "a brand",
     "active_ingredient": "a drug active ingredient",
+    "prescription": "whether a drug needs a prescription; value yes or no",
+    "product_kind": "kind of product such as new or used device",
     "weekday": "a day of the week",
     "hour": "an hour of the day",
     "service_item": "a kind of repair work",
@@ -85,7 +87,10 @@ CANCEL_TOKENS = ("huy", "cancel")
 DEBT_METHOD_TOKENS = ("ghi no", "debt")
 NON_DEBT_METHOD_TOKENS = ("cod", "giao hang thu tien", "san", "marketplace", "tmdt")
 # Rulebook §2: shifts by order time, both ends inclusive. Matched when the key appears in the normalized filter text.
-SHIFT_WINDOWS = {"sang": ("06:00:00", "13:59:59"), "chieu": ("14:00:00", "21:59:59")}
+SHIFT_WINDOWS = {"sang": ("06:00:00", "13:59:59"), "chieu": ("14:00:00", "21:59:59"),
+    "morning": ("06:00:00", "13:59:59"),
+    "afternoon": ("14:00:00", "21:59:59"),
+}
 # Rulebook §2: when two shifts are compared, the morning shift is the baseline.
 SHIFT_BASELINE = "sang"
 # Meanings established at ingestion, expressed in the annotation vocabulary.
@@ -101,3 +106,11 @@ INGESTION_ROLES = {
 SERVICE_FEE_NAMES = ("phi phuc vu",)
 # Currency spellings that may follow a grouped amount such as 75,000 or 75.000. Compared case-insensitively.
 CURRENCY_SUFFIXES = ("vnd", "vnđ", "đ", "₫")
+
+# Generic nouns, unit words and time words a question may attach to a name; removed before an exact match.
+GENERIC_FILTER_WORDS = (
+    "hang", "mat hang", "san pham", "sp", "nhom", "nhom hang", "khach", "khach hang", "nhan vien", "thung", "hop",
+    "chai", "lon", "goi", "ly", "kg", "cai", "thang", "tuan", "ngay", "nam",
+)
+# Rulebook §7: a question about a customer's address needs a column carrying one.
+ADDRESS_HEADER_TOKENS = ("dia chi", "addr", "address", "duong pho")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from bizreason.llm import LanguageModel, ModelError
 from bizreason.semantic.compiler import Intent
 from bizreason.semantic.vocabulary import DIMENSIONS, MEASURES, SHAPES
 
-COMPARE_MODES = ("percent", "value")
+COMPARE_MODES = ("percent", "value", "average_per_weekday")
 DEFAULT_COMPARE_AS = "percent"
 # Time concepts a model may put into filters; time is resolved from the time phrase, so these filters are dropped.
 TIME_FILTER_DIMS = ("date", "day", "month", "quarter", "year", "week", "time", "period", "range")
@@ -24,6 +25,12 @@ THRESHOLD_SHAPES = ("threshold_count", "ratio_of_counts")
 RANKING_SHAPES = ("top_k", "argmax_entity")
 _PLAIN_NUMBER = re.compile(r"-?\d+(\.\d+)?")
 _DIGITS = re.compile(r"[0-9]+")
+# Filter values that are only a time expression, such as a month/year pair or a letter-prefixed period number.
+_TIME_SLASHED = re.compile(r"(?:th|thang|t)?\d+[/-]\d+", re.IGNORECASE)
+# Only month prefixes: a bare letter followed by digits can be a product code.
+_TIME_PREFIXED = re.compile(r"(?:th|thang|t)\d{1,2}", re.IGNORECASE)
+# Stored values shown to the parser per dimension; longer lists are cut to this many.
+CHOICE_VALUE_LIMIT = 40
 
 SYSTEM = (
     "You convert a Vietnamese business question, which may have typos, slang or no diacritics, into JSON. "
@@ -32,10 +39,13 @@ SYSTEM = (
     '"group_by": "<dimension or null>", '
     '"filters": [{"dim": "<dimension>", "value": "<text copied from the question>", '
     '"exclude": <true or false>}], '
-    '"time": "<the time phrase copied from the question, or null>", "top_k": <number or null>, '
+    '"time": "<the time phrase copied from the question, or null>", '
+    '"location": "<the street, district or place the question restricts customers to, or null>", '
+    '"top_k": <number or null>, '
     '"compare_as": "<percent or value>", "age_days": <positive integer or null>, '
     '"threshold": {"subject": "<customer, order, product or day>", "metric": "<order_count, revenue or qty>", '
     '"op": "<gte, gt, lte or lt>", "value": <number>} or null}\n'
+    '"compare_as" is "average_per_weekday" when a question asks the average per given day of the week. '
     '"compare_as" is "percent" when a comparison asks for a percent change, and "value" when it asks for '
     "a difference in units.\n"
     '"exclude" is true when the question says to leave that value out, and false otherwise.\n'
@@ -64,6 +74,16 @@ SYSTEM = (
     "- A question asking which product, customer, employee or supplier is best uses group_by with that dimension.\n"
     "- Shapes top_k and argmax_entity always need group_by set to one dimension.\n"
     "Field rules:\n"
+    "- A time expression is never a filter value; time words belong only in the time field.\n"
+    '- "gross profit" is measure gross_profit.\n'
+    "- A question about money received from selling a product is measure revenue; "
+    "purchase_amount is only for goods bought from suppliers.\n"
+    "- If a question asks two different quantities, measure is the first and measure2 is the second; "
+    "otherwise measure2 is null.\n"
+    '- "location" is the street, district or place the question restricts customers to, or null. '
+    "Never put a place into customer_group or customer.\n"
+    "- A filter on prescription drugs uses dim prescription. A filter on new or used devices uses dim product_kind.\n"
+    "- A breakdown across several periods, such as months or weeks, has group_by null.\n"
     '- "age_days" is a positive integer or null. Set it when a debt question restricts to debts older than N days; '
     "otherwise it is null.\n"
     "- revenue is only for questions about money received from sales.\n"
@@ -168,6 +188,23 @@ def _filter_value(value: Any) -> str | None:
     return None
 
 
+def _is_time_only(text: str) -> bool:
+    return bool(_TIME_SLASHED.fullmatch(text) or _TIME_PREFIXED.fullmatch(text))
+
+
+def _measure2(value: Any) -> str | None:
+    # An unusable second measure is dropped; the question is still answered for its first measure.
+    if _is_text(value) and value in MEASURES and value != "outside":
+        return value
+    return None
+
+
+def _location(value: Any) -> str | None:
+    if _is_text(value) and value.strip():
+        return value.strip()
+    return None
+
+
 def _filters(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
@@ -190,6 +227,9 @@ def _filters(value: Any) -> list[dict[str, Any]]:
                 continue
             # Dropping this filter would silently widen the question, so refuse instead.
             raise _Unresolvable(f"unknown filter dimension: {dim}")
+        if _is_time_only(text):
+            # A period such as a month is resolved from the time phrase, so it is not a row constraint.
+            continue
         kept.append({"dim": dim, "value": text, "exclude": item.get("exclude") is True})
     return kept
 
@@ -282,6 +322,25 @@ def _interpret(raw: Any, *, final: bool) -> Intent:
         compare_as=compare_as,
         threshold=threshold,
         age_days=age_days,
+        measure2=_measure2(raw.get("measure2")),
+        location=_location(raw.get("location")),
+    )
+
+
+def _choices_section(choices: dict[str, list[str]] | None) -> str:
+    """The stored values the filters must match, or "" when there are none to show."""
+    lines = [
+        f"- {dim}: {json.dumps(values[:CHOICE_VALUE_LIMIT], ensure_ascii=False)}"
+        for dim, values in (choices or {}).items()
+        if values
+    ]
+    if not lines:
+        return ""
+    return (
+        "Stored values for filter dimensions:\n" + "\n".join(lines) + "\n"
+        "When a filter refers to one of these values, copy the stored value exactly. "
+        "When the question uses a colloquial word that has the same meaning as a stored value, use that stored value. "
+        "If no stored value matches, keep the question's words."
     )
 
 
@@ -293,9 +352,11 @@ class IntentParser:
         self.timeout = timeout
         self.max_attempts = max_attempts
 
-    def parse(self, question: str) -> ParsedIntent:
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParsedIntent:
         base_prompt = "Question: " + question
-        prompt = base_prompt
+        section = _choices_section(choices)
+        suffix = "\n\n" + section if section else ""
+        prompt = base_prompt + suffix
         raw: dict[str, Any] | None = None
         reason = ""
         attempts = 0
@@ -316,5 +377,5 @@ class IntentParser:
                     hint = exc.hint
                 else:
                     return ParsedIntent(intent=intent, reason="", attempts=attempts, raw=raw)
-            prompt = base_prompt + " " + hint
+            prompt = base_prompt + " " + hint + suffix
         return ParsedIntent(intent=None, reason=reason, attempts=attempts, raw=raw)

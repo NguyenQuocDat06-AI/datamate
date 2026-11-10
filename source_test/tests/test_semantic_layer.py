@@ -32,12 +32,13 @@ def _source(tmp_path: Path, specs: Specs) -> Path:
     return path
 
 
-def _context(path: Path, specs: Specs) -> BusinessContext:
+def _context(path: Path, specs: Specs, originals: dict[str, str] | None = None) -> BusinessContext:
+    """originals maps a column name to the header the file shows for it, where that differs."""
     tables = [
         TableMeta(
             name=name,
             sources=[SourceRef(path=f"{name}.csv")],
-            columns=[ColumnMeta(name=c, original_name=c, dtype="text") for c in columns],
+            columns=[ColumnMeta(name=c, original_name=(originals or {}).get(c, c), dtype="text") for c in columns],
             row_count=len(rows),
             raw_row_count=len(rows),
         )
@@ -556,4 +557,282 @@ def test_service_fee_is_revenue_but_not_an_item_without_line_kinds(tmp_path: Pat
     assert _query(out, "SELECT revenue FROM orders") == [(110.0,)]
     assert _query(out, "SELECT product_name, is_item FROM lines ORDER BY product_name") == [
         ("Phí phục vụ", 0), ("tea", 1),
+    ]
+
+
+def test_barcode_like_id_loses_to_the_id_that_joins_the_catalog(tmp_path: Path) -> None:
+    sales_columns = ["order", "barcode", "sku", "amount"]
+    specs: Specs = {
+        "sales": (sales_columns, [("O1", "8934567890123", "P1", "100"), ("O2", "8934567890124", "P2", "50")]),
+        "products": (["code", "name"], [("P1", "Tra sua"), ("P2", "Ca phe")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {
+            "order": "order_id", "barcode": "product_id", "sku": "product_id", "amount": "line_amount",
+        }),
+        _record(["code", "name"], "product_catalog", {"code": "product_id", "name": "product_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, product_id FROM lines ORDER BY order_id") == [("O1", "P1"), ("O2", "P2")]
+
+
+def test_constant_group_column_loses_to_a_varying_one(tmp_path: Path) -> None:
+    columns = ["order", "segment", "tier", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "Retail", "A", "tea", "100"), ("O2", "Retail", "B", "tea", "50")])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "segment": "customer_group", "tier": "customer_group",
+        "item": "product_name", "amount": "line_amount",
+    })]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, customer_group FROM orders ORDER BY order_id") == [("O1", "A"), ("O2", "B")]
+
+
+def test_varying_category_column_beats_a_constant_one(tmp_path: Path) -> None:
+    columns = ["order", "item", "fixed", "varied", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "Drink", "Hot", "100"), ("O2", "cake", "Drink", "Cold", "50")])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "item": "product_name", "fixed": "product_category",
+        "varied": "product_category", "amount": "line_amount",
+    })]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, category FROM lines ORDER BY order_id") == [("O1", "Hot"), ("O2", "Cold")]
+
+
+def test_timestamp_column_beats_a_date_only_column(tmp_path: Path) -> None:
+    columns = ["order", "day", "stamp", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "2026-03-01", "2026-03-01 14:05:00", "tea", "100"),
+        ("O2", "2026-03-02", "2026-03-02 09:00:00", "tea", "50"),
+    ])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "day": "ordered_at", "stamp": "ordered_at", "item": "product_name",
+        "amount": "line_amount",
+    })]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, date, ts FROM orders ORDER BY order_id") == [
+        ("O1", "2026-03-01", "2026-03-01 14:05:00"),
+        ("O2", "2026-03-02", "2026-03-02 09:00:00"),
+    ]
+
+
+def test_product_name_is_filled_only_on_an_exact_id_match(tmp_path: Path) -> None:
+    sales_columns = ["order", "pid", "amount"]
+    specs: Specs = {
+        "sales": (sales_columns, [
+            ("O1", "P1", "100"),
+            ("O2", " P1 ", "50"),   # padding is ignored: the id joins
+            ("O3", "P1X", "30"),    # not the same id
+            ("O4", "P2", "10"),     # two catalog names for this id: stays empty
+        ]),
+        "products": (["code", "name"], [("P1", "Tra sua"), ("P2", "Ca phe"), ("P2", "Ca phe 2")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {"order": "order_id", "pid": "product_id", "amount": "line_amount"}),
+        _record(["code", "name"], "product_catalog", {"code": "product_id", "name": "product_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, product_name FROM lines ORDER BY order_id") == [
+        ("O1", "Tra sua"), ("O2", "Tra sua"), ("O3", None), ("O4", None),
+    ]
+
+
+def test_customer_name_is_filled_by_id_and_an_existing_name_is_kept(tmp_path: Path) -> None:
+    sales_columns = ["order", "cust", "name", "item", "amount"]
+    specs: Specs = {
+        "sales": (sales_columns, [
+            ("O1", "C1", None, "tea", "100"),
+            ("O2", "C1", "Lan", "tea", "50"),
+            ("O3", "C9", None, "tea", "30"),
+        ]),
+        "customers": (["code", "name"], [("C1", "An")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {
+            "order": "order_id", "cust": "customer_id", "name": "customer_name",
+            "item": "product_name", "amount": "line_amount",
+        }),
+        _record(["code", "name"], "customer_catalog", {"code": "customer_id", "name": "customer_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, customer_name FROM orders ORDER BY order_id") == [
+        ("O1", "An"), ("O2", "Lan"), ("O3", None),
+    ]
+
+
+def test_purchase_lines_take_date_status_and_supplier_from_their_receipt(tmp_path: Path) -> None:
+    purchase_columns = ["receipt", "day", "state", "maker", "pid", "qty", "cost"]
+    specs: Specs = {
+        "imports": (purchase_columns, [
+            ("R1", "2026-03-01", "completed", "S1", "P1", "2", "100"),
+            ("R1", None, None, None, "P2", "1", "50"),
+        ]),
+        "products": (["code", "name"], [("P2", "Ca phe")]),
+        "suppliers": (["maker_code", "maker_name"], [("S1", "Cty A")]),
+    }
+    records = [
+        _record(purchase_columns, "purchase", {
+            "receipt": "purchase_id", "day": "purchased_at", "state": "purchase_status", "maker": "supplier_id",
+            "pid": "product_id", "qty": "qty_purchased", "cost": "purchase_unit_cost",
+        }),
+        _record(["code", "name"], "product_catalog", {"code": "product_id", "name": "product_name"}),
+        _record(["maker_code", "maker_name"], "supplier_list", {"maker_code": "supplier_id", "maker_name": "supplier_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT product_id, date, status, supplier_id, supplier_name, product_name "
+                       "FROM purchases ORDER BY product_id") == [
+        ("P1", "2026-03-01", "completed", "S1", "Cty A", None),
+        ("P2", "2026-03-01", "completed", "S1", "Cty A", "Ca phe"),
+    ]
+
+
+def test_prescription_and_active_ingredient_come_from_the_catalog(tmp_path: Path) -> None:
+    sales_columns = ["order", "pid", "item", "amount"]
+    specs: Specs = {
+        "sales": (sales_columns, [
+            ("O1", "P1", "Paracetamol", "100"),
+            ("O2", "P2", "Vitamin C", "50"),
+            ("O3", "P3", "Gift", "30"),
+            ("O4", None, "Paracetamol", "20"),  # no id: matched by name
+        ]),
+        "products": (["code", "name", "rx", "ingredient"], [
+            ("P1", "Paracetamol", "True", "paracetamol"),
+            ("P2", "Vitamin C", "FALSE", "ascorbic"),
+            ("P3", "Gift", "maybe", ""),
+        ]),
+    }
+    records = [
+        _record(sales_columns, "sales", {"order": "order_id", "pid": "product_id", "item": "product_name",
+                                         "amount": "line_amount"}),
+        _record(["code", "name", "rx", "ingredient"], "product_catalog", {
+            "code": "product_id", "name": "product_name", "rx": "prescription_flag", "ingredient": "active_ingredient",
+        }),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, prescription, active_ingredient FROM lines ORDER BY order_id") == [
+        ("O1", 1, "paracetamol"), ("O2", 0, "ascorbic"), ("O3", None, None), ("O4", 1, "paracetamol"),
+    ]
+
+
+def test_product_kind_comes_from_the_alias_sheet(tmp_path: Path) -> None:
+    specs: Specs = {
+        "sales": (["order", "item", "amount"], [("O1", "IP", "100"), ("O2", "Iphone X", "50"), ("O3", "Tea", "10")]),
+        "aliases": (["short", "full", "kind"], [("IP", "Iphone X", "new")]),
+    }
+    records = [
+        _record(["order", "item", "amount"], "sales", SALES_ROLES),
+        _record(["short", "full", "kind"], "alias", {"short": "alias_key", "full": "product_name",
+                                                     "kind": "product_kind"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, product_name, product_kind FROM lines ORDER BY order_id") == [
+        ("O1", "Iphone X", "new"), ("O2", "Iphone X", "new"), ("O3", "Tea", None),
+    ]
+
+
+def test_service_ticket_without_status_column_is_completed(tmp_path: Path) -> None:
+    columns = ["ticket", "visit", "job", "bill"]
+    specs: Specs = {"repairs": (columns, [("T1", "2026-03-01", "oil change", "200"),
+                                          ("T2", "2026-03-02", "brake pads", "450")])}
+    records = [_record(columns, "service_ticket", {
+        "ticket": "ticket_id", "visit": "ordered_at", "job": "service_item", "bill": "ticket_amount",
+    })]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["tickets_defaulted_completed"] == 2
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [("T1", "completed"), ("T2", "completed")]
+
+
+def test_service_ticket_with_status_column_keeps_its_own_status(tmp_path: Path) -> None:
+    columns = ["ticket", "visit", "state", "job", "bill"]
+    specs: Specs = {"repairs": (columns, [("T1", "2026-03-01", "cancelled", "oil change", "200"),
+                                          ("T2", "2026-03-02", "completed", "brake pads", "450")])}
+    records = [_record(columns, "service_ticket", {
+        "ticket": "ticket_id", "visit": "ordered_at", "state": "order_status", "job": "service_item",
+        "bill": "ticket_amount",
+    })]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["tickets_defaulted_completed"] == 0
+    assert _query(out, "SELECT order_id, status FROM orders ORDER BY order_id") == [
+        ("T1", "cancelled"), ("T2", "completed"),
+    ]
+
+
+def test_deliveries_table_is_built_from_delivery_tables(tmp_path: Path) -> None:
+    specs: Specs = {
+        "sales": (["order", "item", "amount"], [("O1", "tea", "100"), ("O2", "tea", "50")]),
+        "shipping": (["order", "when", "trip", "qty"], [("O1", "2026-03-02", "T1", "3"), ("O2", "2026-03-03", "T1", "1")]),
+    }
+    records = [
+        _record(["order", "item", "amount"], "sales", SALES_ROLES),
+        _record(["order", "when", "trip", "qty"], "delivery", {
+            "order": "order_id", "when": "delivered_at", "trip": "delivery_trip", "qty": "delivery_qty",
+        }),
+    ]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["deliveries"] == 2
+    assert _query(out, "SELECT order_id, date, trip, qty FROM deliveries ORDER BY order_id") == [
+        ("O1", "2026-03-02", "T1", 3.0), ("O2", "2026-03-03", "T1", 1.0),
+    ]
+
+
+def test_deliveries_qty_is_null_without_a_qty_role(tmp_path: Path) -> None:
+    specs: Specs = {
+        "sales": (["order", "item", "amount"], [("O1", "tea", "100")]),
+        "shipping": (["order", "when", "trip"], [("O1", "2026-03-02", "T1")]),
+    }
+    records = [
+        _record(["order", "item", "amount"], "sales", SALES_ROLES),
+        _record(["order", "when", "trip"], "delivery", {"order": "order_id", "when": "delivered_at",
+                                                        "trip": "delivery_trip"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, date, trip, qty FROM deliveries") == [("O1", "2026-03-02", "T1", None)]
+
+
+def test_deliveries_table_exists_and_is_empty_without_delivery_tables(tmp_path: Path) -> None:
+    specs: Specs = {"sales": (["order", "item", "amount"], [("O1", "tea", "100")])}
+    records = [_record(["order", "item", "amount"], "sales", SALES_ROLES)]
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["deliveries"] == 0
+    assert _query(out, "SELECT COUNT(*) FROM deliveries") == [(0,)]
+
+
+def test_shop_facts_are_true_when_address_group_and_dated_orders_exist(tmp_path: Path) -> None:
+    columns = ["order", "day", "place", "seg", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "2026-03-01", "Ha Noi", "Gold", "tea", "100")])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "day": "ordered_at", "place": "other", "seg": "customer_group",
+        "item": "product_name", "amount": "line_amount",
+    })]
+    out = tmp_path / "canonical.sqlite"
+    layer.build(_context(_source(tmp_path, specs), specs, {"place": "Dia chi giao hang"}), records, out)
+
+    assert _query(out, "SELECT key, value FROM shop_facts ORDER BY key") == [
+        ("has_address", 1), ("has_customer_group", 1), ("has_orders", 1),
+    ]
+
+
+def test_shop_facts_are_false_without_address_group_or_dated_orders(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount", "memo"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100", "wrapped")])}
+    records = [_record(columns, "sales", {"order": "order_id", "item": "product_name", "amount": "line_amount",
+                                          "memo": "note"})]
+    out = tmp_path / "canonical.sqlite"
+    layer.build(_context(_source(tmp_path, specs), specs, {"memo": "Ghi chu"}), records, out)
+
+    assert _query(out, "SELECT key, value FROM shop_facts ORDER BY key") == [
+        ("has_address", 0), ("has_customer_group", 0), ("has_orders", 0),
     ]

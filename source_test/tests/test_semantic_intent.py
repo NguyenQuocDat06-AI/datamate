@@ -611,3 +611,117 @@ def test_ranking_with_group_by_is_accepted() -> None:
     assert result.intent.group_by == "customer"
     assert result.attempts == 1
     assert len(model.calls) == 1
+
+
+def test_choices_section_lists_stored_values_and_says_to_copy_them() -> None:
+    model = FakeModel(good())
+    IntentParser(model).parse("question one", choices={"channel": ["Shop A", "Online"]})
+
+    prompt = model.calls[0]["prompt"]
+    assert prompt.startswith("Question: question one\n\n")
+    assert 'channel: ["Shop A", "Online"]' in prompt
+    assert "copy the stored value exactly" in prompt
+    assert "keep the question's words" in prompt
+
+
+def test_choices_are_truncated_to_forty_values() -> None:
+    values = [f"value {i:02d}" for i in range(50)]
+    model = FakeModel(good())
+    IntentParser(model).parse("question one", choices={"product_group": values})
+
+    prompt = model.calls[0]["prompt"]
+    assert '"value 39"' in prompt
+    assert '"value 40"' not in prompt
+
+
+def test_empty_choices_leave_the_prompt_unchanged() -> None:
+    model = FakeModel(good(), good())
+    IntentParser(model).parse("question one", choices={})
+    IntentParser(model).parse("question one", choices={"channel": []})
+
+    assert model.calls[0]["prompt"] == "Question: question one"
+    assert model.calls[1]["prompt"] == "Question: question one"
+
+
+def test_choices_stay_in_the_retry_prompt() -> None:
+    model = FakeModel(good(measure="profit"), good())
+    IntentParser(model).parse("question one", choices={"channel": ["Shop A"]})
+
+    retry = model.calls[1]["prompt"]
+    assert retry.startswith("Question: question one ")
+    assert "measure" in retry
+    assert 'channel: ["Shop A"]' in retry
+
+
+@pytest.mark.parametrize("value", ["T6/2025", "th5/2025", "8/25", "T6", "th12", "3-2025"])
+def test_time_only_filter_value_is_dropped(value: str) -> None:
+    reply = good(filters=[{"dim": "product", "value": value, "exclude": False}])
+
+    result = IntentParser(FakeModel(reply)).parse("question one")
+
+    assert result.intent is not None
+    assert result.intent.filters == []
+
+
+@pytest.mark.parametrize("value", ["Sting 500ml", "Coca 330", "Item 2", "2 kg bag", "100", "A4 paper"])
+def test_product_names_with_digits_are_kept(value: str) -> None:
+    reply = good(filters=[{"dim": "product", "value": value, "exclude": False}])
+
+    result = IntentParser(FakeModel(reply)).parse("question one")
+
+    assert result.intent is not None
+    assert result.intent.filters == [{"dim": "product", "value": value, "exclude": False}]
+
+
+def test_measure2_is_parsed_into_intent() -> None:
+    result = IntentParser(FakeModel(good(measure2="order_count"))).parse("question one")
+
+    assert result.intent is not None
+    assert result.intent.measure2 == "order_count"
+
+
+def test_measure2_absent_or_null_is_none() -> None:
+    assert IntentParser(FakeModel(good())).parse("q").intent.measure2 is None
+    assert IntentParser(FakeModel(good(measure2=None))).parse("q").intent.measure2 is None
+
+
+@pytest.mark.parametrize("value", ["profit", 7, "", ["revenue"], "outside"])
+def test_invalid_measure2_is_dropped_without_retry(value: Any) -> None:
+    model = FakeModel(good(measure2=value))
+
+    result = IntentParser(model).parse("question one")
+
+    assert result.intent is not None
+    assert result.intent.measure2 is None
+    assert result.intent.measure == "revenue"
+    assert result.attempts == 1
+    assert len(model.calls) == 1
+
+
+def test_location_is_parsed_and_trimmed() -> None:
+    result = IntentParser(FakeModel(good(location="  Main street  "))).parse("question one")
+
+    assert result.intent is not None
+    assert result.intent.location == "Main street"
+    assert result.intent.group_by is None
+    assert result.intent.filters == []
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 12, ["Main street"]])
+def test_unusable_location_is_none(value: Any) -> None:
+    result = IntentParser(FakeModel(good(location=value))).parse("question one")
+
+    assert result.intent is not None
+    assert result.intent.location is None
+    assert result.attempts == 1
+
+
+def test_system_prompt_has_location_measure2_and_mapping_rules() -> None:
+    assert '"location"' in SYSTEM
+    assert "measure2" in SYSTEM
+    assert "gross_profit" in SYSTEM
+    assert "purchase_amount is only for goods bought from suppliers" in SYSTEM
+    assert "prescription" in SYSTEM
+    assert "product_kind" in SYSTEM
+    assert "Never put a place into customer_group or customer." in SYSTEM
+    assert "time expression is never a filter value" in SYSTEM

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 
 from bizreason.contracts import AnswerType, Prediction, Question, TimeWindow
 from bizreason.semantic.compiler import Compiler, Intent, Unsupported
@@ -18,6 +18,14 @@ ORDER_MEASURES = {
     "qty_base_sold", "distinct_customers", "gross_profit",
 }
 PERIOD_SHAPES = {"breakdown", "argmax_period", "trend_check"}
+# Stored values offered to the parser, per filter dimension: (table, column).
+CHOICE_COLUMNS = {
+    "channel": ("orders", "channel"),
+    "customer_group": ("orders", "customer_group"),
+    "payment_method": ("orders", "payment_method"),
+    "product_group": ("lines", "category"),
+}
+CHOICE_LIMIT = 40
 
 
 class ParseResult(Protocol):
@@ -29,7 +37,7 @@ class ParseResult(Protocol):
 
 
 class IntentParser(Protocol):
-    def parse(self, question: str) -> ParseResult: ...
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParseResult: ...
 
 
 @dataclass
@@ -39,6 +47,36 @@ class SolveTrace:
     windows: list[TimeWindow]
     decision: str  # "value" | "unanswerable" | "abstain"
     reason: str
+
+
+def filter_choices(connection: sqlite3.Connection) -> dict[str, list[str]]:
+    """Distinct stored values for each filter dimension; a dimension whose table or column is missing is left out."""
+    choices: dict[str, list[str]] = {}
+    for dim, (table, column) in CHOICE_COLUMNS.items():
+        try:
+            rows = connection.execute(
+                f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL "
+                f"ORDER BY {column} LIMIT ?",
+                (CHOICE_LIMIT,),
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        values = [str(row[0]) for row in rows if str(row[0]).strip()]
+        if values:
+            choices[dim] = values
+    return choices
+
+
+def _flag(facts: dict[str, Any], key: str) -> int | None:
+    """A shop fact read as a whole number, or None when it is absent or not a number."""
+    try:
+        return int(str(facts[key]).strip())
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _outside(window: TimeWindow, low: date, high: date) -> bool:
+    return window.end_exclusive <= low or window.start > high
 
 
 class SemanticSolver:
@@ -55,13 +93,28 @@ class SemanticSolver:
             return self._finish(question, trace, "abstain", type(exc).__name__)
 
     def _decide(self, question: Question, trace: SolveTrace) -> tuple[Prediction, SolveTrace]:
-        parsed = self.parser.parse(question.question)
+        parsed = self.parser.parse(question.question, choices=filter_choices(self.connection))
         intent = parsed.intent
         trace.intent = intent
         if intent is None:
             return self._finish(question, trace, "abstain", parsed.reason)
         if intent.measure == "outside":
             return self._finish(question, trace, "abstain", "outside known measures")
+
+        facts = self._shop_facts()
+        if intent.location is not None:
+            if facts is not None and _flag(facts, "has_address") == 0 and _flag(facts, "has_orders") == 1:
+                return self._finish(question, trace, "unanswerable", "no address recorded")
+            return self._finish(question, trace, "abstain", "location filter unsupported")
+
+        uses_customer_group = intent.group_by == "customer_group" or any(
+            f.get("dim") == "customer_group" for f in intent.filters
+        )
+        if (
+            uses_customer_group and facts is not None
+            and _flag(facts, "has_customer_group") == 0 and _flag(facts, "has_orders") == 1
+        ):
+            return self._finish(question, trace, "unanswerable", "customer group not recorded")
 
         windows: list[TimeWindow] = []
         if intent.shape in PERIOD_SHAPES:
@@ -88,10 +141,17 @@ class SemanticSolver:
                 return self._finish(question, trace, "abstain", "orders table has no dated rows")
             low, high = span
             targets = [w for w in windows if w.role != "comparison"]
-            if targets and all(w.end_exclusive <= low or w.start > high for w in targets):
+            if targets and all(_outside(w, low, high) for w in targets):
                 return self._finish(
                     question, trace, "unanswerable",
                     f"requested period lies wholly outside the shop's data range {low.isoformat()} to {high.isoformat()}",
+                )
+            comparisons = [w for w in windows if w.role == "comparison"]
+            orders_recorded = facts is None or _flag(facts, "has_orders") == 1
+            if comparisons and orders_recorded and all(_outside(w, low, high) for w in comparisons):
+                return self._finish(
+                    question, trace, "unanswerable",
+                    f"comparison period lies wholly outside the shop's data range {low.isoformat()} to {high.isoformat()}",
                 )
 
         try:
@@ -104,6 +164,15 @@ class SemanticSolver:
         prediction = Prediction(id=question.id, type=AnswerType(answer.type), answer=answer.value)
         trace.decision = "value"
         return prediction, trace
+
+    def _shop_facts(self) -> dict[str, Any] | None:
+        """Key-value facts the shop records about itself; None when the shop_facts table is missing."""
+        exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shop_facts'"
+        ).fetchone()
+        if exists is None:
+            return None
+        return {str(key): value for key, value in self.connection.execute("SELECT key, value FROM shop_facts")}
 
     def _orders_range(self) -> tuple[date, date] | None:
         row = self.connection.execute("SELECT MIN(date), MAX(date) FROM orders").fetchone()

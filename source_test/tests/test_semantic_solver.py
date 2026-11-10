@@ -9,7 +9,7 @@ import pytest
 from bizreason.contracts import AnswerType, Question, TimeWindow
 from bizreason.semantic import solver as solver_module
 from bizreason.semantic.compiler import Intent, Unsupported
-from bizreason.semantic.solver import SemanticSolver
+from bizreason.semantic.solver import SemanticSolver, filter_choices
 from bizreason.utils import normalize_lookup
 
 
@@ -22,8 +22,10 @@ class ParseResult:
 class FakeParser:
     def __init__(self, result: ParseResult):
         self.result = result
+        self.choices: dict[str, list[str]] | None = None
 
-    def parse(self, question: str) -> ParseResult:
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParseResult:
+        self.choices = choices
         return self.result
 
 
@@ -74,6 +76,187 @@ def solve(parser_result: ParseResult, temporal: FakeTemporal, conn: sqlite3.Conn
     conn = conn or make_db()
     solver = SemanticSolver(FakeParser(parser_result), temporal, conn)
     return solver.solve(question())
+
+
+def add_facts(conn: sqlite3.Connection, **facts: object) -> None:
+    conn.execute("CREATE TABLE shop_facts (key TEXT, value TEXT)")
+    conn.executemany("INSERT INTO shop_facts VALUES (?, ?)", [(k, str(v)) for k, v in facts.items()])
+
+
+class RecordingCompiler:
+    """Stands in for the compiler; records that the solver reached it and answers with a fixed value."""
+
+    reached: list[str] = []
+
+    def __init__(self, connection):
+        pass
+
+    def answer(self, intent, windows):
+        RecordingCompiler.reached.append(intent.measure)
+        raise Unsupported("reached compiler")
+
+
+@pytest.fixture
+def reached(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    RecordingCompiler.reached = []
+    monkeypatch.setattr(solver_module, "Compiler", RecordingCompiler)
+    return RecordingCompiler.reached
+
+
+def test_parser_receives_stored_choices_from_the_database():
+    parser = FakeParser(ParseResult(None, "x"))
+    conn = make_db()
+    conn.execute("ALTER TABLE orders ADD COLUMN channel TEXT")
+    conn.execute("UPDATE orders SET channel = 'shop'")
+    conn.commit()
+    SemanticSolver(parser, FakeTemporal(), conn).solve(question())
+    assert parser.choices == {"channel": ["shop"]}
+
+
+def test_filter_choices_lists_distinct_values_per_dimension():
+    conn = make_db()
+    conn.execute("ALTER TABLE orders ADD COLUMN channel TEXT")
+    conn.execute("ALTER TABLE orders ADD COLUMN customer_group TEXT")
+    conn.execute("ALTER TABLE orders ADD COLUMN payment_method TEXT")
+    conn.execute("UPDATE orders SET channel = 'shop', customer_group = 'vip', payment_method = 'cash' WHERE order_id = 'o1'")
+    conn.execute("UPDATE orders SET channel = 'shop', payment_method = 'card' WHERE order_id = 'o2'")
+    conn.execute("INSERT INTO lines VALUES ('o1', 'p', 'name', 'drinks', 'u', 1, 1, 1, 0)")
+    conn.execute("INSERT INTO lines VALUES ('o1', 'p2', 'name2', NULL, 'u', 1, 1, 1, 0)")
+    conn.commit()
+    assert filter_choices(conn) == {
+        "channel": ["shop"],
+        "customer_group": ["vip"],
+        "payment_method": ["card", "cash"],
+        "product_group": ["drinks"],
+    }
+
+
+def test_filter_choices_is_capped_at_forty_values():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE orders (order_id TEXT, channel TEXT)")
+    conn.executemany("INSERT INTO orders VALUES (?, ?)", [(f"o{i}", f"ch{i:02d}") for i in range(50)])
+    values = filter_choices(conn)["channel"]
+    assert len(values) == 40
+    assert values[0] == "ch00"
+    assert values[-1] == "ch39"
+
+
+def test_filter_choices_tolerates_missing_tables_and_columns():
+    empty = sqlite3.connect(":memory:")
+    assert filter_choices(empty) == {}
+
+    partial = sqlite3.connect(":memory:")
+    partial.execute("CREATE TABLE orders (order_id TEXT, date TEXT, channel TEXT)")
+    partial.execute("INSERT INTO orders VALUES ('o1', '2026-01-05', 'shop')")
+    assert filter_choices(partial) == {"channel": ["shop"]}
+
+
+def test_location_without_address_on_a_shop_with_orders_is_unanswerable():
+    conn = make_db()
+    add_facts(conn, has_address=0, has_orders=1)
+    prediction, trace = solve(ParseResult(Intent(measure="order_count", location="Main street")),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.UNANSWERABLE
+    assert prediction.reason == "no address recorded"
+    assert trace.decision == "unanswerable"
+
+
+def test_location_with_address_recorded_abstains_as_unsupported(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_address=1, has_orders=1)
+    prediction, _ = solve(ParseResult(Intent(measure="revenue", location="Main street")),
+                          FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "location filter unsupported"
+    assert reached == []
+
+
+def test_location_with_missing_shop_facts_abstains(reached: list[str]):
+    prediction, _ = solve(ParseResult(Intent(measure="revenue", location="Main street")),
+                          FakeTemporal(single=[win("2026-01-01", "2026-02-01")]))
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "location filter unsupported"
+    assert reached == []
+
+
+def test_comparison_wholly_outside_coverage_is_unanswerable(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_orders=1)
+    temporal = FakeTemporal(single=[
+        win("2026-01-01", "2026-02-01"),
+        win("2025-01-01", "2025-02-01", role="comparison"),
+    ])
+    prediction, trace = solve(ParseResult(Intent(measure="revenue", shape="compare_periods")), temporal, conn)
+    assert prediction.type == AnswerType.UNANSWERABLE
+    assert "comparison" in prediction.reason
+    assert trace.decision == "unanswerable"
+    assert reached == []
+
+
+def test_comparison_outside_coverage_is_unanswerable_when_shop_facts_is_missing(reached: list[str]):
+    temporal = FakeTemporal(single=[
+        win("2026-01-01", "2026-02-01"),
+        win("2025-01-01", "2025-02-01", role="comparison"),
+    ])
+    prediction, _ = solve(ParseResult(Intent(measure="revenue", shape="compare_periods")), temporal)
+    assert prediction.type == AnswerType.UNANSWERABLE
+
+
+def test_comparison_outside_coverage_is_not_unanswerable_when_orders_are_not_recorded(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_orders=0)
+    temporal = FakeTemporal(single=[
+        win("2026-01-01", "2026-02-01"),
+        win("2025-01-01", "2025-02-01", role="comparison"),
+    ])
+    prediction, _ = solve(ParseResult(Intent(measure="revenue", shape="compare_periods")), temporal, conn)
+    assert prediction.type != AnswerType.UNANSWERABLE
+    assert reached == ["revenue"]
+
+
+def test_comparison_partly_inside_coverage_is_not_unanswerable(reached: list[str]):
+    temporal = FakeTemporal(single=[
+        win("2026-01-01", "2026-02-01"),
+        win("2025-12-01", "2026-01-10", role="comparison"),
+    ])
+    solve(ParseResult(Intent(measure="revenue", shape="compare_periods")), temporal)
+    assert reached == ["revenue"]
+
+
+def test_customer_group_filter_not_recorded_is_unanswerable(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_customer_group=0, has_orders=1)
+    intent = Intent(measure="revenue", filters=[{"dim": "customer_group", "value": "vip", "exclude": False}])
+    prediction, trace = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.UNANSWERABLE
+    assert prediction.reason == "customer group not recorded"
+    assert trace.decision == "unanswerable"
+    assert reached == []
+
+
+def test_customer_group_breakdown_not_recorded_is_unanswerable(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_customer_group=0, has_orders=1)
+    intent = Intent(measure="revenue", shape="breakdown", group_by="customer_group")
+    prediction, _ = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.UNANSWERABLE
+    assert prediction.reason == "customer group not recorded"
+
+
+def test_customer_group_recorded_reaches_compiler(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_customer_group=1, has_orders=1)
+    intent = Intent(measure="revenue", filters=[{"dim": "customer_group", "value": "vip", "exclude": False}])
+    solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert reached == ["revenue"]
+
+
+def test_customer_group_rule_needs_orders_recorded(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_customer_group=0, has_orders=0)
+    intent = Intent(measure="revenue", filters=[{"dim": "customer_group", "value": "vip", "exclude": False}])
+    solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert reached == ["revenue"]
 
 
 def test_value_answer_for_scalar_revenue():

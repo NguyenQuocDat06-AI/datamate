@@ -270,11 +270,20 @@ def test_debt_age_keeps_payments_up_to_the_window_end() -> None:
     ]), AGED_WINDOW) == 30
 
 
-@pytest.mark.parametrize("measure", ["debt_repaid", "debt_new", "revenue", "order_count"])
-def test_age_on_other_measures_raises_unsupported(measure: str) -> None:
+@pytest.mark.parametrize("measure", ["debt_repaid", "debt_new"])
+def test_age_on_other_debt_measures_raises_unsupported(measure: str) -> None:
     compiler = Compiler(make_aged_db())
     with pytest.raises(Unsupported, match="age on measure"):
         compiler.value(Intent(measure=measure, age_days=7), AGED_WINDOW)
+
+
+def test_age_on_non_debt_measure_is_ignored() -> None:
+    # An age on a sales measure is an artefact of a window phrase: revenue 100 + 50 + 30 = 180 on the aged fixture
+    # at any age, and order_count is 3 with or without it.
+    compiler = Compiler(make_aged_db())
+    assert compiler.value(Intent(measure="revenue", age_days=7), AGED_WINDOW) == 180
+    assert compiler.value(Intent(measure="order_count", age_days=7), AGED_WINDOW) == 3
+    assert compiler.answer(Intent(measure="order_count", age_days=7), [AGED_WINDOW]) == Answer("number", 3)
 
 
 def test_age_on_threshold_shape_raises_unsupported() -> None:
@@ -297,3 +306,17 @@ def test_age_must_be_a_non_negative_whole_number(bad) -> None:
 def test_answer_with_age_is_a_number() -> None:
     compiler = Compiler(make_aged_db())
     assert compiler.answer(Intent(measure="debt_outstanding", age_days=7), [AGED_WINDOW]) == Answer("number", 30)
+
+
+# Change 10: customers ranked by the debt still owed at the cutoff (31 Mar), largest first.
+# Owed: c1 = O1 50 + O2 50 = 100 (O9 is in April); c3 = O6 60 (O5 is COD); c2 = O4 50 (O3 is cancelled);
+# c4 is 0 and drops out; c5 (marketplace only) is 0; the walk-in O7 (30) is in totals but not in the ranking.
+def test_debt_outstanding_ranked_by_customer(compiler: Compiler) -> None:
+    ranked = Intent(measure="debt_outstanding", shape="top_k", group_by="customer", top_k=3)
+    assert compiler.answer(ranked, [CUTOFF_31_MAR]) == Answer("list", ["c1", "c3", "c2"])
+    assert compiler.answer(
+        Intent(measure="debt_outstanding", shape="top_k", group_by="customer", top_k=2), [CUTOFF_31_MAR]
+    ) == Answer("list", ["c1", "c3"])
+    assert compiler.answer(
+        Intent(measure="debt_outstanding", shape="argmax_entity", group_by="customer"), [CUTOFF_31_MAR]
+    ) == Answer("string", "c1")

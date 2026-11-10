@@ -5,14 +5,14 @@ from __future__ import annotations
 import operator
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from bizreason.contracts import TimeWindow
 from bizreason.semantic.vocabulary import (
-    DEBT_METHOD_TOKENS, NON_DEBT_METHOD_TOKENS, SHIFT_BASELINE, SHIFT_WINDOWS,
+    DEBT_METHOD_TOKENS, GENERIC_FILTER_WORDS, NON_DEBT_METHOD_TOKENS, SHIFT_BASELINE, SHIFT_WINDOWS,
 )
 from bizreason.utils import normalize_lookup
 
@@ -31,11 +31,19 @@ STATUS_MEASURES = {
 }
 # Measures where a zero is only trustworthy when cancellation is recorded at all.
 CANCEL_MEASURES = {"cancelled_count", "cancel_rate"}
+# Measures ranked by supplier, read from the purchase receipts.
+PURCHASE_RANK_MEASURES = {"purchase_amount", "purchase_receipt_count"}
+# Measures that can be averaged per weekday (rulebook §2).
+WEEKDAY_AVERAGE_MEASURES = {"order_count", "revenue"}
 ORDER_DIMS = {
     "customer": "customer_key", "customer_group": "customer_group", "employee": "employee",
     "channel": "channel", "payment_method": "payment_method",
 }
-LINE_DIMS = {"product": "product_key", "product_group": "category", "size": "product_name", "unit": "unit"}
+# Drug and device columns on the sale lines (rulebook section 6). A filter on one needs the column to exist.
+LINE_DIMS = {
+    "product": "product_key", "product_group": "category", "size": "product_name", "unit": "unit",
+    "prescription": "prescription", "active_ingredient": "active_ingredient", "product_kind": "product_kind",
+}
 LABEL = {"product": "MIN(product_name)", "customer": "MIN(customer_name)", "employee": "employee"}
 # Threshold subjects: (table, key column, metric expressions). A subject is one key; its metric is per key.
 THRESHOLD_SUBJECTS = {
@@ -49,7 +57,30 @@ THRESHOLD_SUBJECTS = {
 }
 THRESHOLD_OPS = {"gte": operator.ge, "gt": operator.gt, "lte": operator.le, "lt": operator.lt}
 THRESHOLD_SHAPES = {"threshold_count", "ratio_of_counts"}
+# Filter dimensions matched on the whole stored string only: no generic-word removal, no partial match.
+EXACT_ONLY_DIMS = {"active_ingredient"}
+# Filter dimensions where a partial match could name another customer or group.
+NO_PARTIAL_DIMS = {"customer", "customer_group"}
+# Prescription values: a token for "no" means 0, any other value means 1 (rulebook section 6). ASCII tokens.
+NO_TOKENS = ("no", "khong")
+# Weekday words as normalize_lookup writes them, with the SQL strftime('%w') number of the day (Sunday is 0).
+WEEKDAY_TOKENS = {
+    "thu 2": 1, "thu hai": 1, "monday": 1,
+    "thu 3": 2, "thu ba": 2, "tuesday": 2,
+    "thu 4": 3, "thu tu": 3, "wednesday": 3,
+    "thu 5": 4, "thu nam": 4, "thursday": 4,
+    "thu 6": 5, "thu sau": 5, "friday": 5,
+    "thu 7": 6, "thu bay": 6, "saturday": 6,
+    "chu nhat": 0, "cn": 0, "sunday": 0,
+}
+# The afternoon shift key (the other key of SHIFT_WINDOWS besides SHIFT_BASELINE, rulebook section 2).
+SHIFT_AFTERNOON = "chieu"
 _CLOCK = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
+# Generic phrases, longest first, so that a phrase is removed whole.
+_GENERIC_PHRASES = sorted(
+    {tuple(normalize_lookup(word).split()) for word in GENERIC_FILTER_WORDS},
+    key=lambda phrase: (-len(phrase), phrase),
+)
 
 
 class Unsupported(Exception):
@@ -68,6 +99,10 @@ class Intent:
     threshold: dict[str, Any] | None = None
     # Debt measures only: keep orders strictly older than this many days at the cutoff.
     age_days: int | None = None
+    # A second measure asked in the same question; answered as a list in the order asked.
+    measure2: str | None = None
+    # A place the question restricts to, such as a street.
+    location: str | None = None
 
 
 @dataclass
@@ -100,12 +135,53 @@ def _mentions(method: Any, tokens: tuple[str, ...]) -> bool:
     return any(f" {normalize_lookup(token)} " in padded for token in tokens)
 
 
+def _strip_generic(needle: str) -> str:
+    """The normalized needle with generic words removed from its start and end. Never returns an empty string."""
+    words = needle.split()
+    changed = True
+    while changed:
+        changed = False
+        for phrase in _GENERIC_PHRASES:
+            size = len(phrase)
+            if len(words) <= size:
+                continue
+            if tuple(words[:size]) == phrase:
+                words = words[size:]
+                changed = True
+            elif tuple(words[-size:]) == phrase:
+                words = words[:-size]
+                changed = True
+    return " ".join(words)
+
+
+def _weekday_of(text: Any) -> int:
+    """The SQL weekday number (Sunday is 0) named by a filter value: a day number 2 to 7, or a weekday name."""
+    needle = normalize_lookup(text)
+    if needle in {"2", "3", "4", "5", "6", "7"}:
+        return int(needle) - 1
+    padded = f" {needle} "
+    days = {day for token, day in WEEKDAY_TOKENS.items() if f" {token} " in padded}
+    if len(days) != 1:
+        raise Unsupported(f"unknown weekday: {text}")
+    return days.pop()
+
+
+def _unpaid(paid: dict[Any, list[tuple[Any, Any]]], order_id: Any, due: Any, paid_by: Any) -> float | None:
+    """Rulebook §4: the part of an order's total not yet paid by the payments that pass `paid_by`, never below 0."""
+    if due is None:
+        return None
+    settled = sum(amount for paid_on, amount in paid.get(order_id, []) if amount is not None and paid_by(paid_on))
+    return max(float(due) - settled, 0.0)
+
+
 def _filter_column(dim: str) -> str:
     """The stored column that a filter's predicate reads; rows where it is null are kept by an exclusion."""
     if dim in {"product", "size"}:
         return "product_name"
     if dim == "shift":
         return "ts"
+    if dim == "weekday":
+        return "date"
     return ORDER_DIMS.get(dim) or LINE_DIMS[dim]
 
 
@@ -130,8 +206,12 @@ def _name_head(value: Any) -> str | None:
 
 
 def _check_age(intent: Intent) -> None:
-    """Rulebook §4: an age only means something for the debt measures that take it; anywhere else it would be dropped."""
-    if intent.age_days is None:
+    """Rulebook §4: an age only means something for the debt measures that take it.
+
+    An age on a non-debt measure is an artefact of a window phrase, so it is ignored. An age on a debt measure
+    that does not take one would change the answer, so it raises.
+    """
+    if intent.age_days is None or intent.measure not in DEBT_MEASURES:
         return
     if intent.measure not in AGE_MEASURES:
         raise Unsupported(f"age on measure {intent.measure}")
@@ -155,14 +235,17 @@ class Compiler:
         self.db.create_function("clock_of", 1, _clock_of)
         self.db.create_function("name_head", 1, _name_head)
         self.has_lines = self.db.execute("SELECT 1 FROM lines LIMIT 1").fetchone() is not None
-        line_columns = {row[1] for row in self.db.execute("PRAGMA table_info(lines)")}
+        self.line_columns = {row[1] for row in self.db.execute("PRAGMA table_info(lines)")}
+        self.order_columns = {row[1] for row in self.db.execute("PRAGMA table_info(orders)")}
         # Rulebook §3: a unit filter means base units. Only used when the base unit is recorded on the lines.
-        self.base_unit = "base_unit" in line_columns and self.db.execute(
+        self.base_unit = "base_unit" in self.line_columns and self.db.execute(
             "SELECT 1 FROM lines WHERE base_unit IS NOT NULL LIMIT 1"
         ).fetchone() is not None
         # Rulebook §3: a service charge is revenue but not a product that can be ranked or counted.
-        self.items_only = "is_item=1" if "is_item" in line_columns else "1=1"
-        self.price_expr = "COALESCE(unit_price, amount*1.0/qty)" if "unit_price" in line_columns else "amount*1.0/qty"
+        self.items_only = "is_item=1" if "is_item" in self.line_columns else "1=1"
+        self.price_expr = (
+            "COALESCE(unit_price, amount*1.0/qty)" if "unit_price" in self.line_columns else "amount*1.0/qty"
+        )
         self._has_status: bool | None = None
         self._has_cancelled: bool | None = None
         self._has_time: bool | None = None
@@ -196,6 +279,10 @@ class Compiler:
         if not self._has_time:
             raise Unsupported("order time unavailable")
 
+    def _require_line_column(self, column: str) -> None:
+        if not self.has_lines or column not in self.line_columns:
+            raise Unsupported(f"{column} unavailable")
+
     def _supplier_column(self) -> str:
         """Supplier matching reads the supplier name; the id is used only when no receipt carries a name."""
         if self._supplier_col is None:
@@ -215,6 +302,63 @@ class Compiler:
         start, end = SHIFT_WINDOWS[key]
         return "(clock_of(ts) >= ? AND clock_of(ts) <= ?)", [start, end], False
 
+    @staticmethod
+    def _match(dim: str, values: list[Any], needle: str, partial: bool = True) -> list[Any]:
+        """Stored values a filter names: exact, then exact after generic words are removed, then one partial match.
+
+        A partial match is used only when it yields exactly one stored value.
+        """
+        if not needle:
+            return []
+        exact = [v for v in values if normalize_lookup(v) == needle]
+        if exact or dim in EXACT_ONLY_DIMS:
+            return exact
+        stripped = _strip_generic(needle)
+        if stripped != needle:
+            found = [v for v in values if normalize_lookup(v) == stripped]
+            if found:
+                return found
+        if partial and dim not in NO_PARTIAL_DIMS:
+            loose = [v for v in values if needle in normalize_lookup(v)]
+            if len(loose) == 1:
+                return loose
+        return []
+
+    def _stored_matches(
+        self, table: str, source: str, dim: str, needle: str, text: str, partial: bool = True,
+    ) -> list[Any]:
+        values = [r[0] for r in self.db.execute(f"SELECT DISTINCT {source} FROM {table} WHERE {source} IS NOT NULL")]
+        matched = self._match(dim, values, needle, partial)
+        if not matched:
+            raise Unsupported(f"unresolved {dim}: {text}")
+        return matched
+
+    def _customer_predicate(self, text: str) -> tuple[str, list[Any], bool]:
+        """Rulebook §3. A customer is a code when the shop has codes, otherwise the name written on the order.
+
+        Matches customer_key or customer_name. One name that belongs to two or more codes is ambiguous.
+        """
+        needle = normalize_lookup(text)
+        name_expr = "customer_name" if "customer_name" in self.order_columns else "NULL"
+        pairs = self.db.execute(f"SELECT DISTINCT customer_key, {name_expr} FROM orders").fetchall()
+        keys = sorted({key for key, _ in pairs if key is not None})
+        names = sorted({name for _, name in pairs if name is not None})
+        if not keys:
+            matched = self._match("customer", names, needle)
+            if not matched:
+                raise Unsupported(f"unresolved customer: {text}")
+            return f"customer_name IN ({','.join('?' for _ in matched)})", list(matched), False
+        found = set(self._match("customer", keys, needle))
+        for name in self._match("customer", names, needle):
+            owners = {key for key, owner in pairs if owner == name and key is not None}
+            if len(owners) > 1:
+                raise Unsupported(f"ambiguous customer name: {text}")
+            found |= owners
+        if not found:
+            raise Unsupported(f"unresolved customer: {text}")
+        ordered = sorted(found)
+        return f"customer_key IN ({','.join('?' for _ in ordered)})", ordered, False
+
     def resolve_filter(self, dim: str, text: str, on: str | None = None) -> tuple[str, list[Any], bool]:
         """Return a SQL predicate for a filter, or raise when the value is not in the data.
 
@@ -224,6 +368,10 @@ class Compiler:
             if on is not None:
                 raise Unsupported(f"shift filter on {on}")
             return self._shift_filter(text)
+        if dim == "weekday":
+            if on is not None:
+                raise Unsupported(f"weekday filter on {on}")
+            return "(strftime('%w', date) = ?)", [str(_weekday_of(text))], False
         if dim == "supplier" and on != "purchases":
             raise Unsupported("supplier filter outside purchases")
         column = ORDER_DIMS.get(dim) or LINE_DIMS.get(dim)
@@ -231,35 +379,42 @@ class Compiler:
             raise Unsupported(f"dimension {dim}")
         if on == "purchases" and dim not in {"product", "supplier"}:
             raise Unsupported(f"purchase filter on {dim}")
+        if dim == "customer":
+            return self._customer_predicate(text)
         needle = normalize_lookup(text)
         if dim == "size":
             token = needle.split()[-1] if needle else ""
             if not token:
                 raise Unsupported("size value")
             return "(name_head(product_name) LIKE ?)", [f"% {token}"], True
+        if dim == "prescription":
+            self._require_line_column("prescription")
+            if not needle:
+                raise Unsupported("prescription value")
+            padded = f" {needle} "
+            return "(prescription = ?)", [0 if any(f" {token} " in padded for token in NO_TOKENS) else 1], True
         if on == "purchases":
-            table, source, line = "purchases", (self._supplier_column() if dim == "supplier" else "product_name"), False
-        elif dim == "unit" and self.base_unit:
-            # Exact match only: a partial unit name could be a different unit.
-            values = [r[0] for r in self.db.execute("SELECT DISTINCT base_unit FROM lines WHERE base_unit IS NOT NULL")]
-            matched = [v for v in values if needle and normalize_lookup(v) == needle]
-            if not matched:
-                raise Unsupported(f"unresolved {dim}: {text}")
+            table = "purchases"
+            source = self._supplier_column() if dim == "supplier" else "product_name"
+            matched = self._stored_matches(table, source, dim, needle, text)
+            return f"{source} IN ({','.join('?' for _ in matched)})", list(matched), False
+        if dim == "unit" and self.base_unit:
+            # Exact match only after generic words are removed: a partial unit name could be a different unit.
+            matched = self._stored_matches("lines", "base_unit", dim, needle, text, partial=False)
             return f"base_unit IN ({','.join('?' for _ in matched)})", list(matched), True
-        else:
-            table = "lines" if column in LINE_DIMS.values() else "orders"
-            if not self.has_lines and table == "lines":
+        table = "lines" if column in LINE_DIMS.values() else "orders"
+        line = table == "lines"
+        if line:
+            if not self.has_lines:
                 raise Unsupported("line detail unavailable")
             source = "product_name" if dim == "product" else column
-            line = table == "lines"
-        values = [r[0] for r in self.db.execute(f"SELECT DISTINCT {source} FROM {table} WHERE {source} IS NOT NULL")]
-        exact = [v for v in values if normalize_lookup(v) == needle]
-        partial = [v for v in values if needle and needle in normalize_lookup(v)]
-        matched = exact or partial
-        if not matched or (len(matched) > 1 and not exact and dim in {"product", "customer"}):
-            raise Unsupported(f"unresolved {dim}: {text}")
-        slots = ",".join("?" for _ in matched)
-        return f"{source} IN ({slots})", list(matched), line
+        else:
+            source = column
+        available = self.line_columns if line else self.order_columns
+        if source not in available:
+            raise Unsupported(f"{dim} unavailable")
+        matched = self._stored_matches(table, source, dim, needle, text)
+        return f"{source} IN ({','.join('?' for _ in matched)})", list(matched), line
 
     def _predicates(self, intent: Intent, skip: bool = False) -> tuple[list[str], list[Any], bool]:
         sql, args, needs_lines = [], [], False
@@ -362,8 +517,8 @@ class Compiler:
             if not _mentions(method, NON_DEBT_METHOD_TOKENS)
         ]
 
-    def _debt(self, intent: Intent, window: TimeWindow, skip_filters: bool) -> float | None:
-        """Rulebook §4. The unpaid part of an order is its total_due less payments dated up to the cutoff, never below 0."""
+    def _payment_index(self) -> dict[Any, list[tuple[Any, Any]]]:
+        """Payments grouped by order as (paid_on, amount). Raises when the shop has no payment record."""
         try:
             payment_rows = self.db.execute("SELECT order_id, date, amount FROM payments").fetchall()
         except sqlite3.OperationalError as exc:
@@ -373,29 +528,36 @@ class Compiler:
         paid: dict[Any, list[tuple[Any, Any]]] = {}
         for order_id, paid_on, amount in payment_rows:
             paid.setdefault(order_id, []).append((paid_on, amount))
+        return paid
+
+    @staticmethod
+    def _owed(
+        orders: list[tuple[Any, Any, Any, Any, bool]], paid: dict[Any, list[tuple[Any, Any]]],
+        window: TimeWindow, age_days: int | None,
+    ) -> list[tuple[Any, float | None]]:
+        """(customer, unpaid part at the end of the window) for each order placed up to the window's last day."""
+        end = window.end_exclusive.isoformat()
+        # Rulebook §4: age counts days from the order date to the last day of the window. An order exactly
+        # age_days old is not older than age_days, so it is left out.
+        age_limit = None
+        if age_days is not None:
+            age_limit = (window.end_exclusive - timedelta(days=1 + age_days)).isoformat()
+        return [
+            (customer, _unpaid(paid, order_id, due, lambda d: d is not None and d < end))
+            for order_id, customer, day, due, _ in orders
+            if day is not None and day < end and (age_limit is None or day < age_limit)
+        ]
+
+    def _debt(self, intent: Intent, window: TimeWindow, skip_filters: bool) -> float | None:
+        """Rulebook §4. The unpaid part of an order is its total_due less payments dated up to the cutoff, never below 0."""
+        paid = self._payment_index()
         orders = self._debt_orders(intent, skip_filters)
         if orders and all(due is None for _, _, _, due, _ in orders):
             raise Unsupported("no total_due")
         start, end = window.start.isoformat(), window.end_exclusive.isoformat()
-        # Rulebook §4: age counts days from the order date to the last day of the window. An order exactly
-        # age_days old is not older than age_days, so it is left out.
-        age_limit = None
-        if intent.age_days is not None:
-            age_limit = (window.end_exclusive - timedelta(days=1 + intent.age_days)).isoformat()
-
-        def unpaid(order_id: Any, due: Any, paid_by: Any) -> float | None:
-            if due is None:
-                return None
-            settled = sum(amount for paid_on, amount in paid.get(order_id, []) if amount is not None and paid_by(paid_on))
-            return max(float(due) - settled, 0.0)
-
         m = intent.measure
         if m in {"debt_outstanding", "debtor_count"}:
-            owed = [
-                (customer, unpaid(order_id, due, lambda d: d is not None and d < end))
-                for order_id, customer, day, due, _ in orders
-                if day is not None and day < end and (age_limit is None or day < age_limit)
-            ]
+            owed = self._owed(orders, paid, window, intent.age_days)
             if m == "debt_outstanding":
                 return sum(r for _, r in owed if r is not None)
             per_customer: dict[Any, float] = {}
@@ -417,9 +579,54 @@ class Compiler:
             for order_id, _, day, due, is_debt in orders:
                 if not is_debt or day is None or due is None or not start <= day < end:
                     continue
-                total += unpaid(order_id, due, lambda d: d is not None and d == day) or 0.0
+                total += _unpaid(paid, order_id, due, lambda d: d is not None and d == day) or 0.0
             return total
         raise Unsupported(f"measure {m}")
+
+    def _customer_labels(self) -> dict[Any, Any] | None:
+        """A display name per customer code, or None when the orders carry no name column."""
+        if "customer_name" not in self.order_columns:
+            return None
+        rows = self.db.execute(
+            "SELECT customer_key, MIN(customer_name) FROM orders WHERE customer_key IS NOT NULL GROUP BY customer_key"
+        ).fetchall()
+        return dict(rows)
+
+    def _ranked_debtors(self, intent: Intent, window: TimeWindow) -> list[tuple[Any, float]]:
+        """Rulebook §4 and §3: customers by the debt still owed at the window's last day, largest first."""
+        paid = self._payment_index()
+        orders = self._debt_orders(intent, skip_filters=False)
+        if orders and all(due is None for _, _, _, due, _ in orders):
+            raise Unsupported("no total_due")
+        totals: dict[Any, float] = {}
+        for customer, remaining in self._owed(orders, paid, window, intent.age_days):
+            # Walk-in orders (no customer code) are not a row of the debt table.
+            if customer is not None and remaining is not None:
+                totals[customer] = totals.get(customer, 0.0) + remaining
+        owing = sorted(((c, t) for c, t in totals.items() if t > 0), key=lambda item: (-item[1], item[0]))
+        labels = self._customer_labels()
+        return [((labels.get(c) if labels is not None else c), t) for c, t in owing]
+
+    def _ranked_suppliers(self, intent: Intent, window: TimeWindow) -> list[tuple[Any, float]]:
+        """Rulebook §5: suppliers by import money (per receipt, as in value) or by number of receipts."""
+        column = self._supplier_column()
+        pieces, piece_args = self._purchase_predicates(intent, False)
+        where = " AND ".join(["cancelled=0", "date>=?", "date<?", f"{column} IS NOT NULL", *pieces])
+        span = [window.start.isoformat(), window.end_exclusive.isoformat()]
+        if intent.measure == "purchase_amount":
+            sql = (
+                f"SELECT k, SUM(a) s FROM (SELECT {column} k, "
+                "COALESCE(MAX(receipt_total), SUM(COALESCE(amount, qty*unit_cost))) a "
+                f"FROM purchases WHERE {where} GROUP BY {column}, COALESCE(purchase_id, date)) "
+                "GROUP BY k ORDER BY s DESC, k ASC"
+            )
+        else:
+            sql = (
+                f"SELECT {column} k, COUNT(DISTINCT purchase_id) s FROM purchases WHERE {where} "
+                f"GROUP BY {column} ORDER BY s DESC, k ASC"
+            )
+        rows = self.db.execute(sql, span + piece_args).fetchall()
+        return [(r[0], r[1]) for r in rows if r[1] is not None]
 
     def _unit_purchase_price(self, intent: Intent, window: TimeWindow, skip_filters: bool) -> float | None:
         """Rulebook §5 average import price: SUM(qty*unit_cost)/SUM(qty) over non-cancelled purchase rows in the window.
@@ -468,6 +675,25 @@ class Compiler:
         ).fetchone()
         return row[0]
 
+    def _delivery_trips(self, intent: Intent, window: TimeWindow, skip_filters: bool) -> int:
+        """Rulebook section 6 (construction materials): distinct (order, trip) pairs dated in the window.
+
+        The order status does not matter. No filter can be applied to the delivery rows, so a filter raises.
+        """
+        if not skip_filters and intent.filters:
+            raise Unsupported("delivery trips with a filter")
+        try:
+            total = self.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            raise Unsupported("no deliveries table") from exc
+        if not total:
+            raise Unsupported("no deliveries")
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT order_id, trip FROM deliveries WHERE date>=? AND date<?)",
+            [window.start.isoformat(), window.end_exclusive.isoformat()],
+        ).fetchone()
+        return row[0]
+
     def value(self, intent: Intent, window: TimeWindow, skip_filters: bool = False) -> float | None:
         _check_age(intent)
         if intent.measure in DEBT_MEASURES:
@@ -481,6 +707,8 @@ class Compiler:
             return self._unit_purchase_price(intent, window, skip_filters)
         if m == "unit_sale_price_on_date":
             return self._unit_sale_price(intent, window, skip_filters)
+        if m == "delivery_trip_count":
+            return self._delivery_trips(intent, window, skip_filters)
         span = [window.start.isoformat(), window.end_exclusive.isoformat()]
         if m == "purchase_amount":
             # Checked before the sales predicates: a supplier name is not a sales column.
@@ -539,9 +767,19 @@ class Compiler:
         return Answer("number", _whole(value))
 
     def _ranked(self, intent: Intent, window: TimeWindow) -> list[tuple[Any, float]]:
-        where, args, needs_lines = self._predicates(intent)
         dim = intent.group_by
         m = intent.measure
+        if m in PURCHASE_RANK_MEASURES:
+            if dim != "supplier":
+                raise Unsupported("purchase ranking needs supplier grouping")
+            return self._ranked_suppliers(intent, window)
+        if dim == "supplier":
+            raise Unsupported("supplier grouping needs a purchase measure")
+        if m == "debt_outstanding":
+            if dim != "customer":
+                raise Unsupported("debt ranking needs customer grouping")
+            return self._ranked_debtors(intent, window)
+        where, args, needs_lines = self._predicates(intent)
         if m in STATUS_MEASURES:
             self._require_order_status()
         if m == "cancelled_count":
@@ -554,6 +792,8 @@ class Compiler:
                 raise Unsupported(f"group by {dim}")
             label = LABEL.get(dim or "", key)
             line = dim in LINE_DIMS
+            if line and key not in self.line_columns:
+                raise Unsupported(f"{dim} unavailable")
         if m == "orders_containing_product" and not line:
             raise Unsupported("orders containing a product need a product grouping")
         source = "lines" if line or needs_lines or m == "qty_base_sold" else "orders"
@@ -610,12 +850,72 @@ class Compiler:
                 raise Unsupported("two shifts needed")
             if keys[1] != SHIFT_BASELINE:
                 members = members[::-1]
-        first =self.value(Intent(measure=intent.measure, filters=[*others, members[0]]), target[0])
+        first = self.value(Intent(measure=intent.measure, filters=[*others, members[0]]), target[0])
         second = self.value(Intent(measure=intent.measure, filters=[*others, members[1]]), target[0])
         return self._compare(intent, first, second)
 
+    def _compare_shift(self, intent: Intent, window: TimeWindow, item: dict[str, Any]) -> Answer:
+        """Rulebook §2: one named shift against the other shift. The morning shift is always the baseline.
+
+        The named shift is validated; the comparison is afternoon against morning, so the percent is the change
+        from morning to afternoon, and the value mode is afternoon minus morning.
+        """
+        if item.get("exclude") is True:
+            raise Unsupported("shift exclusion has no comparison")
+        _shift_key(item["value"])
+        others = [f for f in intent.filters if f.get("dim") != "shift"]
+        dims = [f.get("dim") for f in others if f.get("exclude") is not True]
+        if len(dims) != len(set(dims)):
+            raise Unsupported("comparison with several members of one dimension")
+        morning = self.value(
+            Intent(measure=intent.measure, filters=[*others, {"dim": "shift", "value": SHIFT_BASELINE}],
+                   age_days=intent.age_days),
+            window,
+        )
+        afternoon = self.value(
+            Intent(measure=intent.measure, filters=[*others, {"dim": "shift", "value": SHIFT_AFTERNOON}],
+                   age_days=intent.age_days),
+            window,
+        )
+        return self._compare(intent, afternoon, morning)
+
+    def _weekday_days(self, intent: Intent, window: TimeWindow) -> int:
+        """Rulebook §2: how many days of the named weekday the window holds, days without orders included."""
+        days: set[int] = set()
+        first = True
+        for item in intent.filters:
+            if item.get("dim") != "weekday":
+                continue
+            if item.get("exclude") is True:
+                raise Unsupported("weekday exclusion in an average")
+            day = _weekday_of(item["value"])
+            days = {day} if first else days & {day}
+            first = False
+        count = 0
+        cursor = window.start
+        while cursor < window.end_exclusive:
+            if cursor.isoweekday() % 7 in days:
+                count += 1
+            cursor += timedelta(days=1)
+        if not count:
+            raise Unsupported("no such weekday in the window")
+        return count
+
+    def _scalar(self, intent: Intent, window: TimeWindow) -> float | None:
+        """One value. A weekday filter only filters, unless the average per weekday is asked for."""
+        value = self.value(intent, window)
+        has_weekday = any(item.get("dim") == "weekday" for item in intent.filters)
+        if intent.compare_as == "average_per_weekday" and intent.measure in WEEKDAY_AVERAGE_MEASURES and has_weekday:
+            if value is None:
+                return None
+            return value / self._weekday_days(intent, window)
+        return value
+
     def answer(self, intent: Intent, windows: list[TimeWindow]) -> Answer:
         shape = intent.shape
+        if intent.location is not None:
+            # A place has no column in the canonical tables; dropping it would answer a wider question.
+            raise Unsupported("location filter has no column")
         if intent.threshold is not None and shape not in THRESHOLD_SHAPES:
             # A condition the shape does not apply to would be dropped silently; that is a wrong answer.
             raise Unsupported(f"threshold on shape {shape}")
@@ -623,6 +923,8 @@ class Compiler:
         if intent.age_days is not None and shape in THRESHOLD_SHAPES:
             # The threshold path reads its own metric, so an age would be dropped silently.
             raise Unsupported(f"age on shape {shape}")
+        if intent.measure2 is not None and shape != "scalar":
+            raise Unsupported(f"second measure on shape {shape}")
         target = [w for w in windows if w.role != "comparison"]
         other = [w for w in windows if w.role == "comparison"]
         if not target:
@@ -644,16 +946,34 @@ class Compiler:
         if shape == "scalar":
             if len(target) != 1 or other:
                 raise Unsupported("scalar with several windows")
-            return self._format(intent.measure, self.value(intent, window))
+            first = self._format(intent.measure, self._scalar(intent, window))
+            if intent.measure2 is None:
+                return first
+            second_intent = replace(intent, measure=intent.measure2, measure2=None)
+            second = self._format(intent.measure2, self._scalar(second_intent, window))
+            return Answer("list", [first.value, second.value])
         if shape == "compare_periods":
-            if not other:
-                return self._compare_members(intent, target)
-            return self._compare(intent, self.value(intent, window), self.value(intent, other[0]))
+            if other:
+                return self._compare(intent, self.value(intent, window), self.value(intent, other[0]))
+            shifts = [item for item in intent.filters if item.get("dim") == "shift"]
+            if len(target) == 1 and len(shifts) == 1:
+                return self._compare_shift(intent, window, shifts[0])
+            return self._compare_members(intent, target)
         if shape == "share_of_total":
             part, whole = self.value(intent, window), self.value(intent, window, skip_filters=True)
             if part is None or not whole:
                 raise Unsupported("empty share")
             return Answer("percent", _round2(100.0 * part / whole))
+        if shape == "trend_check":
+            # Each window must be strictly above the one before it; a window the question did not ask for would change it.
+            if other or intent.group_by or intent.top_k is not None:
+                raise Unsupported("trend check with a comparison, grouping or top_k")
+            if len(target) < 2:
+                raise Unsupported("trend check needs two windows")
+            values = [self.value(intent, w) for w in target]
+            if any(v is None for v in values):
+                raise Unsupported("empty period")
+            return Answer("boolean", all(later > earlier for earlier, later in zip(values, values[1:])))
         if shape in {"top_k", "argmax_entity", "argmax_date"}:
             rows = self._ranked(intent, window)
             if not rows:

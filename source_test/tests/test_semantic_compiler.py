@@ -693,3 +693,335 @@ def test_distinct_customers_scalar_with_threshold_still_raises() -> None:
     )
     with pytest.raises(Unsupported, match="threshold on shape scalar"):
         compiler.answer(intent, [MARCH])
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Changes to the filter, ranking, shift, age, delivery, trend, two-measure and weekday handling.
+# Each fixture is built by hand here; the expected values are worked in the comments.
+
+
+def build(schema: str, **tables: list[tuple]) -> sqlite3.Connection:
+    db = sqlite3.connect(":memory:")
+    db.executescript(schema)
+    for name, rows in tables.items():
+        if rows:
+            db.executemany(f"INSERT INTO {name} VALUES ({','.join('?' for _ in rows[0])})", rows)
+    db.commit()
+    return db
+
+
+DRUG_SCHEMA = """
+CREATE TABLE orders (order_id TEXT, date TEXT, ts TEXT, status TEXT, customer_key TEXT, customer_name TEXT,
+                     channel TEXT, revenue REAL, total_due REAL);
+CREATE TABLE lines (order_id TEXT, date TEXT, ts TEXT, status TEXT, customer_key TEXT, channel TEXT,
+                    product_key TEXT, product_name TEXT, qty REAL, qty_base REAL, amount REAL,
+                    prescription INTEGER, active_ingredient TEXT, product_kind TEXT);
+"""
+# order_id, date, ts, status, customer_key, customer_name, channel, revenue, total_due
+DRUG_ORDERS = [
+    ("B1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "Lan", "dine", 100, 100),
+    ("B2", "2026-03-03", "2026-03-03 15:00:00", "completed", "c2", "Minh", "take", 90, 90),
+    ("B3", "2026-03-04", "2026-03-04 10:00:00", "cancelled", "c1", "Lan", "dine", 500, 500),
+    ("B4", "2026-03-05", "2026-03-05 16:00:00", "completed", "c3", "Hoa", "dine", 40, 40),
+]
+# order_id, date, ts, status, customer_key, channel, product_key, product_name, qty, qty_base, amount,
+# prescription, active_ingredient, product_kind
+DRUG_LINES = [
+    ("B1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "dine", "amox", "Amoxi 500", 1, 1, 100,
+     1, "amoxicillin", "drug"),
+    ("B2", "2026-03-03", "2026-03-03 15:00:00", "completed", "c2", "take", "vitc", "Vitamin C", 2, 2, 60,
+     0, "ascorbic acid", "drug"),
+    ("B2", "2026-03-03", "2026-03-03 15:00:00", "completed", "c2", "take", "combo", "Combo", 1, 1, 30,
+     1, "amoxicillin + clavulanate", "drug"),
+    ("B3", "2026-03-04", "2026-03-04 10:00:00", "cancelled", "c1", "dine", "amox", "Amoxi 500", 1, 1, 500,
+     1, "amoxicillin", "drug"),
+    ("B4", "2026-03-05", "2026-03-05 16:00:00", "completed", "c3", "dine", "phone", "Phone X", 1, 1, 40,
+     None, None, "used"),
+]
+
+
+def drug_db(orders=DRUG_ORDERS, lines=DRUG_LINES) -> sqlite3.Connection:
+    return build(DRUG_SCHEMA, orders=orders, lines=lines)
+
+
+def by(dim: str, value: str, exclude: bool = False) -> dict:
+    item = {"dim": dim, "value": value}
+    if exclude:
+        item["exclude"] = True
+    return item
+
+
+# Change 1: prescription, active_ingredient and product_kind. Valid March lines: B1 100, B2 vitamin 60,
+# B2 combo 30, B4 phone 40. The cancelled B3 line is left out.
+def test_prescription_yes_no_and_exclusion() -> None:
+    compiler = Compiler(drug_db())
+    assert compiler.value(Intent(measure="revenue", filters=[by("prescription", "yes")]), MARCH) == 130
+    # "no" and "khong ke don" both mean 0: the vitamin line only.
+    assert compiler.value(Intent(measure="revenue", filters=[by("prescription", "no")]), MARCH) == 60
+    assert compiler.value(Intent(measure="revenue", filters=[by("prescription", "khong ke don")]), MARCH) == 60
+    # Excluding prescription yes keeps the vitamin line (0) and the phone (NULL): 60 + 40 = 100.
+    excluded = Intent(measure="revenue", filters=[by("prescription", "yes", exclude=True)])
+    assert compiler.value(excluded, MARCH) == 100
+
+
+def test_active_ingredient_is_an_exact_whole_string_match() -> None:
+    compiler = Compiler(drug_db())
+    # Only Amoxi 500 has "amoxicillin" on its own: 100 (the cancelled line is left out).
+    assert compiler.value(Intent(measure="revenue", filters=[by("active_ingredient", "Amoxicillin")]), MARCH) == 100
+    # The combination is its own kind of drug: "amoxicillin + clavulanate" is 30, not counted in "amoxicillin".
+    combo = Intent(measure="revenue", filters=[by("active_ingredient", "amoxicillin + clavulanate")])
+    assert compiler.value(combo, MARCH) == 30
+    # A partial ingredient name does not match, even though it is a substring of a stored one.
+    with pytest.raises(Unsupported, match="unresolved active_ingredient"):
+        compiler.value(Intent(measure="revenue", filters=[by("active_ingredient", "amoxi")]), MARCH)
+
+
+def test_product_kind_matches_normalized_value() -> None:
+    compiler = Compiler(drug_db())
+    # drug: vitamin 60 + amoxi 100 + combo 30 = 190; used: phone 40.
+    assert compiler.value(Intent(measure="revenue", filters=[by("product_kind", "DRUG")]), MARCH) == 190
+    assert compiler.value(Intent(measure="revenue", filters=[by("product_kind", "used")]), MARCH) == 40
+    with pytest.raises(Unsupported, match="unresolved product_kind"):
+        compiler.value(Intent(measure="revenue", filters=[by("product_kind", "new")]), MARCH)
+
+
+def test_drug_dimensions_raise_when_the_columns_are_absent() -> None:
+    # Timed fixture: lines carry no prescription, active_ingredient or product_kind column. Nothing else changes.
+    compiler = Compiler(make_timed_db())
+    for dim, value in [("prescription", "yes"), ("active_ingredient", "x"), ("product_kind", "x")]:
+        with pytest.raises(Unsupported, match=f"{dim} unavailable"):
+            compiler.value(Intent(measure="revenue", filters=[by(dim, value)]), MARCH)
+    assert compiler.value(Intent(measure="revenue"), MARCH) == 350
+
+
+# Change 2: generic words are removed at the start and end before an exact match; partial matches are kept only
+# when they name exactly one stored value; customer and customer_group never match in part.
+def test_generic_word_is_removed_before_an_exact_match() -> None:
+    compiler = Compiler(drug_db())
+    # "san pham" is generic: "san pham vitamin c" becomes "vitamin c", which is the stored product: 60.
+    assert compiler.value(Intent(measure="revenue", filters=[by("product", "San pham Vitamin C")]), MARCH) == 60
+    # "khach" is generic: "khach Lan" becomes "lan", the name of customer c1: valid B1 100 (B3 is cancelled).
+    assert compiler.value(Intent(measure="revenue", filters=[by("customer", "khach Lan")]), MARCH) == 100
+
+
+def test_partial_match_only_when_it_yields_one_value() -> None:
+    compiler = Compiler(drug_db())
+    # "Vitamin" is part of one product only: 60.
+    assert compiler.value(Intent(measure="revenue", filters=[by("product", "Vitamin")]), MARCH) == 60
+    # "di" is part of the channel dine only: valid dine revenue 100 + 40 = 140.
+    assert compiler.value(Intent(measure="revenue", filters=[by("channel", "di")]), MARCH) == 140
+    # "o" is part of three products: no single match, so no answer.
+    with pytest.raises(Unsupported, match="unresolved product"):
+        compiler.value(Intent(measure="revenue", filters=[by("product", "o")]), MARCH)
+
+
+def test_customer_never_matches_in_part() -> None:
+    compiler = Compiler(drug_db())
+    # "La" is part of the name Lan, but a customer named in part is another customer, so it does not resolve.
+    with pytest.raises(Unsupported, match="unresolved customer"):
+        compiler.value(Intent(measure="revenue", filters=[by("customer", "La")]), MARCH)
+
+
+# Change 3: a customer filter matches the code or the stored name. One name over two codes is ambiguous.
+def test_customer_name_mapping_to_two_codes_raises() -> None:
+    orders = DRUG_ORDERS + [("B5", "2026-03-06", "2026-03-06 11:00:00", "completed", "c9", "Lan", "dine", 25, 25)]
+    compiler = Compiler(drug_db(orders=orders, lines=DRUG_LINES))
+    # "Lan" is c1 and c9: two codes with one name, which rulebook section 3 counts as two customers.
+    with pytest.raises(Unsupported, match="ambiguous customer name"):
+        compiler.value(Intent(measure="revenue", filters=[by("customer", "Lan")]), MARCH)
+    # The code itself is unambiguous: c9 is 25.
+    assert compiler.value(Intent(measure="revenue", filters=[by("customer", "c9")]), MARCH) == 25
+
+
+def test_customer_matches_stored_name_when_name_is_unique() -> None:
+    compiler = Compiler(drug_db())
+    # Minh is customer c2 (name only): valid B2 revenue 90.
+    assert compiler.value(Intent(measure="revenue", filters=[by("customer", "minh")]), MARCH) == 90
+    assert compiler.value(Intent(measure="revenue", filters=[by("customer", "c3")]), MARCH) == 40
+
+
+# Change 4: suppliers ranked by import money (per receipt) and by number of receipts. Timed purchases:
+# Sun Co R1 50 + R2 44 = 94 with 2 receipts; Bean Ltd R3 40 (amount missing, so 5 * 8) with 1 receipt.
+# R4 is cancelled and R5 is in February.
+def test_supplier_ranking_by_purchase_amount_and_receipt_count() -> None:
+    compiler = Compiler(make_timed_db())
+    top = Intent(measure="purchase_amount", shape="top_k", group_by="supplier", top_k=2)
+    assert compiler.answer(top, [MARCH]) == Answer("list", ["Sun Co", "Bean Ltd"])
+    most_receipts = Intent(measure="purchase_receipt_count", shape="argmax_entity", group_by="supplier")
+    assert compiler.answer(most_receipts, [MARCH]) == Answer("string", "Sun Co")
+    by_money = Intent(measure="purchase_amount", shape="argmax_entity", group_by="supplier")
+    assert compiler.answer(by_money, [MARCH]) == Answer("string", "Sun Co")
+
+
+def test_supplier_ranking_uses_id_when_no_receipt_has_a_name() -> None:
+    rows = [(p[0], p[1], None, p[3], *p[4:]) for p in T_PURCHASES]
+    compiler = Compiler(make_timed_db(purchases=rows))
+    # S1 is 50 + 44 = 94, S2 is 40.
+    assert compiler.answer(Intent(measure="purchase_amount", shape="argmax_entity", group_by="supplier"), [MARCH]) == Answer("string", "S1")
+
+
+def test_supplier_ranking_rejects_a_product_filter() -> None:
+    compiler = Compiler(make_timed_db())
+    intent = Intent(measure="purchase_receipt_count", shape="argmax_entity", group_by="supplier", filters=[product("tea")])
+    with pytest.raises(Unsupported, match="purchase amount with filter product"):
+        compiler.answer(intent, [MARCH])
+
+
+# Change 5: one named shift is compared with the other shift, the morning shift being the baseline.
+# Morning 185, afternoon 135: (135 - 185) / 185 * 100 = -27.027 -> -27.03; as a difference, 135 - 185 = -50.
+def test_single_named_shift_compares_afternoon_over_morning() -> None:
+    compiler = Compiler(make_timed_db())
+    afternoon = Intent(measure="revenue", shape="compare_periods", filters=[shift("chiều")])
+    assert compiler.answer(afternoon, [MARCH]) == Answer("percent", -27.03)
+    morning = Intent(measure="revenue", shape="compare_periods", filters=[shift("sáng")])
+    assert compiler.answer(morning, [MARCH]) == Answer("percent", -27.03)
+    as_value = Intent(measure="revenue", shape="compare_periods", compare_as="value", filters=[shift("chiều")])
+    assert compiler.answer(as_value, [MARCH]) == Answer("number", -50)
+
+
+def test_single_shift_exclusion_has_no_comparison() -> None:
+    compiler = Compiler(make_timed_db())
+    intent = Intent(measure="revenue", shape="compare_periods", filters=[{"dim": "shift", "value": "sáng", "exclude": True}])
+    with pytest.raises(Unsupported):
+        compiler.answer(intent, [MARCH])
+
+
+# Change 6: an age on a non-debt measure is ignored. Valid March revenue is 350 and order count is 8.
+def test_age_on_non_debt_measure_is_ignored_in_answers() -> None:
+    compiler = Compiler(make_timed_db())
+    assert compiler.answer(Intent(measure="revenue", age_days=7), [MARCH]) == Answer("number", 350)
+    assert compiler.answer(Intent(measure="order_count", age_days=7), [MARCH]) == Answer("number", 8)
+
+
+# Change 7: delivery trips are the distinct (order, trip) pairs dated in the window, whatever the order status.
+# March: (D1, t1), (D1, t2), (D2, t1), (D4, t1) = 4. February: (D3, t1) = 1. The second D1 line repeats (D1, t1).
+DELIVERY_SCHEMA = """
+CREATE TABLE orders (order_id TEXT, date TEXT, status TEXT, revenue REAL);
+CREATE TABLE lines (order_id TEXT, date TEXT, status TEXT, amount REAL);
+CREATE TABLE deliveries (order_id TEXT, date TEXT, trip TEXT, qty REAL);
+"""
+DELIVERY_ROWS = [
+    ("D1", "2026-03-02", "t1", 1), ("D1", "2026-03-02", "t1", 2), ("D1", "2026-03-09", "t2", 1),
+    ("D2", "2026-03-05", "t1", 3), ("D3", "2026-02-20", "t1", 1), ("D4", "2026-03-31", "t1", 1),
+]
+
+
+def test_delivery_trip_count_counts_distinct_order_and_trip() -> None:
+    compiler = Compiler(build(DELIVERY_SCHEMA, deliveries=DELIVERY_ROWS))
+    assert compiler.answer(Intent(measure="delivery_trip_count"), [MARCH]) == Answer("number", 4)
+    assert compiler.answer(Intent(measure="delivery_trip_count"), [FEBRUARY]) == Answer("number", 1)
+
+
+def test_delivery_trip_count_needs_rows_and_no_filter() -> None:
+    empty = Compiler(build(DELIVERY_SCHEMA))
+    with pytest.raises(Unsupported, match="no deliveries"):
+        empty.value(Intent(measure="delivery_trip_count"), MARCH)
+    compiler = Compiler(build(DELIVERY_SCHEMA, deliveries=DELIVERY_ROWS))
+    with pytest.raises(Unsupported, match="delivery trips with a filter"):
+        compiler.value(Intent(measure="delivery_trip_count", filters=[product("tea")]), MARCH)
+    with pytest.raises(Unsupported, match="no deliveries table"):
+        Compiler(build("CREATE TABLE orders (order_id TEXT, date TEXT, status TEXT, revenue REAL);"
+                       "CREATE TABLE lines (order_id TEXT, date TEXT, status TEXT, amount REAL);")).value(
+            Intent(measure="delivery_trip_count"), MARCH)
+
+
+# Change 8: strictly increasing across the windows given, in order. Totals: January 50, February 100, March 150.
+TREND_SCHEMA = """
+CREATE TABLE orders (order_id TEXT, date TEXT, status TEXT, revenue REAL);
+CREATE TABLE lines (order_id TEXT, date TEXT, status TEXT, amount REAL);
+"""
+TREND_ORDERS = [
+    ("J1", "2026-01-10", "completed", 50), ("F1", "2026-02-10", "completed", 100),
+    ("M1", "2026-03-10", "completed", 100), ("M2", "2026-03-20", "completed", 50),
+]
+JANUARY = TimeWindow(start=date(2026, 1, 1), end_exclusive=date(2026, 2, 1))
+
+
+def test_trend_check_is_strict_and_in_window_order() -> None:
+    compiler = Compiler(build(TREND_SCHEMA, orders=TREND_ORDERS))
+    trend = Intent(measure="revenue", shape="trend_check")
+    assert compiler.answer(trend, [JANUARY, FEBRUARY, MARCH]) == Answer("boolean", True)
+    # Equal neighbours are not an increase.
+    assert compiler.answer(trend, [FEBRUARY, FEBRUARY]) == Answer("boolean", False)
+    assert compiler.answer(trend, [JANUARY, FEBRUARY, MARCH, MARCH]) == Answer("boolean", False)
+    # Reversed order is a fall.
+    assert compiler.answer(trend, [MARCH, FEBRUARY, JANUARY]) == Answer("boolean", False)
+
+
+def test_trend_check_with_an_empty_window_raises() -> None:
+    compiler = Compiler(build(TREND_SCHEMA, orders=TREND_ORDERS))
+    trend = Intent(measure="revenue", shape="trend_check")
+    # April has no orders, so its value is None and no yes or no can be given.
+    with pytest.raises(Unsupported, match="empty period"):
+        compiler.answer(trend, [JANUARY, APRIL])
+    with pytest.raises(Unsupported, match="two windows"):
+        compiler.answer(trend, [JANUARY])
+
+
+# Change 9: a second measure on a scalar gives a list in the order asked. Timed March: revenue 350, order count 8,
+# store-wide purchase amount 134 (R1 50, R2 44, R3 40).
+def test_second_measure_gives_a_list() -> None:
+    compiler = Compiler(make_timed_db())
+    assert compiler.answer(Intent(measure="revenue", measure2="order_count"), [MARCH]) == Answer("list", [350, 8])
+    assert compiler.answer(Intent(measure="revenue", measure2="purchase_amount"), [MARCH]) == Answer("list", [350, 134])
+
+
+def test_second_measure_on_another_shape_raises() -> None:
+    compiler = Compiler(make_timed_db())
+    intent = Intent(measure="revenue", measure2="order_count", shape="top_k", group_by="customer", top_k=2)
+    with pytest.raises(Unsupported, match="second measure"):
+        compiler.answer(intent, [MARCH])
+
+
+def test_location_is_not_silently_dropped() -> None:
+    compiler = Compiler(make_timed_db())
+    with pytest.raises(Unsupported, match="location"):
+        compiler.answer(Intent(measure="revenue", location="Nguyen Hue"), [MARCH])
+
+
+# Change 11: weekday filter. March 2026 has five Mondays (2, 9, 16, 23, 30) and five Tuesdays.
+# Valid March orders on Monday: A1 100, A2 50, A3 40, so 3 orders and 190. On Tuesday: A4 70, A5 30, 2 orders, 100.
+# Valid March total is 350, so excluding Monday leaves 160.
+def test_weekday_filter_by_name_and_number() -> None:
+    compiler = Compiler(make_timed_db())
+    monday = [by("weekday", "thu 2")]
+    assert compiler.value(Intent(measure="revenue", filters=monday), MARCH) == 190
+    assert compiler.value(Intent(measure="revenue", filters=[by("weekday", "2")]), MARCH) == 190
+    assert compiler.value(Intent(measure="revenue", filters=[by("weekday", "Monday")]), MARCH) == 190
+    assert compiler.value(Intent(measure="revenue", filters=[by("weekday", "thu 3")]), MARCH) == 100
+    # Sunday (chu nhat): A12 15.
+    assert compiler.value(Intent(measure="revenue", filters=[by("weekday", "chu nhat")]), MARCH) == 15
+
+
+def test_weekday_exclusion_and_unknown_weekday() -> None:
+    compiler = Compiler(make_timed_db())
+    assert compiler.value(Intent(measure="revenue", filters=[by("weekday", "thu 2", exclude=True)]), MARCH) == 160
+    with pytest.raises(Unsupported, match="unknown weekday"):
+        compiler.value(Intent(measure="revenue", filters=[by("weekday", "thu 9")]), MARCH)
+
+
+def test_weekday_average_divides_by_the_days_of_that_weekday() -> None:
+    compiler = Compiler(make_timed_db())
+    # Mondays in March: 5, including days with no order. Order count 3 / 5 = 0.6; revenue 190 / 5 = 38.
+    average_orders = Intent(measure="order_count", shape="scalar", filters=[by("weekday", "thu 2")],
+                            compare_as="average_per_weekday")
+    assert compiler.answer(average_orders, [MARCH]) == Answer("number", 0.6)
+    average_revenue = Intent(measure="revenue", shape="scalar", filters=[by("weekday", "thu 2")],
+                             compare_as="average_per_weekday")
+    assert compiler.answer(average_revenue, [MARCH]) == Answer("number", 38)
+    # Tuesdays in March: 5. Revenue 100 / 5 = 20.
+    tuesday = Intent(measure="revenue", shape="scalar", filters=[by("weekday", "thu 3")],
+                     compare_as="average_per_weekday")
+    assert compiler.answer(tuesday, [MARCH]) == Answer("number", 20)
+
+
+def test_weekday_without_average_only_filters() -> None:
+    compiler = Compiler(make_timed_db())
+    # The average is asked only with average_per_weekday; a plain weekday question keeps the total of that weekday.
+    plain = Intent(measure="revenue", shape="scalar", filters=[by("weekday", "thu 2")])
+    assert compiler.answer(plain, [MARCH]) == Answer("number", 190)
+    # Average is not defined for other measures here, so the weekday only filters.
+    other = Intent(measure="qty_base_sold", shape="scalar", filters=[by("weekday", "thu 2")],
+                   compare_as="average_per_weekday")
+    # Valid March Monday lines in base units: A1 2, A2 tea 1, A2 cake 3, A3 1 (no qty_base, so qty). Total 7.
+    assert compiler.answer(other, [MARCH]) == Answer("number", 7)
