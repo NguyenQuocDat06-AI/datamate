@@ -1,0 +1,19 @@
+{
+  "answer_types": {
+    "abstain": 270,
+    "date": 39,
+    "list": 33,
+    "number": 517,
+    "percent": 124,
+    "string": 17
+  },
+  "elapsed_seconds": 15649.46559513826,
+  "model_calls": 970,
+  "model_tokens": 0,
+  "note": "Runtime summary only. PA requires independent evaluation against references.",
+  "output": "/home/ubuntu/datamate/source_test/artifacts/kaggle_12h_eval_1000/predictions.jsonl",
+  "p50_ms": 55558.79547121003,
+  "p95_ms": 120299.73120521754,
+  "preparation_errors": {},
+  "questions": 1000
+}

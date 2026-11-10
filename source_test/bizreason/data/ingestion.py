@@ -1,0 +1,726 @@
+from __future__ import annotations
+
+import itertools
+import re
+import sqlite3
+from collections import Counter
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from bizreason.contracts import BusinessContext, ColumnMeta, Diagnostic, SourceRef, TableMeta
+from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
+from bizreason.data.layout import has_record_evidence, is_note, is_summary
+from bizreason.data.readers import RawSheet, read_sheets
+from bizreason.data.identities import (
+    canonicalize_products,
+    canonicalize_customers,
+    clean_text,
+    refresh_examples,
+    is_retail_customer,
+)
+from bizreason.data.notes_facets import derive_status_from_notes
+from bizreason.data.eligibility import propagate_order_returns
+from bizreason.data.ledger_schema import contextual_roles
+from bizreason.data.vehicles import derive_vehicle_columns
+from bizreason.data.schema import (
+    DATE_ROLES,
+    NUMERIC_ROLES,
+    MONEY_ROLES,
+    column_descriptions,
+    described_role,
+    infer_grain,
+    infer_role,
+    sheet_year,
+)
+from bizreason.rules import RuleRegistry
+from bizreason.utils import (
+    atomic_json,
+    digest,
+    dumps,
+    file_hash,
+    identifier,
+    normalize_lookup,
+    quote_identifier,
+    writable_path,
+)
+
+PARSER_VERSION = "1.4.0"
+SUPPORTED_SUFFIXES = {".csv", ".xlsx", ".sqlite", ".sqlite3", ".db"}
+GROUP_ROLES = {
+    "order_id",
+    "ordered_at",
+    "status",
+    "customer_id",
+    "customer_name",
+    "payment_method",
+    "total_due",
+}
+
+
+def header_score(row: tuple[Any, ...], readme: str) -> float:
+    cells = [str(cell).strip() for cell in row if not blank(cell)]
+    if len(cells) < 2:
+        return -1
+    labels = sum(infer_role(cell, readme) is not None for cell in cells) / len(cells)
+    texts = sum(isinstance(cell, str) for cell in row if not blank(cell)) / len(cells)
+    unique = len(set(cells)) / len(cells)
+    long = sum(len(cell) > 80 for cell in cells) / len(cells)
+    return 4 * labels + texts + unique - 2 * long
+
+
+def unique_columns(headers: tuple[Any, ...]) -> list[str]:
+    names = []
+    used: set[str] = set()
+    for index, header in enumerate(headers, 1):
+        base = identifier(str(header)) if not blank(header) else f"unnamed_{index}"
+        name = base
+        suffix = 2
+        while name in used or name.startswith("__"):
+            name = f"{base}_{suffix}"
+            suffix += 1
+        names.append(name)
+        used.add(name)
+    return names
+
+
+def infer_locale(values: list[Any], readme: str, *, currency: bool = False) -> str:
+    text = normalize_lookup(readme)
+    if "dau phay thap phan" in text or "decimal comma" in text:
+        return "vi"
+    if "decimal point" in text or "dau cham thap phan" in text:
+        return "en"
+    strings = [str(value).strip() for value in values if isinstance(value, str)]
+    # Mixed native/exported values can establish the column locale without guessing
+    # from one ambiguous cell: e.g. native 45000 occurs alongside text "45,000".
+    anchors = {
+        Decimal(str(value))
+        for value in values
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    anchors.update(Decimal(value) for value in strings if re.fullmatch(r"-?\d+", value))
+    if currency:
+        for value in strings:
+            if re.search(r"(?:k|tr|triệu|trieu|vnd|vnđ|đ|₫)$", value, re.IGNORECASE):
+                parsed = parse_number(value, unit="VND")
+                if parsed.status == ParseStatus.OK:
+                    anchors.add(parsed.value)
+    votes = {}
+    for separator, locale in [(".", "vi"), (",", "en")]:
+        grouped = [
+            value
+            for value in strings
+            if re.fullmatch(r"-?\d{1,3}(?:" + re.escape(separator) + r"\d{3})+", value)
+        ]
+        matches = sum(Decimal(value.replace(separator, "")) in anchors for value in grouped)
+        if matches >= 3 and matches >= len(grouped) * 0.5:
+            votes[locale] = matches
+    if len(votes) == 1:
+        return next(iter(votes))
+    if any(re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+,\d+", value) for value in strings):
+        return "vi"
+    if any(re.fullmatch(r"-?\d{1,3}(?:,\d{3})+\.\d+", value) for value in strings):
+        return "en"
+    for separator, locale in [(".", "vi"), (",", "en")]:
+        if any(
+            re.fullmatch(r"-?\d{1,3}(?:" + re.escape(separator) + r"\d{3}){2,}", value)
+            for value in strings
+        ):
+            return locale
+        # Plain integers such as 500 do not contradict the thousands spelling
+        # 4,400. Compare separator conventions among formatted values only.
+        numeric_strings = [
+            value for value in strings
+            if re.fullmatch(r"-?[\d.,]+", value) and ("," in value or "." in value)
+        ]
+        grouped = [
+            value
+            for value in numeric_strings
+            if re.fullmatch(r"-?\d{1,3}(?:" + re.escape(separator) + r"\d{3})+", value)
+        ]
+        if (
+            currency
+            and len(grouped) >= 20
+            and len(set(grouped)) >= 4
+            and len(grouped) >= 0.95 * len(numeric_strings)
+        ):
+            return locale
+    return "unknown"
+
+
+def _stored_number(number: Decimal) -> int | str:
+    if number == number.to_integral_value() and -(2**63) <= number < 2**63:
+        return int(number)
+    return str(number)  # Fractional quantities stay exact; SQL decimal helpers are available.
+
+
+class BusinessBuilder:
+    def __init__(
+        self,
+        cache_root: Path,
+        *,
+        rule_hash: str,
+        inheritance_allowed: bool = True,
+        rules: RuleRegistry | None = None,
+    ):
+        self.cache_root = writable_path(cache_root)
+        self.rule_hash = rule_hash
+        self.inheritance_allowed = inheritance_allowed
+        self.rules = rules
+        package = Path(__file__).resolve().parents[1]
+        implementation_files = sorted((package / "data").glob("*.py")) + [
+            package / "contracts.py",
+            package / "rules.py",
+        ]
+        self.implementation_hash = digest(
+            {path.relative_to(package).as_posix(): file_hash(path) for path in implementation_files}
+        )
+
+    def prepare(self, business_dir: Path) -> BusinessContext:
+        business_dir = business_dir.resolve()
+        if not business_dir.is_dir():
+            raise FileNotFoundError("Business directory does not exist")
+        readme_path = business_dir / "README.md"
+        readme = readme_path.read_text(encoding="utf-8-sig") if readme_path.exists() else ""
+        paths = sorted(
+            path
+            for path in business_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+        )
+        manifest = {path.relative_to(business_dir).as_posix(): file_hash(path) for path in paths}
+        if readme_path.exists():
+            manifest["README.md"] = file_hash(readme_path)
+        revision = digest(
+            {
+                "files": manifest,
+                "rule_hash": self.rule_hash,
+                "parser": PARSER_VERSION,
+                "inheritance": self.inheritance_allowed,
+                "derive_units": bool(self.rules),
+                "implementation": self.implementation_hash,
+            }
+        )
+        directory = writable_path(self.cache_root / identifier(business_dir.name) / revision[:20])
+        metadata = directory / "catalog.json"
+        database = directory / "business.sqlite"
+        if metadata.exists() and database.exists():
+            context = BusinessContext.model_validate_json(metadata.read_text(encoding="utf-8"))
+            if context.revision == revision and context.database == database:
+                return context
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / "business.building.sqlite"
+        temporary.unlink(missing_ok=True)
+        diagnostics: list[Diagnostic] = []
+        tables = []
+        connection = sqlite3.connect(temporary)
+        try:
+            for path in paths:
+                relative = path.relative_to(business_dir).as_posix()
+                try:
+                    for sheet in read_sheets(path):
+                        tables.extend(
+                            self._ingest_sheet(
+                                connection, sheet, relative, manifest[relative], readme, diagnostics
+                            )
+                        )
+                except Exception as error:
+                    diagnostics.append(
+                        Diagnostic(
+                            code="SOURCE_READ_ERROR",
+                            message=f"Reader failed: {type(error).__name__}",
+                            source=SourceRef(path=relative, sha256=manifest[relative]),
+                            severity="error",
+                        )
+                    )
+            from bizreason.data.catalog import discover_joins
+
+            aliases = canonicalize_products(connection, tables)
+            canonicalize_customers(connection, tables)
+            tables = derive_vehicle_columns(connection, tables)
+            tables = derive_status_from_notes(connection, tables, self.rules)
+            propagate_order_returns(connection, tables, readme)
+            tables = refresh_examples(connection, tables)
+            atomic_json(directory / "product_aliases.json", aliases)
+
+            if self.rules:
+                from bizreason.data.normalization import derive_base_quantities
+
+                tables, conversion_diagnostics = derive_base_quantities(
+                    connection, tables, self.rules
+                )
+                diagnostics.extend(conversion_diagnostics)
+            joins = discover_joins(connection, tables)
+            for edge in joins:
+                for k in edge.keys:
+                    if len(k) >= 2:
+                        l_col, r_col = k[0], k[1]
+                        try:
+                            connection.execute(
+                                f"CREATE INDEX IF NOT EXISTS {quote_identifier('idx_jn_' + edge.left + '_' + l_col)[:60]} ON {quote_identifier(edge.left)} ({quote_identifier(l_col)})"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            connection.execute(
+                                f"CREATE INDEX IF NOT EXISTS {quote_identifier('idx_jn_' + edge.right + '_' + r_col)[:60]} ON {quote_identifier(edge.right)} ({quote_identifier(r_col)})"
+                            )
+                        except Exception:
+                            pass
+            connection.commit()
+        finally:
+            connection.close()
+        temporary.replace(database)
+        match = re.search(
+            r"(?:đến hết|tới hết|đến ngày)\s+(\d{1,2}/\d{1,2}/\d{4})", readme, re.IGNORECASE
+        )
+        declared_end = None
+        if match:
+            parsed = parse_date(match.group(1))
+            if parsed.status == ParseStatus.OK:
+                declared_end = date.fromisoformat(parsed.value)
+        start_match = re.search(r"dữ liệu có từ\s+(\d{1,2}/\d{1,2}/\d{4})", readme, re.IGNORECASE)
+        declared_start = None
+        if start_match:
+            parsed = parse_date(start_match.group(1))
+            if parsed.status == ParseStatus.OK:
+                declared_start = date.fromisoformat(parsed.value)
+        context = BusinessContext(
+            business_id=business_dir.name,
+            revision=revision,
+            database=database,
+            readme=readme,
+            tables=tables,
+            joins=joins,
+            diagnostics=diagnostics,
+            manifest=manifest,
+            schema_complete=not any(d.code in {"SOURCE_READ_ERROR", "UNRESOLVED_HEADER"} for d in diagnostics),
+            declared_end=declared_end,
+            declared_start=declared_start,
+        )
+        atomic_json(metadata, context)
+        atomic_json(
+            directory / "business_manifest.json",
+            {
+                "revision": revision,
+                "parser": PARSER_VERSION,
+                "rule_hash": self.rule_hash,
+                "files": manifest,
+            },
+        )
+        return context
+
+    def _ingest_sheet(
+        self,
+        connection: sqlite3.Connection,
+        sheet: RawSheet,
+        relative: str,
+        source_hash: str,
+        readme: str,
+        diagnostics: list[Diagnostic],
+    ) -> list[TableMeta]:
+        prefix = list(itertools.islice(sheet.rows, 40))
+        if not prefix:
+            return []
+        if sheet.declared_columns:
+            headers = tuple(sheet.declared_columns)
+            header_row = 0
+            rows = enumerate(itertools.chain(prefix, sheet.rows), 1)
+        else:
+            scored = [(header_score(row, readme), index) for index, row in enumerate(prefix)]
+            score, position = max(scored, key=lambda item: (item[0], -item[1]))
+            if score < 1.5:
+                diagnostics.append(
+                    Diagnostic(
+                        code="UNRESOLVED_HEADER",
+                        message="Insufficient header evidence",
+                        source=SourceRef(path=relative, table=sheet.name),
+                        severity="error",
+                    )
+                )
+                return []
+            header_row = position + 1
+            headers = prefix[position]
+            rows = enumerate(itertools.chain(prefix[position + 1 :], sheet.rows), header_row + 1)
+        # Split later regions with a different, strongly recognized header.
+        regions: list[tuple[tuple[Any, ...], int, list[tuple[int, tuple[Any, ...]]]]] = []
+        buffered: list[tuple[int, tuple[Any, ...]]] = []
+        current_headers, current_header_row = headers, header_row
+        for row_number, row in rows:
+            known = sum(
+                infer_role(str(cell), readme) is not None for cell in row if not blank(cell)
+            )
+            if (
+                known >= 2
+                and header_score(row, readme) >= 4.0
+                and tuple(row) != tuple(current_headers)
+            ):
+                regions.append((current_headers, current_header_row, buffered))
+                current_headers, current_header_row, buffered = row, row_number, []
+            else:
+                buffered.append((row_number, row))
+        regions.append((current_headers, current_header_row, buffered))
+        return [
+            self._write_region(
+                connection,
+                sheet,
+                relative,
+                source_hash,
+                readme,
+                region_headers,
+                region_header_row,
+                region_rows,
+                index,
+                diagnostics,
+            )
+            for index, (region_headers, region_header_row, region_rows) in enumerate(regions)
+        ]
+
+    def _write_region(
+        self,
+        connection: sqlite3.Connection,
+        sheet: RawSheet,
+        relative: str,
+        source_hash: str,
+        readme: str,
+        headers: tuple[Any, ...],
+        header_row: int,
+        rows: list[tuple[int, tuple[Any, ...]]],
+        region_index: int,
+        diagnostics: list[Diagnostic],
+    ) -> TableMeta:
+        width = max(
+            (index + 1 for index, value in enumerate(headers) if not blank(value)),
+            default=len(headers),
+        )
+        headers = headers[:width]
+        names = unique_columns(headers)
+        descriptions = column_descriptions(readme, sheet.path.name, sheet.name)
+        table_label = sheet.path.stem + " " + sheet.name
+        roles = [
+            described_role(str(header), descriptions.get(normalize_lookup(header), ""), table_label)
+            or infer_role(str(header), readme)
+            for header in headers
+        ]
+        roles = contextual_roles(headers, roles, descriptions, readme)
+        clock_columns = [i for i, header in enumerate(headers) if normalize_lookup(header) in
+                         {"gio tao don", "gio ban", "thoigianlap", "thoi gian lap", "ngay gio"}]
+        if len(clock_columns) == 1 and roles[clock_columns[0]] == "ordered_at":
+            roles = ["ordered_date" if role == "ordered_at" and i != clock_columns[0] else role
+                     for i, role in enumerate(roles)]
+        for index, header in enumerate(headers):
+            normalized = normalize_lookup(header)
+            if normalized == "ngay mua" and "chi phi" in normalize_lookup(table_label):
+                roles[index] = "expense_at"
+            if normalized in {"ten goi", "tengoi"}:
+                label = normalize_lookup(table_label)
+                if "san pham" in label or "san_pham" in table_label:
+                    roles[index] = "product_name"
+                elif "khach hang" in label or "khach_hang" in table_label:
+                    roles[index] = "customer_name"
+            if normalized in {"tinhtrang", "tinh trang"} and any(
+                role in roles for role in ["order_id", "purchase_id"]
+            ):
+                roles[index] = "status"
+        if "order_id" not in roles and "purchase_id" not in roles:
+            roles = [
+                (
+                    None
+                    if role == "status"
+                    and not normalize_lookup(
+                        descriptions.get(normalize_lookup(header), "")
+                    ).startswith("trang thai don")
+                    else role
+                )
+                for header, role in zip(headers, roles)
+            ]
+        grain = infer_grain(set(filter(None, roles)), sheet.name, readme)
+        name = (
+            identifier(f"{sheet.path.stem}_{sheet.name}")[:65]
+            + "_"
+            + digest([relative, sheet.name, region_index])[:8]
+        )
+        source = SourceRef(path=relative, table=sheet.name, row=header_row, sha256=source_hash)
+        q = quote_identifier
+        definitions = ", ".join(f"{q(column)}" for column in names)
+        connection.execute(
+            f"CREATE TABLE {q(name)} ({definitions}, __source_row INTEGER, __raw_json TEXT)"
+        )
+        placeholders = ",".join("?" for _ in range(width + 2))
+        insert = f"INSERT INTO {q(name)} VALUES ({placeholders})"
+        locales = [
+            infer_locale(
+                [row[index] for _, row in rows[:2000] if len(row) > index],
+                readme,
+                currency=roles[index]
+                in MONEY_ROLES,
+            )
+            for index in range(width)
+        ]
+        nulls: Counter[int] = Counter()
+        errors: Counter[int] = Counter()
+        types: dict[int, set[str]] = {index: set() for index in range(width)}
+        examples: dict[int, list[Any]] = {index: [] for index in range(width)}
+        coverage: dict[str, list[str]] = {}
+        seen: set[str] = set()
+        current_group: dict[int, Any] | None = None
+        order_index = roles.index("order_id") if "order_id" in roles else None
+        inherited_fields = [
+            index
+            for index, role in enumerate(roles)
+            if role in GROUP_ROLES or normalize_lookup(headers[index]) == "ghi chu"
+        ]
+        raw_count, excluded, duplicate, kept = len(rows), 0, 0, 0
+        year = sheet_year(sheet.path.stem + " " + sheet.name)
+        batch = []
+        last_record = max(
+            (
+                index
+                for index, (_, raw) in enumerate(rows)
+                if has_record_evidence(list(raw[:width]) + [None] * max(0, width - len(raw)), roles)
+            ),
+            default=-1,
+        )
+        for position, (row_number, raw_row) in enumerate(rows):
+            row = list(raw_row[:width]) + [None] * max(0, width - len(raw_row))
+            if all(blank(cell) for cell in row) or tuple(row) == tuple(headers):
+                excluded += 1
+                current_group = None
+                continue
+            kind = (
+                "summary"
+                if is_summary(
+                    row, roles, after_last_record=last_record >= 0 and position > last_record
+                )
+                else (
+                    "note"
+                    if is_note(row, roles)
+                    else None
+                )
+            )
+            if kind:
+                excluded += 1
+                current_group = None
+                diagnostics.append(
+                    Diagnostic(
+                        code=f"EXCLUDED_{kind.upper()}_ROW",
+                        message=f"Confirmed export {kind} outside transaction rows",
+                        source=SourceRef(path=relative, table=sheet.name, row=row_number),
+                        severity="info",
+                    )
+                )
+                continue
+            if grain == "order_line" and order_index is not None:
+                if not blank(row[order_index]):
+                    row[order_index] = clean_text(row[order_index])
+                key = row[order_index]
+                if not blank(key):
+                    if current_group is None or key != current_group[order_index]:
+                        current_group = {index: row[index] for index in inherited_fields}
+                elif current_group is None or not self.inheritance_allowed:
+                    diagnostics.append(
+                        Diagnostic(
+                            code="ORPHAN_CONTINUATION",
+                            message="Order detail without a documented parent group",
+                            source=SourceRef(path=relative, table=sheet.name, row=row_number),
+                            severity="error",
+                        )
+                    )
+                if current_group is not None and self.inheritance_allowed:
+                    for index in inherited_fields:
+                        if blank(row[index]):
+                            row[index] = current_group.get(index)
+            # A repeated exported header is the same order too. Independent
+            # payment/ledger events must retain identical rows as separate events.
+            if grain in {"order_line", "order_header"} and order_index is not None and not blank(row[order_index]):
+                row[order_index] = clean_text(row[order_index])
+                fingerprint = digest(row)  # Includes identity, scope and every source cell.
+                if fingerprint in seen:
+                    duplicate += 1
+                    if grain == "order_header":
+                        diagnostics.append(Diagnostic(
+                            code="DUPLICATE_ORDER_ROW", severity="info",
+                            message="Exact repeated order header; counted once",
+                            source=SourceRef(path=relative, table=sheet.name, row=row_number, sha256=source_hash),
+                        ))
+                    continue
+                seen.add(fingerprint)
+            parsed = []
+            for index, (value, role) in enumerate(zip(row, roles)):
+                result = None
+                if role in NUMERIC_ROLES:
+                    result = parse_number(
+                        value,
+                        locale=locales[index],
+                        unit=(
+                            "VND"
+                            if role
+                            in MONEY_ROLES
+                            else (
+                                str(row[roles.index("unit")])
+                                if role == "qty_sale"
+                                and "unit" in roles
+                                and not blank(row[roles.index("unit")])
+                                else None
+                            )
+                        ),
+                    )
+                elif role in DATE_ROLES:
+                    result = parse_date(value, year=year)
+                elif role == "status":
+                    purchase_domain = (
+                        grain in {"purchase_header", "purchase_line"}
+                        or "purchased_at" in roles
+                        or "nhaphang" in normalize_lookup(table_label).replace(" ", "")
+                    )
+                    result = parse_status(value, domain="purchase" if purchase_domain else "order")
+                if result:
+                    if result.status in {ParseStatus.INVALID, ParseStatus.AMBIGUOUS}:
+                        errors[index] += 1
+                        value = (
+                            None  # Raw value remains recoverable via __raw_json/source position.
+                        )
+                    else:
+                        value = (
+                            _stored_number(result.value)
+                            if isinstance(result.value, Decimal)
+                            else result.value
+                        )
+                elif not blank(value):
+                    value = (
+                        clean_text(value)
+                        if role and (role.endswith("_id") or role.endswith("_name"))
+                        else value
+                    )
+                    if not isinstance(value, (str, int, float, bytes)):
+                        value = str(value)
+                else:
+                    value = None
+                if role == "customer_name" and value is not None and is_retail_customer(value):
+                    customer_id = row[roles.index("customer_id")] if "customer_id" in roles else None
+                    if blank(customer_id):
+                        value = None
+                if value is None:
+                    nulls[index] += 1
+                else:
+                    types[index].add(type(value).__name__)
+                    if len(examples[index]) < 3 and value not in examples[index]:
+                        examples[index].append(value)
+                    if role in DATE_ROLES:
+                        bounds = coverage.setdefault(names[index], [str(value), str(value)])
+                        bounds[0], bounds[1] = min(bounds[0], str(value)), max(
+                            bounds[1], str(value)
+                        )
+                parsed.append(value)
+            batch.append((*parsed, row_number, dumps(list(raw_row))))
+            kept += 1
+            if len(batch) >= 2000:
+                connection.executemany(insert, batch)
+                batch.clear()
+        if batch:
+            connection.executemany(insert, batch)
+        for index, count in errors.items():
+            diagnostics.append(
+                Diagnostic(
+                    code="PARSE_ERROR",
+                    message=f"{name}.{names[index]}: {count} invalid/ambiguous cells",
+                    source=source,
+                    severity="error",
+                )
+            )
+        columns = [
+            ColumnMeta(
+                name=column,
+                original_name=str(headers[index] or ""),
+                dtype=(
+                    "INTEGER"
+                    if types[index] <= {"int"} and types[index]
+                    else (
+                        "TEXT"
+                        if roles[index] in DATE_ROLES or types[index] <= {"str"}
+                        else "NUMERIC"
+                    )
+                ),
+                semantic_role=roles[index],
+                examples=examples[index],
+                null_count=nulls[index],
+                parse_errors=errors[index],
+                unit=(
+                    "VND"
+                    if roles[index]
+                    in MONEY_ROLES
+                    else None
+                ),
+                evidence=[
+                    f"{relative}:{sheet.name}:header:{header_row}",
+                    *(
+                        [f"numeric_locale:{locales[index]}:column_profile"]
+                        if roles[index] in NUMERIC_ROLES
+                        else []
+                    ),
+                ],
+            )
+            for index, column in enumerate(names)
+        ]
+        for index, role in enumerate(roles):
+            col_l = names[index].lower()
+            orig_l = normalize_lookup(str(headers[index] or "")).replace(" ", "_")
+            is_join_id = (
+                col_l.startswith("ma_")
+                or col_l.startswith("so_")
+                or col_l.startswith("id_")
+                or col_l.endswith("_id")
+                or col_l
+                in {
+                    "ma_giao_dich",
+                    "so_chung_tu",
+                    "so_hd",
+                    "ma_bill",
+                    "so_phieu",
+                    "ma_don",
+                    "ma_nhap_hang",
+                    "ma_hang",
+                    "ma_mat_hang",
+                    "ma_sp",
+                    "ma_san_pham_ban",
+                    "ma_kh",
+                    "so_kh",
+                    "order_id",
+                    "customer_id",
+                }
+                or orig_l
+                in {
+                    "ma_giao_dich",
+                    "so_chung_tu",
+                    "so_hd",
+                    "ma_bill",
+                    "so_phieu",
+                    "ma_don",
+                    "ma_nhap_hang",
+                    "ma_hang",
+                    "ma_mat_hang",
+                    "ma_sp",
+                    "ma_san_pham_ban",
+                    "ma_kh",
+                    "so_kh",
+                }
+            )
+            if (role and (role.endswith("_id") or role in DATE_ROLES or role == "status")) or is_join_id:
+                try:
+                    connection.execute(
+                        f"CREATE INDEX IF NOT EXISTS {q(name + '_' + str(index))} ON {q(name)} ({q(names[index])})"
+                    )
+                except Exception:
+                    pass
+        return TableMeta(
+            name=name,
+            sources=[source],
+            columns=columns,
+            grain=grain,
+            row_count=kept,
+            raw_row_count=raw_count,
+            excluded_rows=excluded,
+            duplicate_rows=duplicate,
+            header_row=header_row,
+            coverage={key: tuple(value) for key, value in coverage.items()},
+        )

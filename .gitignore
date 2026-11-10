@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Large or generated data (about 1.6 GB, not covered by git)
+source_test/data/
+source_test/artifacts/
+logs/
