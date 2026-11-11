@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 
 from bizreason.config import Settings, normalize_model_id
 
+logger = logging.getLogger(__name__)
+
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 520, 522, 524}
+# Status codes a tunnel returns when its origin is gone; treated like transport errors
+# only when an endpoint_resolver is configured.
+TUNNEL_DOWN_STATUS_CODES = {502, 503, 504, 530}
+ENDPOINT_RESOLVE_MIN_INTERVAL = 15.0
+OUTAGE_POLL_SECONDS = 20.0
 
 __all__ = [
     "LanguageModel",
@@ -22,6 +33,7 @@ __all__ = [
     "TrammayClient",
     "Usage",
     "_extract_payload_provider_error",
+    "endpoint_file_resolver",
     "_repair_json_syntax",
     "build_chat_messages",
     "normalize_model_id",
@@ -358,12 +370,56 @@ def parse_json_object(text: str) -> dict[str, Any]:
     raise ModelError("Model returned invalid JSON")
 
 
+def endpoint_file_resolver(path: Path) -> Callable[[], str | None]:
+    """Return a resolver that reads the "base_url" field of a JSON file on each call.
+
+    Returns None on any error (missing file, bad JSON, missing field). File content is never logged.
+    """
+    file_path = Path(path)
+
+    def _resolve() -> str | None:
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        value = data.get("base_url")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    return _resolve
+
+
 class TrammayClient:
-    def __init__(self, settings: Settings, *, transport: httpx.BaseTransport | None = None):
+    # Class-level defaults so subclasses that bypass __init__ still behave as before.
+    _endpoint_resolver: Callable[[], str | None] | None = None
+    _outage_wait_seconds: float = 0.0
+    _outage_poll_seconds: float = OUTAGE_POLL_SECONDS
+    _last_resolve_at: float | None = None
+    _transport: httpx.BaseTransport | None = None
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        endpoint_resolver: Callable[[], str | None] | None = None,
+        outage_wait_seconds: float = 0.0,
+        outage_poll_seconds: float = OUTAGE_POLL_SECONDS,
+    ):
         if not settings.api_key:
             raise ModelError("TRAMMAY_KEY is missing (set TRAMMAY_KEY or OPENROUTER_API in source_test/.env)")
+        if outage_poll_seconds <= 0:
+            raise ValueError("outage_poll_seconds must be positive")
         self.settings = settings
         self.usage = Usage()
+        self._transport = transport
+        self._endpoint_resolver = endpoint_resolver
+        self._outage_wait_seconds = float(outage_wait_seconds)
+        self._outage_poll_seconds = float(outage_poll_seconds)
+        self._last_resolve_at = None
         self._client = self._create_client(transport=transport)
 
     def _create_client(self, transport: httpx.BaseTransport | None = None) -> httpx.Client:
@@ -414,6 +470,40 @@ class TrammayClient:
     def close(self) -> None:
         self._client.close()
 
+    def _switch_base_url(self, new_url: str) -> None:
+        # Only the host is logged; the query string and headers never are.
+        logger.info("Model endpoint changed; rebuilding client for host %s", urlsplit(new_url).hostname or "?")
+        self.settings = replace(self.settings, base_url=new_url)
+        old_client = self._client
+        self._client = self._create_client(transport=self._transport)
+        try:
+            old_client.close()
+        except Exception:
+            pass
+
+    def _try_switch_endpoint(self) -> bool:
+        """Ask the resolver for the current base URL; switch if it changed. Rate-limited."""
+        if self._endpoint_resolver is None:
+            return False
+        now = time.monotonic()
+        if self._last_resolve_at is not None and now - self._last_resolve_at < ENDPOINT_RESOLVE_MIN_INTERVAL:
+            return False
+        self._last_resolve_at = now
+        try:
+            candidate = self._endpoint_resolver()
+        except Exception:
+            return False
+        if not isinstance(candidate, str):
+            return False
+        candidate = candidate.strip().rstrip("/")
+        parts = urlsplit(candidate)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return False
+        if candidate == self.settings.base_url.strip().rstrip("/"):
+            return False
+        self._switch_base_url(candidate)
+        return True
+
     def _request(self, method: str, path: str, *, count_call: bool = False, **kwargs: Any) -> dict[str, Any]:
         max_attempts = (
             max(1 + self.settings.transport_retries, 4)
@@ -429,11 +519,16 @@ class TrammayClient:
         started = time.monotonic()
         last_error: ProviderError | None = None
         call_counted = False
+        # Set once normal attempts are exhausted by transport errors and outage waiting is enabled.
+        outage_deadline: float | None = None
+        attempt = 0
 
-        for attempt in range(max_attempts):
+        while True:
             elapsed = time.monotonic() - started
             remaining = effective_timeout - elapsed
-            if remaining <= 0:
+            # During an outage wait the implicit (non-caller) deadline does not apply;
+            # the outage deadline governs instead.
+            if remaining <= 0 and outage_deadline is None:
                 raise ProviderError("Provider request deadline exceeded")
             if req_timeout is not None and attempt > 0 and remaining <= 5.0:
                 if last_error:
@@ -447,6 +542,7 @@ class TrammayClient:
             )
             last_response: httpx.Response | None = None
             last_status_code: int | None = None
+            transport_failure = False
 
             try:
                 response = self._client.request(
@@ -479,35 +575,63 @@ class TrammayClient:
                 status_code = error.response.status_code
                 last_response = error.response
                 last_status_code = status_code
-                if status_code not in RETRYABLE_STATUS_CODES:
+                tunnel_down = (
+                    self._endpoint_resolver is not None and status_code in TUNNEL_DOWN_STATUS_CODES
+                )
+                if status_code not in RETRYABLE_STATUS_CODES and not tunnel_down:
                     if count_call and not call_counted:
                         self.usage.calls += 1
                         call_counted = True
                     raise ProviderError(f"Provider HTTP {status_code}") from None
                 last_error = ProviderError(f"Provider HTTP {status_code}")
+                transport_failure = tunnel_down
             except (httpx.HTTPError, ValueError) as error:
                 self._reset_client_if_transport_error(error)
                 last_response = None
                 last_status_code = None
                 last_error = ProviderError(f"Provider request failed ({type(error).__name__})")
+                transport_failure = True
 
-            if attempt == max_attempts - 1:
+            switched = False
+            if transport_failure and self._endpoint_resolver is not None:
+                switched = self._try_switch_endpoint()
+
+            # A successful endpoint switch always grants one immediate retry on the new URL.
+            if attempt >= max_attempts - 1 and not switched:
                 assert last_error is not None
-                raise last_error
+                if not (
+                    transport_failure
+                    and self._endpoint_resolver is not None
+                    and self._outage_wait_seconds > 0
+                ):
+                    raise last_error
+                now = time.monotonic()
+                if outage_deadline is None:
+                    outage_deadline = now + self._outage_wait_seconds
+                if now >= outage_deadline:
+                    raise last_error
+                rem = effective_timeout - (now - started)
+                if req_timeout is not None and rem <= 5.0:
+                    raise last_error
+                wait = min(self._outage_poll_seconds, outage_deadline - now)
+                if req_timeout is not None:
+                    wait = min(wait, rem - 5.0)
+                time.sleep(max(wait, 0.0))
+                attempt += 1
+                continue
 
             rem = effective_timeout - (time.monotonic() - started)
             if req_timeout is not None and rem <= 5.0:
                 assert last_error is not None
                 raise last_error
 
-            delay = self._retry_delay_seconds(
-                attempt, last_response, status_code=last_status_code
-            )
-            if delay > 0:
-                time.sleep(delay)
-
-        assert last_error is not None
-        raise last_error
+            if not switched:
+                delay = self._retry_delay_seconds(
+                    attempt, last_response, status_code=last_status_code
+                )
+                if delay > 0:
+                    time.sleep(delay)
+            attempt += 1
 
     def models(self) -> list[str]:
         payload = self._request("GET", "models")

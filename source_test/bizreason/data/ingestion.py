@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import itertools
 import re
 import sqlite3
@@ -59,7 +60,127 @@ GROUP_ROLES = {
 }
 
 
-def header_score(row: tuple[Any, ...], readme: str) -> float:
+HEADER_LOOKAHEAD = 10  # Following prefix rows that show what a column holds below a candidate header.
+HEADER_TEXT_LIMIT = 60  # Header cells are short labels, not sentences.
+HEADER_MIN_SCORE = 2.5  # Below this the sheet has no plausible header row.
+HEADER_STACKED_PENALTY = 1.0  # A solid text row directly under another solid text row is data.
+
+
+@functools.lru_cache(maxsize=16)
+def _readme_terms(readme: str) -> str:
+    return f" {normalize_lookup(readme)} "
+
+
+def _in_readme(text: str, terms: str) -> bool:
+    normalized = normalize_lookup(text)
+    return len(normalized) >= 3 and f" {normalized} " in terms
+
+
+def _cell_kind(cell: Any) -> str | None:
+    if blank(cell):
+        return None
+    if isinstance(cell, (int, float, Decimal)) and not isinstance(cell, bool):
+        return "number"
+    if isinstance(cell, date):
+        return "date"
+    if isinstance(cell, str):
+        if parse_number(cell).status in {ParseStatus.OK, ParseStatus.AMBIGUOUS}:
+            return "number"
+        if parse_date(cell).status in {ParseStatus.OK, ParseStatus.AMBIGUOUS}:
+            return "date"
+        return "text"
+    return "other"
+
+
+def _contrast_share(index: int, following: tuple[tuple[Any, ...], ...]) -> float:
+    """Share of the values below a label column that are numbers or dates."""
+    below = [
+        _cell_kind(row[index])
+        for row in following
+        if index < len(row) and not blank(row[index])
+    ]
+    if len(below) < 2:
+        return 0.0
+    return sum(kind in {"number", "date"} for kind in below) / len(below)
+
+
+def header_score(
+    row: tuple[Any, ...],
+    readme: str,
+    following: tuple[tuple[Any, ...], ...] = (),
+    width: int | None = None,
+) -> float:
+    """Structural header score: short text, fill, distinct labels, numbers below labels.
+
+    ``following`` holds the rows after ``row`` in the prefix and ``width`` the widest
+    non-blank row in the prefix. Known header names only add a small bonus.
+    """
+    present = [(index, cell) for index, cell in enumerate(row) if not blank(cell)]
+    if len(present) < 2:
+        return -1
+    count = len(present)
+    cells = [str(cell).strip() for _, cell in present]
+    short = [
+        (index, text)
+        for (index, cell), text in zip(present, cells)
+        if _cell_kind(cell) == "text" and len(text) <= HEADER_TEXT_LIMIT
+    ]
+    text = len(short) / count
+    if text < 0.5:
+        return -1  # Mostly numbers or dates: a data row, not a header.
+    fill = count / max(width or count, count)
+    unique = len(set(cells)) / count
+    long = sum(len(cell) > 80 for cell in cells) / count
+    labels = sum(infer_role(cell, readme) is not None for cell in cells) / count
+    terms = _readme_terms(readme)
+    mentioned = sum(_in_readme(value, terms) for _, value in short) / count
+    contrast = sum(_contrast_share(index, following) for index, _ in short) / count
+    return (
+        fill
+        + text
+        + unique
+        + 3.0 * contrast
+        + 1.5 * mentioned
+        + 0.5 * labels
+        - 2.0 * long
+    )
+
+
+def _solid_text_row(row: tuple[Any, ...], width: int) -> bool:
+    present = [cell for cell in row if not blank(cell)]
+    return (
+        len(present) >= 2
+        and len(present) >= 0.8 * max(width, len(present))
+        and all(
+            _cell_kind(cell) == "text" and len(str(cell).strip()) <= HEADER_TEXT_LIMIT
+            for cell in present
+        )
+    )
+
+
+def choose_header_row(prefix: list[tuple[Any, ...]], readme: str) -> tuple[int, float]:
+    """Return the index and score of the best header candidate; earliest row wins ties."""
+    width = max((sum(not blank(cell) for cell in row) for row in prefix), default=0)
+    scored = []
+    for index, row in enumerate(prefix):
+        following = tuple(prefix[index + 1 : index + 1 + HEADER_LOOKAHEAD])
+        score = header_score(row, readme, following, width)
+        # A header usually follows a title, blank or other non-table row. A text row under
+        # another text row is more likely the first data row.
+        if (
+            score > 0
+            and index > 0
+            and _solid_text_row(row, width)
+            and _solid_text_row(prefix[index - 1], width)
+        ):
+            score -= HEADER_STACKED_PENALTY
+        scored.append((score, index))
+    score, position = max(scored, key=lambda item: (item[0], -item[1]))
+    return position, score
+
+
+def _alias_shape_score(row: tuple[Any, ...], readme: str) -> float:
+    """Previous alias-driven score, kept for region splits where known names are present."""
     cells = [str(cell).strip() for cell in row if not blank(cell)]
     if len(cells) < 2:
         return -1
@@ -68,6 +189,85 @@ def header_score(row: tuple[Any, ...], readme: str) -> float:
     unique = len(set(cells)) / len(cells)
     long = sum(len(cell) > 80 for cell in cells) / len(cells)
     return 4 * labels + texts + unique - 2 * long
+
+
+def _readme_region_header(row: tuple[Any, ...], readme: str, width: int) -> bool:
+    """A region header without known names: strong text-only, high-fill, README-confirmed row."""
+    present = [cell for cell in row if not blank(cell)]
+    if len(present) < 2:
+        return False
+    if any(
+        _cell_kind(cell) != "text" or len(str(cell).strip()) > HEADER_TEXT_LIMIT
+        for cell in present
+    ):
+        return False
+    if len(present) < 0.8 * max(width, len(present)):
+        return False
+    terms = _readme_terms(readme)
+    return sum(_in_readme(str(cell).strip(), terms) for cell in present) >= 2
+
+
+_UNIT_STATEMENT = re.compile(
+    r"\b(?:don vi tinh|don vi|dvt|unit|units)\s+\b(nghin|ngan(?!\s+hang)|thousand|trieu|million)\b"
+)  # Applied to normalize_lookup text, so punctuation is already a single space.
+AMOUNT_SCALES = {
+    "nghin": 1_000,
+    "ngan": 1_000,
+    "thousand": 1_000,
+    "trieu": 1_000_000,
+    "million": 1_000_000,
+}
+
+
+def _amount_scale(rows: list[tuple[Any, ...]]) -> int | None:
+    """Money unit stated in the preamble, e.g. "don vi tinh: nghin dong". None if absent or conflicting."""
+    factors: set[int] = set()
+    for row in rows:
+        text = normalize_lookup(" ".join(str(cell) for cell in row if not blank(cell)))
+        factors.update(AMOUNT_SCALES[match.group(1)] for match in _UNIT_STATEMENT.finditer(text))
+    return factors.pop() if len(factors) == 1 else None
+
+
+def _multi_tier_labels(upper: tuple[Any, ...], header: tuple[Any, ...]) -> tuple[Any, ...] | None:
+    """Prefix each header label with the group label above it; None if the row above is not a group row."""
+    upper_present = [index for index, cell in enumerate(upper) if not blank(cell)]
+    # One cell is a title. Labels over every header column are a second header row, not groups.
+    if len(upper_present) < 2:
+        return None
+    if any(
+        _cell_kind(upper[index]) != "text" or len(str(upper[index]).strip()) > HEADER_TEXT_LIMIT
+        for index in upper_present
+    ):
+        return None
+    cover = (*upper, *([None] * max(0, len(header) - len(upper))))
+    if all(not blank(cover[index]) for index, cell in enumerate(header) if not blank(cell)):
+        return None
+    labels: list[Any] = []
+    group: str | None = None
+    for index, cell in enumerate(header):
+        if not blank(cover[index]):
+            group = str(cover[index]).strip()  # Carries across blank cells to the right.
+        if blank(cell) or group is None or _cell_kind(cell) != "text":
+            labels.append(cell)
+        else:
+            labels.append(f"{group}_{str(cell).strip()}")
+    return tuple(labels) if labels != list(header) else None
+
+
+def _is_repeated_header(row: list[Any], headers: tuple[Any, ...], share: float = 0.5) -> bool:
+    """A page-break copy of the header: ``share`` of its labels recur and the row holds no number."""
+    if any(_cell_kind(cell) == "number" for cell in row):
+        return False
+    positions = [index for index, cell in enumerate(headers) if not blank(cell)]
+    if len(positions) < 2:
+        return False
+    matches = sum(
+        index < len(row)
+        and not blank(row[index])
+        and normalize_lookup(row[index]) == normalize_lookup(headers[index])
+        for index in positions
+    )
+    return matches >= share * len(positions)
 
 
 def unique_columns(headers: tuple[Any, ...]) -> list[str]:
@@ -322,14 +522,15 @@ class BusinessBuilder:
         prefix = list(itertools.islice(sheet.rows, 40))
         if not prefix:
             return []
+        width = max((sum(not blank(cell) for cell in row) for row in prefix), default=0)
+        labels: tuple[Any, ...] | None = None
         if sheet.declared_columns:
             headers = tuple(sheet.declared_columns)
             header_row = 0
             rows = enumerate(itertools.chain(prefix, sheet.rows), 1)
         else:
-            scored = [(header_score(row, readme), index) for index, row in enumerate(prefix)]
-            score, position = max(scored, key=lambda item: (item[0], -item[1]))
-            if score < 1.5:
+            position, score = choose_header_row(prefix, readme)
+            if score < HEADER_MIN_SCORE:
                 diagnostics.append(
                     Diagnostic(
                         code="UNRESOLVED_HEADER",
@@ -341,6 +542,27 @@ class BusinessBuilder:
                 return []
             header_row = position + 1
             headers = prefix[position]
+            if position > 0:
+                labels = _multi_tier_labels(prefix[position - 1], headers)
+                if labels is not None:
+                    diagnostics.append(
+                        Diagnostic(
+                            code="MULTI_TIER_HEADER",
+                            message="Column names combine the group label row above the header",
+                            source=SourceRef(path=relative, table=sheet.name, row=header_row),
+                            severity="info",
+                        )
+                    )
+            scale = _amount_scale(prefix[:position])
+            if scale is not None:
+                diagnostics.append(
+                    Diagnostic(
+                        code="AMOUNT_SCALE",
+                        message=str(scale),
+                        source=SourceRef(path=relative, table=sheet.name),
+                        severity="info",
+                    )
+                )
             rows = enumerate(itertools.chain(prefix[position + 1 :], sheet.rows), header_row + 1)
         # Split later regions with a different, strongly recognized header.
         regions: list[tuple[tuple[Any, ...], int, list[tuple[int, tuple[Any, ...]]]]] = []
@@ -350,11 +572,15 @@ class BusinessBuilder:
             known = sum(
                 infer_role(str(cell), readme) is not None for cell in row if not blank(cell)
             )
-            if (
-                known >= 2
-                and header_score(row, readme) >= 4.0
-                and tuple(row) != tuple(current_headers)
-            ):
+            # Rows with known names keep the previous split rule exactly. Rows without them
+            # may split only on README-confirmed, strong text-only, high-fill shape.
+            if known >= 2:
+                splits = _alias_shape_score(row, readme) >= 4.0
+            else:
+                splits = _readme_region_header(row, readme, width)
+            # A page-break copy of the current header repeats it; it is excluded, not a new region.
+            repeat = _is_repeated_header(row, current_headers, share=1.0)
+            if splits and not repeat and tuple(row) != tuple(current_headers):
                 regions.append((current_headers, current_header_row, buffered))
                 current_headers, current_header_row, buffered = row, row_number, []
             else:
@@ -372,6 +598,8 @@ class BusinessBuilder:
                 region_rows,
                 index,
                 diagnostics,
+                # Only the first region starts at the chosen header, which the labels describe.
+                labels=labels if index == 0 else None,
             )
             for index, (region_headers, region_header_row, region_rows) in enumerate(regions)
         ]
@@ -388,13 +616,14 @@ class BusinessBuilder:
         rows: list[tuple[int, tuple[Any, ...]]],
         region_index: int,
         diagnostics: list[Diagnostic],
+        labels: tuple[Any, ...] | None = None,
     ) -> TableMeta:
         width = max(
             (index + 1 for index, value in enumerate(headers) if not blank(value)),
             default=len(headers),
         )
         headers = headers[:width]
-        names = unique_columns(headers)
+        names = unique_columns(headers if labels is None else labels[:width])
         descriptions = column_descriptions(readme, sheet.path.name, sheet.name)
         table_label = sheet.path.stem + " " + sheet.name
         roles = [
@@ -486,6 +715,18 @@ class BusinessBuilder:
             if all(blank(cell) for cell in row) or tuple(row) == tuple(headers):
                 excluded += 1
                 current_group = None
+                continue
+            if _is_repeated_header(row, headers):
+                excluded += 1
+                current_group = None
+                diagnostics.append(
+                    Diagnostic(
+                        code="EXCLUDED_REPEATED_HEADER_ROW",
+                        message="Page-break copy of the header inside transaction rows",
+                        source=SourceRef(path=relative, table=sheet.name, row=row_number),
+                        severity="info",
+                    )
+                )
                 continue
             kind = (
                 "summary"

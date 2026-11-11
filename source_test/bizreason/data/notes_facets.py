@@ -26,7 +26,7 @@ NEGATED_COMPLETE_RE = re.compile(
 )
 
 STATUS_PATTERNS = {
-    "cancelled": re.compile(r"\b(?:da\s+huy|bi\s+huy|huy\s+don|khach\s+huy|don\s+huy|boom\s+hang|huy)\b"),
+    "cancelled": re.compile(r"\b(?:da\s+huy|bi\s+huy|huy\s+don|khach\s+huy|don\s+huy|boom\s+hang)\b"),
     "returned": re.compile(
         r"\b(?:tra\s+hang|hoan\s+tra|doi\s+tra|khach\s+mang\s+tra|mang\s+tra|gui\s+tra|khach\s+gui\s+tra|tra\s+lai\s+hang|tra\s+sp|tra\s+san\s+pham|tra\s+mon|doi\s+hang|doi\s+sang|hoan\s+don|khach\s+tra(?!\s+(?:no|tien|du|bot|coc|truoc|gop|khoan)))\b"
     ),
@@ -66,6 +66,11 @@ def classify_note_status(note_raw: Any) -> tuple[str | None, bool]:
     for state, pattern in STATUS_PATTERNS.items():
         if pattern.search(working_text):
             matched_states.add(state)
+
+    # Without its tone mark, a lone "huy" is usually a person's name; only the marked word states a cancellation.
+    lowered = text.lower()
+    if ("hủy" in lowered or "huỷ" in lowered) and re.search(r"\bhuy\b", working_text):
+        matched_states.add("cancelled")
 
     if not (has_payment or has_negation):
         parsed = parse_status(text, domain="order")
