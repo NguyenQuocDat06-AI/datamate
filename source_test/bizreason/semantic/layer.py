@@ -179,12 +179,29 @@ def effective_roles(table: TableMeta, note: dict[str, Any], dst: sqlite3.Connect
         if mapped:
             fallback.setdefault(mapped, column.name)
     chosen = {role: _choose_column(dst, table, role, columns) for role, columns in candidates.items()}
-    for role in ("order_status", "ordered_at", "qty_base"):
+    for role in ("order_status", "qty_base"):
         if role in fallback:  # parsed and normalized at ingestion; stronger than a column-name reading
             chosen[role] = fallback[role]
+    if "ordered_at" in fallback:
+        chosen["ordered_at"] = _ordered_at_column(dst, table, fallback["ordered_at"], candidates.get("ordered_at", []))
     for role, column in fallback.items():
         chosen.setdefault(role, column)
     return chosen
+
+
+def _ordered_at_column(dst: sqlite3.Connection | None, table: TableMeta, fallback_column: str,
+                       model_columns: list[str]) -> str:
+    """The ordered_at column. The ingestion column competes with the model's other ordered_at columns: one
+    carrying a clock wins, but only if it also carries a date (a time-only column must never become the date)."""
+    others = [column for column in model_columns if column != fallback_column]
+    if dst is None or not others:
+        return fallback_column
+    winner = _choose_column(dst, table, "ordered_at", [fallback_column, *others])
+    if winner == fallback_column:
+        return fallback_column
+    values = _distinct_texts(dst, table, winner)
+    dated = sum(to_date(value) is not None for value in values)
+    return winner if values and dated * 2 >= len(values) else fallback_column
 
 
 def _is_role(role: Any) -> bool:

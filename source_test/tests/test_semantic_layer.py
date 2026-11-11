@@ -620,6 +620,76 @@ def test_timestamp_column_beats_a_date_only_column(tmp_path: Path) -> None:
     ]
 
 
+def _run_with_ingested(tmp_path: Path, specs: Specs, records: list[dict[str, Any]],
+                       ingested: dict[str, str]) -> Path:
+    """Builds with the ingestion meaning ingested maps each column name to (its semantic_role)."""
+    context = _context(_source(tmp_path, specs), specs)
+    tables = [
+        table.model_copy(update={"columns": [
+            column.model_copy(update={"semantic_role": ingested[column.name]}) if column.name in ingested else column
+            for column in table.columns
+        ]})
+        for table in context.tables
+    ]
+    out = tmp_path / "canonical.sqlite"
+    layer.build(context.model_copy(update={"tables": tables}), records, out)
+    return out
+
+
+def test_ingested_date_column_loses_to_a_model_listed_datetime_column(tmp_path: Path) -> None:
+    columns = ["order", "day", "stamp", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "2026-03-01", "2026-03-01 14:05:00", "tea", "100"),
+        ("O2", "2026-03-02", "2026-03-02 06:20:48", "tea", "50"),
+    ])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "day": "ordered_at", "stamp": "ordered_at", "item": "product_name",
+        "amount": "line_amount",
+    })]
+    out = _run_with_ingested(tmp_path, specs, records, {"day": "ordered_at"})
+
+    assert _query(out, "SELECT order_id, date, ts FROM orders ORDER BY order_id") == [
+        ("O1", "2026-03-01", "2026-03-01 14:05:00"),
+        ("O2", "2026-03-02", "2026-03-02 06:20:48"),
+    ]
+
+
+def test_ingested_date_column_stays_over_a_model_listed_time_only_column(tmp_path: Path) -> None:
+    columns = ["order", "day", "clock", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "2026-03-01", "14:05", "tea", "100"),
+        ("O2", "2026-03-02", "06:20", "tea", "50"),
+    ])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "day": "ordered_at", "clock": "ordered_at", "item": "product_name",
+        "amount": "line_amount",
+    })]
+    out = _run_with_ingested(tmp_path, specs, records, {"day": "ordered_at"})
+
+    assert _query(out, "SELECT order_id, date, ts FROM orders ORDER BY order_id") == [
+        ("O1", "2026-03-01", "2026-03-01"),
+        ("O2", "2026-03-02", "2026-03-02"),
+    ]
+
+
+def test_ingested_date_column_stays_when_no_column_carries_a_clock(tmp_path: Path) -> None:
+    columns = ["order", "day", "other", "item", "amount"]
+    specs: Specs = {"sales": (columns, [
+        ("O1", "2026-03-01", "2026-03-05", "tea", "100"),
+        ("O2", "2026-03-02", "2026-03-06", "tea", "50"),
+    ])}
+    records = [_record(columns, "sales", {
+        "order": "order_id", "day": "ordered_at", "other": "ordered_at", "item": "product_name",
+        "amount": "line_amount",
+    })]
+    out = _run_with_ingested(tmp_path, specs, records, {"day": "ordered_at"})
+
+    assert _query(out, "SELECT order_id, date, ts FROM orders ORDER BY order_id") == [
+        ("O1", "2026-03-01", "2026-03-01"),
+        ("O2", "2026-03-02", "2026-03-02"),
+    ]
+
+
 def test_product_name_is_filled_only_on_an_exact_id_match(tmp_path: Path) -> None:
     sales_columns = ["order", "pid", "amount"]
     specs: Specs = {
