@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from bizreason.contracts import BusinessContext, ColumnMeta, Diagnostic, SourceRef, TableMeta
+from bizreason.contracts import BusinessContext, ColumnMeta, Diagnostic, SourceRef, TableMeta, TimeWindow
 from bizreason.semantic import layer
+from bizreason.semantic.compiler import Compiler, Intent
 
 # name -> (column names, rows)
 Specs = dict[str, tuple[list[str], list[tuple[Any, ...]]]]
@@ -1539,3 +1541,81 @@ def test_attribute_row_whose_id_has_no_single_name_still_joins_by_id(tmp_path: P
     _, out = _run(tmp_path, specs, records)
 
     assert _query(out, "SELECT order_id, prescription FROM lines ORDER BY order_id") == [("O1", 1), ("O2", 1)]
+
+
+def test_match_employee_short_and_variant_spellings_get_the_full_name() -> None:
+    full_names = ["Hà Loan Đạt", "Lương Chi Đức"]
+    assert layer.match_employee("Đạt", full_names) == "Hà Loan Đạt"
+    assert layer.match_employee("a Đạt", full_names) == "Hà Loan Đạt"
+    assert layer.match_employee("A.Đạt", full_names) == "Hà Loan Đạt"
+    assert layer.match_employee("Đức", full_names) == "Lương Chi Đức"
+
+
+def test_match_employee_keeps_spelling_when_two_names_fit_or_none_does() -> None:
+    assert layer.match_employee("Đạt", ["Hà Loan Đạt", "Trần Văn Đạt"]) is None
+    assert layer.match_employee("Minh", ["Hà Loan Đạt", "Lương Chi Đức"]) is None
+    # A single letter is not a name on its own.
+    assert layer.match_employee("A", ["Hà Loan Đạt"]) is None
+
+
+def test_employee_spellings_map_to_full_names_on_orders_and_lines(tmp_path: Path) -> None:
+    repair_columns = ["ticket", "visit", "mechanic", "job", "bill"]
+    specs: Specs = {
+        "repairs": (repair_columns, [
+            ("T1", "2026-04-02", "Đạt", "oil change", "1000"),
+            ("T2", "2026-04-03", "a Đạt", "brake pads", "500"),
+            ("T3", "2026-04-04", "Đức", "tyre", "1200"),
+            ("T4", "2026-04-05", "Minh", "wash", "200"),
+        ]),
+        "staff": (["ho_ten"], [("Hà Loan Đạt",), ("Lương Chi Đức",)]),
+    }
+    records = [
+        _record(repair_columns, "service_ticket", {
+            "ticket": "ticket_id", "visit": "ordered_at", "mechanic": "employee_name",
+            "job": "service_item", "bill": "ticket_amount",
+        }),
+        _record(["ho_ten"], "employee_catalog", {"ho_ten": "employee_name"}),
+    ]
+
+    report, out = _run(tmp_path, specs, records)
+
+    assert report["employee_spellings_mapped"] == 3
+    assert _query(out, "SELECT order_id, employee, employee_raw FROM orders ORDER BY order_id") == [
+        ("T1", "Hà Loan Đạt", "Đạt"),
+        ("T2", "Hà Loan Đạt", "a Đạt"),
+        ("T3", "Lương Chi Đức", "Đức"),
+        ("T4", "Minh", "Minh"),
+    ]
+    assert _query(out, "SELECT DISTINCT employee FROM lines ORDER BY employee") == [
+        ("Hà Loan Đạt",), ("Lương Chi Đức",), ("Minh",),
+    ]
+
+
+def test_ranking_by_employee_counts_the_merged_name_once(tmp_path: Path) -> None:
+    repair_columns = ["ticket", "visit", "mechanic", "job", "bill"]
+    specs: Specs = {
+        "repairs": (repair_columns, [
+            ("T1", "2026-04-02", "Đạt", "oil change", "1000"),
+            ("T2", "2026-04-03", "a Đạt", "brake pads", "500"),
+            ("T3", "2026-04-04", "Đức", "tyre", "1200"),
+        ]),
+        "staff": (["ho_ten"], [("Hà Loan Đạt",), ("Lương Chi Đức",)]),
+    }
+    records = [
+        _record(repair_columns, "service_ticket", {
+            "ticket": "ticket_id", "visit": "ordered_at", "mechanic": "employee_name",
+            "job": "service_item", "bill": "ticket_amount",
+        }),
+        _record(["ho_ten"], "employee_catalog", {"ho_ten": "employee_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    # Raw spellings alone would rank Đức first (1200 against 1000 and 500); merged, Đạt has 1500.
+    april = TimeWindow(start=date(2026, 4, 1), end_exclusive=date(2026, 5, 1))
+    con = sqlite3.connect(out)
+    try:
+        compiler = Compiler(con)
+        assert compiler.answer(Intent(measure="revenue", shape="top_k", group_by="employee", top_k=1),
+                               [april]).value == "Hà Loan Đạt"
+    finally:
+        con.close()

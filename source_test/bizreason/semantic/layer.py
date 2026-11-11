@@ -743,6 +743,60 @@ def _insert_catalog_keys(dst: sqlite3.Connection, table: TableMeta, id_role: str
     )
 
 
+def _load_employee_names(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> None:
+    """Full staff names from a staff list. They are the candidates that short staff spellings are matched to."""
+    name = roles.get("employee_name")
+    if not name:
+        return
+    dst.execute(
+        "INSERT INTO temp.employee_names (full_name) "
+        f"SELECT DISTINCT fn FROM (SELECT {_text(name)} AS fn FROM source.{q(table.name)} AS src) "
+        "WHERE fn IS NOT NULL"
+    )
+
+
+def match_employee(spelling: str, full_names: Iterable[str]) -> str | None:
+    """The full staff name a short or variant spelling stands for, or None when it does not name exactly one.
+
+    The spelling's last token (of two letters or more) must be the last token of the full name, and every other
+    token longer than one letter must appear in the full name. Zero matches, or several, leave the spelling as it is.
+    """
+    tokens = normalize_lookup(spelling).split()
+    if not tokens or len(tokens[-1]) < 2:
+        return None
+    found: dict[str, str] = {}  # normalized full name -> the full name as given
+    for full in full_names:
+        words = normalize_lookup(full).split()
+        if words and words[-1] == tokens[-1] and all(token in words for token in tokens if len(token) > 1):
+            found.setdefault(normalize_lookup(full), full)
+    return next(iter(found.values())) if len(found) == 1 else None
+
+
+def _map_employees(dst: sqlite3.Connection) -> int:
+    """Rewrite each employee spelling on orders and lines to its full staff name, where match_employee finds one.
+    The raw spelling goes to employee_raw first, and only when some spelling changes.
+
+    Returns the number of distinct spellings that were mapped.
+    """
+    names = [row[0] for row in dst.execute("SELECT full_name FROM temp.employee_names ORDER BY full_name")]
+    if not names:
+        return 0
+    spellings = [row[0] for row in dst.execute("SELECT DISTINCT employee FROM orders WHERE employee IS NOT NULL")]
+    mapping = {}
+    for spelling in spellings:
+        full = match_employee(spelling, names)
+        if full is not None and full != spelling:
+            mapping[spelling] = full
+    if not mapping:
+        return 0
+    for table in ("orders", "lines"):
+        dst.execute(f"ALTER TABLE {table} ADD COLUMN employee_raw")
+        dst.execute(f"UPDATE {table} SET employee_raw=employee")
+        dst.executemany(f"UPDATE {table} SET employee=? WHERE employee_raw=?",
+                        [(full, spelling) for spelling, full in mapping.items()])
+    return len(mapping)
+
+
 def _prescription_sql(column: str | None) -> str:
     """A yes or no column as 1, 0 or NULL."""
     if not column:
@@ -931,6 +985,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.execute("CREATE TEMP TABLE unit_factors (product_id TEXT, name_key TEXT, large_key TEXT, factor REAL)")
     dst.execute("CREATE TEMP TABLE catalog_ids (role TEXT, id TEXT, name TEXT)")
     dst.execute("CREATE TEMP TABLE alias_map (alias_key TEXT PRIMARY KEY, full_name TEXT)")
+    dst.execute("CREATE TEMP TABLE employee_names (full_name TEXT)")
     dst.execute("CREATE TABLE build_stats (key TEXT, value INTEGER)")
     stats: Counter[str] = Counter({key: 0 for key in BUILD_STAT_KEYS})
     report: dict[str, Any] = {
@@ -1009,6 +1064,8 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             _load_unit_factors(dst, table, roles)
         elif note["kind"] == "alias":
             _load_aliases(dst, table, roles)
+        elif note["kind"] == "employee_catalog":
+            _load_employee_names(dst, table, roles)
         if note["kind"] in PRODUCT_ATTR_KINDS:
             _load_product_attrs(dst, table, note["kind"], roles)
     _fill_receipts(dst)
@@ -1018,6 +1075,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["status_mapped"] = _map_status(dst, status_map or {}, stats)
     report["qty_base_derived"] = _derive_qty_base(dst)
     _derive(dst)
+    report["employee_spellings_mapped"] = _map_employees(dst)
     stats["values_regrouped"] = _regroup_values(dst, value_groups or {})
     report["orders_marked_returned"] = _mark_returned(dst)
     _write_shop_facts(dst, context)
