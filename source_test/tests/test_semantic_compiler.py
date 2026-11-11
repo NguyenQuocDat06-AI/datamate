@@ -522,6 +522,94 @@ def test_null_customer_name_in_ranking_raises() -> None:
     assert compiler.answer(two, [MARCH]) == Answer("list", ["Lan", "Minh"])
 
 
+def spelled_lines_db(lines) -> sqlite3.Connection:
+    # One order per line, so the status and revenue gates see the same rows.
+    orders = [(l[0], l[1], l[2], l[3], l[4], "Lan", l[5], l[10], l[10]) for l in lines]
+    return make_timed_db(orders=orders, lines=lines)
+
+
+# order_id, date, ts, status, customer_key, channel, product_key, product_name, qty, qty_base, amount
+SPELLED_LINES = [
+    ("L1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "dine", "sua", "Cà phê sữa (M)", 1, 1, 40),
+    ("L2", "2026-03-03", "2026-03-03 09:00:00", "completed", "c1", "dine", "sua", "Cà phê sữa (M)", 1, 1, 40),
+    ("L3", "2026-03-04", "2026-03-04 09:00:00", "completed", "c1", "dine", "sua", "Cà phê sữa (M)", 1, 1, 40),
+    ("L4", "2026-03-05", "2026-03-05 09:00:00", "completed", "c2", "dine", "sua", "Ca phe sua (M)", 1, 1, 40),
+    ("L5", "2026-03-06", "2026-03-06 09:00:00", "completed", "c2", "dine", "tea", "Tea", 1, 1, 100),
+]
+
+
+def test_top_k_prints_the_accented_spelling_of_a_product() -> None:
+    # Coffee: 3 rows spelled with diacritics and 1 without, 160 in revenue. The ASCII spelling sorts first, so
+    # a plain MIN would print it. Tea is 100.
+    compiler = Compiler(spelled_lines_db(SPELLED_LINES))
+    top_one = Intent(measure="revenue", shape="top_k", group_by="product", top_k=1)
+    assert compiler.answer(top_one, [MARCH]) == Answer("string", "Cà phê sữa (M)")
+    top_two = Intent(measure="revenue", shape="top_k", group_by="product", top_k=2)
+    assert compiler.answer(top_two, [MARCH]) == Answer("list", ["Cà phê sữa (M)", "Tea"])
+
+
+def test_accented_spellings_with_diacritics_prefer_the_more_frequent_one() -> None:
+    # Both spellings have three letters with diacritics; "Cà phê sữa (M)" has three rows, the other one.
+    lines = [
+        ("M1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "dine", "sua", "Cà Phê Sữa (m)", 1, 1, 60),
+        ("M2", "2026-03-03", "2026-03-03 09:00:00", "completed", "c1", "dine", "sua", "Cà phê sữa (M)", 1, 1, 40),
+        ("M3", "2026-03-04", "2026-03-04 09:00:00", "completed", "c1", "dine", "sua", "Cà phê sữa (M)", 1, 1, 40),
+        ("M4", "2026-03-05", "2026-03-05 09:00:00", "completed", "c1", "dine", "sua", "Cà phê sữa (M)", 1, 1, 40),
+    ]
+    compiler = Compiler(spelled_lines_db(lines))
+    top_one = Intent(measure="revenue", shape="top_k", group_by="product")
+    assert compiler.answer(top_one, [MARCH]) == Answer("string", "Cà phê sữa (M)")
+
+
+def test_equal_spellings_fall_back_to_the_lowest_string() -> None:
+    # Same diacritics and same row count: the lowest string wins, so the answer does not depend on row order.
+    lines = [
+        ("T1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "dine", "sua", "Cà phê", 1, 1, 50),
+        ("T2", "2026-03-03", "2026-03-03 09:00:00", "completed", "c1", "dine", "sua", "Cà Phê", 1, 1, 50),
+    ]
+    compiler = Compiler(spelled_lines_db(lines))
+    top_one = Intent(measure="revenue", shape="top_k", group_by="product")
+    assert compiler.answer(top_one, [MARCH]) == Answer("string", "Cà Phê")
+
+
+def test_product_group_with_no_name_still_abstains() -> None:
+    lines = [("N1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "dine", "sua", None, 1, 1, 50)]
+    compiler = Compiler(spelled_lines_db(lines))
+    with pytest.raises(Unsupported, match="no name"):
+        compiler.answer(Intent(measure="revenue", shape="top_k", group_by="product"), [MARCH])
+
+
+# order_id, date, ts, status, customer_key, customer_name, channel, revenue, total_due
+SPELLED_CUSTOMER_ORDERS = [
+    ("Q1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "Bích Ngọc", "dine", 100, 100),
+    ("Q2", "2026-03-03", "2026-03-03 09:00:00", "completed", "c1", "Bích Ngọc", "dine", 100, 100),
+    ("Q3", "2026-03-04", "2026-03-04 09:00:00", "completed", "c1", "Bích Ngọc", "dine", 100, 100),
+    ("Q4", "2026-03-05", "2026-03-05 09:00:00", "completed", "c1", "Bich Ngoc", "dine", 100, 100),
+    ("Q5", "2026-03-06", "2026-03-06 09:00:00", "completed", "c2", "Minh", "dine", 150, 150),
+]
+
+
+def test_customer_ranking_prints_the_accented_spelling_of_a_customer() -> None:
+    # Bích Ngọc: 400 in revenue over 3 accented rows and 1 ASCII row. Minh is 150.
+    compiler = Compiler(make_timed_db(orders=SPELLED_CUSTOMER_ORDERS, lines=[]))
+    top_one = Intent(measure="revenue", shape="top_k", group_by="customer", top_k=1)
+    assert compiler.answer(top_one, [MARCH]) == Answer("string", "Bích Ngọc")
+    top_two = Intent(measure="revenue", shape="top_k", group_by="customer", top_k=2)
+    assert compiler.answer(top_two, [MARCH]) == Answer("list", ["Bích Ngọc", "Minh"])
+
+
+def test_customer_with_two_accented_spellings_prefers_the_more_frequent_one() -> None:
+    orders = [
+        ("R1", "2026-03-02", "2026-03-02 09:00:00", "completed", "c1", "Đức Anh", "dine", 60, 60),
+        ("R2", "2026-03-03", "2026-03-03 09:00:00", "completed", "c1", "ĐỨC ANH", "dine", 60, 60),
+        ("R3", "2026-03-04", "2026-03-04 09:00:00", "completed", "c1", "ĐỨC ANH", "dine", 60, 60),
+        ("R4", "2026-03-05", "2026-03-05 09:00:00", "completed", "c1", "ĐỨC ANH", "dine", 60, 60),
+    ]
+    compiler = Compiler(make_timed_db(orders=orders, lines=[]))
+    top_one = Intent(measure="revenue", shape="top_k", group_by="customer")
+    assert compiler.answer(top_one, [MARCH]) == Answer("string", "ĐỨC ANH")
+
+
 # order_total_due.
 def test_order_total_due_sums_valid_orders() -> None:
     # Totals: A1 110, A2 50, A3 45, A4 80, A5 30, A10 25, A12 15. A7 has none and adds nothing. Sum 355.

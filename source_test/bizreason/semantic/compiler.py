@@ -5,6 +5,8 @@ from __future__ import annotations
 import operator
 import re
 import sqlite3
+import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -44,7 +46,8 @@ LINE_DIMS = {
     "product": "product_key", "product_group": "category", "size": "product_name", "unit": "unit",
     "prescription": "prescription", "active_ingredient": "active_ingredient", "product_kind": "product_kind",
 }
-LABEL = {"product": "MIN(product_name)", "customer": "MIN(customer_name)", "employee": "employee"}
+# The printed name of a ranked group: the best spelling among the group's rows (see _BestSpelling).
+LABEL = {"product": "best_spelling(product_name)", "customer": "best_spelling(customer_name)", "employee": "employee"}
 # Threshold subjects: (table, key column, metric expressions). A subject is one key; its metric is per key.
 THRESHOLD_SUBJECTS = {
     "customer": ("orders", "customer_key", {"order_count": "COUNT(DISTINCT order_id)", "revenue": "SUM(revenue)"}),
@@ -85,6 +88,31 @@ _GENERIC_PHRASES = sorted(
 
 class Unsupported(Exception):
     """The system cannot establish an answer; the caller abstains."""
+
+
+def _diacritic_letters(text: str) -> int:
+    """How many non-ASCII letters a spelling has, after composing marks into their letters."""
+    return sum(1 for ch in unicodedata.normalize("NFC", text) if ch.isalpha() and not ch.isascii())
+
+
+class _BestSpelling:
+    """SQLite aggregate: the spelling to print for one name group.
+
+    Among the distinct spellings of a group, the winner has the most letters with diacritics, then the most rows,
+    then the lowest string. Null names are skipped, so a group with no name gives NULL and the caller abstains.
+    """
+
+    def __init__(self) -> None:
+        self.counts: Counter[str] = Counter()
+
+    def step(self, value: Any) -> None:
+        if value is not None:
+            self.counts[str(value)] += 1
+
+    def finalize(self) -> str | None:
+        if not self.counts:
+            return None
+        return min(self.counts, key=lambda s: (-_diacritic_letters(s), -self.counts[s], s))
 
 
 @dataclass
@@ -288,6 +316,7 @@ class Compiler:
         self.db = connection
         self.db.create_function("clock_of", 1, _clock_of)
         self.db.create_function("name_head", 1, _name_head)
+        self.db.create_aggregate("best_spelling", 1, _BestSpelling)
         self.has_lines = self.db.execute("SELECT 1 FROM lines LIMIT 1").fetchone() is not None
         self.line_columns = {row[1] for row in self.db.execute("PRAGMA table_info(lines)")}
         self.order_columns = {row[1] for row in self.db.execute("PRAGMA table_info(orders)")}
@@ -659,7 +688,7 @@ class Compiler:
         if "customer_name" not in self.order_columns:
             return None
         rows = self.db.execute(
-            "SELECT customer_key, MIN(customer_name) FROM orders WHERE customer_key IS NOT NULL GROUP BY customer_key"
+            "SELECT customer_key, best_spelling(customer_name) FROM orders WHERE customer_key IS NOT NULL GROUP BY customer_key"
         ).fetchall()
         return dict(rows)
 

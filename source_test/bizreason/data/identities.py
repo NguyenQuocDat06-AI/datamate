@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from bizreason.contracts import TableMeta
 from bizreason.utils import normalize_lookup, quote_identifier
@@ -47,6 +47,16 @@ def strip_embedded_phone(name: str) -> tuple[str, str | None]:
     if len(alpha_words) < 2:
         return (cleaned, None)
     return (clean_text(prefix), phone_raw.strip())
+
+
+def _display_rank(candidate: str, occurrences: int) -> tuple:
+    """Sort key for display spellings; lower sorts first. Total order, so the pick never depends on hash seed."""
+    diacritics = sum(1 for ch in candidate if ch.isalpha() and not ch.isascii())
+    return (candidate.isupper(), -diacritics, -occurrences, -len(candidate), candidate)
+
+
+def _pick_display(counts: dict[str, int]) -> str:
+    return sorted(counts, key=lambda s: _display_rank(s, counts[s]))[0]
 
 
 def is_retail_customer(value: object) -> bool:
@@ -130,7 +140,7 @@ def canonicalize_customers(connection: sqlite3.Connection, tables: list[TableMet
 
     catalog_map = {cid: next(iter(names)) for cid, names in dim_candidates.items() if len(names) == 1}
 
-    cid_observed: dict[str, set[str]] = defaultdict(set)
+    cid_observed: dict[str, Counter[str]] = defaultdict(Counter)
     for table in tables:
         cid_col, cname_col = table.role("customer_id"), table.role("customer_name")
         if not cid_col or not cname_col:
@@ -140,7 +150,7 @@ def canonicalize_customers(connection: sqlite3.Connection, tables: list[TableMet
         ):
             txt = clean_text(name)
             if txt and not is_retail_customer(txt):
-                cid_observed[str(cid)].add(txt)
+                cid_observed[str(cid)][txt] += 1
 
     canonical_map: dict[str, str] = {}
     for cid_str, names in cid_observed.items():
@@ -150,12 +160,14 @@ def canonicalize_customers(connection: sqlite3.Connection, tables: list[TableMet
             stripped_map = {n: strip_embedded_phone(n)[0] for n in names}
             norm_stripped = {normalize_lookup(s) for s in stripped_map.values()}
             if len(norm_stripped) == 1:
-                clean_candidates = [n for n in names if n == stripped_map[n]]
-                if clean_candidates:
-                    clean_candidates.sort(key=lambda x: (x.isupper(), -len(x)))
-                    canonical_map[cid_str] = clean_candidates[0]
+                clean_counts = {n: names[n] for n in names if n == stripped_map[n]}
+                if clean_counts:
+                    canonical_map[cid_str] = _pick_display(clean_counts)
                 else:
-                    canonical_map[cid_str] = next(iter(stripped_map.values()))
+                    stripped_counts: Counter[str] = Counter()
+                    for n, count in names.items():
+                        stripped_counts[stripped_map[n]] += count
+                    canonical_map[cid_str] = _pick_display(stripped_counts)
 
     for table in tables:
         cid_col, cname_col = table.role("customer_id"), table.role("customer_name")
