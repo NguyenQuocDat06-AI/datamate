@@ -949,10 +949,13 @@ def _register(con: sqlite3.Connection) -> None:
 
 def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
           status_map: dict[str, str] | None = None, line_kinds: dict[str, str] | None = None,
-          value_groups: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
+          value_groups: dict[str, dict[str, str]] | None = None,
+          model_failures: list[str] | None = None) -> dict[str, Any]:
     """line_kinds maps a product name (normalized by normalize_lookup) to a LINE_ITEM_KINDS value.
 
     value_groups maps a role (a key of VALUE_GROUP_FIELDS) to {raw value: canonical value}.
+    model_failures lists the model stages that failed and were replaced by fallbacks; the solver abstains
+    on a database that records any.
     """
     pairs: list[tuple[str, str]] = []
     for name, kind in (line_kinds or {}).items():
@@ -987,6 +990,8 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.execute("CREATE TEMP TABLE alias_map (alias_key TEXT PRIMARY KEY, full_name TEXT)")
     dst.execute("CREATE TEMP TABLE employee_names (full_name TEXT)")
     dst.execute("CREATE TABLE build_stats (key TEXT, value INTEGER)")
+    dst.execute("CREATE TABLE model_failures (stage TEXT)")
+    dst.executemany("INSERT INTO model_failures VALUES (?)", [(stage,) for stage in model_failures or []])
     stats: Counter[str] = Counter({key: 0 for key in BUILD_STAT_KEYS})
     report: dict[str, Any] = {
         "sales_tables": 0, "service_tables": 0, "purchase_tables": 0, "return_tables": 0, "unannotated": [],
@@ -1086,6 +1091,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["purchases"] = dst.execute("SELECT COUNT(*) FROM purchases").fetchone()[0]
     report["payments"] = dst.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
     report["deliveries"] = dst.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+    report["model_failures"] = len(model_failures or [])
     dst.commit()
     dst.execute("DETACH DATABASE source")
     dst.commit()

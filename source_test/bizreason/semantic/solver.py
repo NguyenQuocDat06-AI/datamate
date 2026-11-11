@@ -158,6 +158,11 @@ class SemanticSolver:
         parsed = self.parser.parse(question.question, choices=filter_choices(self.connection))
         intent = parsed.intent
         trace.intent = intent
+        failed_stage = self._model_failure()
+        if failed_stage is not None:
+            # The layer was built with a model fallback, so no answer from it is trusted; this runs before the
+            # unanswerable paths so that a degraded shop is never reported as unanswerable.
+            return self._finish(question, trace, "abstain", f"model stage failed: {failed_stage}")
         if intent is None:
             return self._finish(question, trace, "abstain", parsed.reason)
         ungrounded = _ungrounded_dim(question.question, intent.filters)
@@ -244,6 +249,18 @@ class SemanticSolver:
         if exists is None:
             return None
         return {str(key): value for key, value in self.connection.execute("SELECT key, value FROM shop_facts")}
+
+    def _model_failure(self) -> str | None:
+        """First model stage recorded as failed in the layer, or None; None too when the table is missing."""
+        exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_failures'"
+        ).fetchone()
+        if exists is None:
+            return None
+        row = self.connection.execute("SELECT stage FROM model_failures ORDER BY rowid LIMIT 1").fetchone()
+        if row is None:
+            return None
+        return "unknown" if row[0] is None else str(row[0])
 
     def _orders_range(self) -> tuple[date, date] | None:
         row = self.connection.execute("SELECT MIN(date), MAX(date) FROM orders").fetchone()

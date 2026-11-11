@@ -914,3 +914,51 @@ def test_load_value_groups_with_another_revision_is_ignored_and_rewritten(tmp_pa
 
     assert result == {"channel": {"Bán lẻ tại quầy": "Bán lẻ"}}
     assert json.loads(cache.read_text(encoding="utf-8")) == {"revision": "rev-1", "value_groups": result}
+
+
+def test_failed_line_classification_is_recorded_and_taken_once() -> None:
+    annotator = Annotator(StatusModel(fail=RuntimeError("down")), workers=1)
+
+    result = annotator.annotate_line_kinds(_context([]), [], ["Shirt"], ["Coke", "Voucher 10"])
+
+    assert result == {}
+    assert annotator.take_failures() == ["line_kinds"]
+    assert annotator.take_failures() == []
+
+
+def test_successful_stage_records_no_failure() -> None:
+    annotator = Annotator(StatusModel(reply={"Coke": "product", "Voucher 10": "discount"}), workers=1)
+
+    annotator.annotate_line_kinds(_context([]), [], ["Shirt"], ["Coke", "Voucher 10"])
+
+    assert annotator.take_failures() == []
+
+
+def test_failed_value_grouping_records_failure_and_writes_no_cache(tmp_path: Path) -> None:
+    context, records = _value_context(tmp_path, [("Bán lẻ", "cai", ["Bán lẻ", "cai"]),
+                                                 (None, "hop", ["Bán lẻ tại quầy", "hop"])])
+    cache = tmp_path / "groups.json"
+    annotator = Annotator(ValueModel(_raise), workers=1)
+
+    assert load_value_groups(annotator, context, records, cache) == {}
+    assert not cache.exists()
+    failures = annotator.take_failures()
+    assert failures and all(stage.startswith("value_groups:") for stage in failures)
+
+
+class PartialStatusAnnotator(Annotator):
+    """Returns a usable map but records a failure, as a stage that lost some of its calls would."""
+
+    def annotate_status(self, context: BusinessContext, records: list[dict[str, Any]]) -> dict[str, str]:
+        self._record_failure("status")
+        return {"delivered": "completed"}
+
+
+def test_load_status_map_skips_cache_when_a_failure_was_recorded(tmp_path: Path) -> None:
+    context, records = _status_context(tmp_path, ["delivered"])
+    cache = tmp_path / "status.json"
+
+    result = load_status_map(PartialStatusAnnotator(StatusModel(), workers=1), context, records, cache)
+
+    assert result == {"delivered": "completed"}
+    assert not cache.exists()

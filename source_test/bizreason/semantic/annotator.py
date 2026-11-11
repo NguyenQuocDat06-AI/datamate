@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -337,6 +338,27 @@ class Annotator:
         self.model = model
         self.timeout = timeout
         self.workers = workers
+        # Stage names of model calls that failed and were replaced by a fallback; see take_failures().
+        self.failures: list[str] = []
+        self._failures_lock = threading.Lock()
+        self._failure_seq = 0
+
+    def _record_failure(self, stage: str) -> None:
+        with self._failures_lock:
+            self.failures.append(stage)
+            self._failure_seq += 1
+
+    def failure_count(self) -> int:
+        """Number of model failures recorded so far; unaffected by take_failures()."""
+        with self._failures_lock:
+            return self._failure_seq
+
+    def take_failures(self) -> list[str]:
+        """Return the stage names of model failures recorded since the last call, and clear them."""
+        with self._failures_lock:
+            taken = list(self.failures)
+            self.failures.clear()
+        return taken
 
     def annotate(self, context: BusinessContext) -> list[dict[str, Any]]:
         groups = group_tables(context)
@@ -365,6 +387,7 @@ class Annotator:
             reply = self.model.generate_json(system, "Values:\n" + json.dumps(values, ensure_ascii=False),
                                              timeout=self.timeout)
         except Exception:
+            self._record_failure("status")
             return {}
         if not isinstance(reply, dict):
             return {}
@@ -393,6 +416,7 @@ class Annotator:
                 reply = self.model.generate_json(system, "Names:\n" + json.dumps(batch, ensure_ascii=False),
                                                  timeout=self.timeout)
             except Exception:
+                self._record_failure("line_kinds")
                 continue
             if not isinstance(reply, dict):
                 continue
@@ -457,6 +481,7 @@ class Annotator:
                 result.update({value: canonical for value in members})
             return result
         except Exception:
+            self._record_failure(f"value_groups:{role}")
             return {}
 
     def _map_payment(self, values: list[str]) -> dict[str, str]:
@@ -564,7 +589,7 @@ class Annotator:
             try:
                 return self._ask_roles(doc, columns, roles), False
             except Exception:
-                pass  # retried below as batches
+                pass  # retried below as batches; only a batch that still fails is a failure
         batches = [columns[i:i + ROLE_BATCH_SIZE] for i in range(0, len(columns), ROLE_BATCH_SIZE)] or [[]]
         merged: dict[str, str] = {}
         failed = 0
@@ -573,6 +598,7 @@ class Annotator:
             try:
                 merged.update(self._ask_roles(doc, batch, roles))
             except Exception as exc:
+                self._record_failure(f"roles:{table.name}")
                 failed += 1
                 last_error = exc
         if failed == len(batches) and last_error is not None:
@@ -601,6 +627,7 @@ class Annotator:
             except Exception:
                 if not kind_fallback:
                     raise
+                self._record_failure(f"kind:{table.name}")
                 kind = None
             if not isinstance(kind, str) or kind not in KINDS:
                 kind = "other"
@@ -620,6 +647,7 @@ class Annotator:
             if partial:
                 record["partial"] = True
         except Exception as exc:
+            self._record_failure(f"annotation:{table.name}")
             record["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         record["seconds"] = round(time.time() - started, 1)
         return record
@@ -634,8 +662,9 @@ def load_or_annotate(annotator: Annotator, context: BusinessContext, cache_path:
     if isinstance(cached, dict) and cached.get("revision") == context.revision and isinstance(cached.get("records"), list):
         return cached["records"]
 
+    failures_before = annotator.failure_count()
     records = annotator.annotate(context)
-    if any("error" in record for record in records):
+    if any("error" in record for record in records) or annotator.failure_count() != failures_before:
         return records  # a transient model failure must not persist
     _write_json_atomic(cache_path, {"revision": context.revision, "records": records})
     return records
@@ -654,8 +683,9 @@ def load_status_map(annotator: Annotator, context: BusinessContext, records: lis
     if isinstance(cached, dict) and cached.get("revision") == context.revision and isinstance(cached.get("status_map"), dict):
         return cached["status_map"]
 
+    failures_before = annotator.failure_count()
     status_map = annotator.annotate_status(context, records)
-    if not status_map and order_status_values(context, records):
+    if (not status_map and order_status_values(context, records)) or annotator.failure_count() != failures_before:
         return status_map  # a transient model failure must not persist
     _write_json_atomic(cache_path, {"revision": context.revision, "status_map": status_map})
     return status_map
@@ -674,9 +704,10 @@ def load_value_groups(annotator: Annotator, context: BusinessContext, records: l
     if isinstance(cached, dict) and cached.get("revision") == context.revision and isinstance(cached.get("value_groups"), dict):
         return cached["value_groups"]
 
+    failures_before = annotator.failure_count()
     maps, failed = annotator._group_context(context, records)
     value_groups = _changed_only(maps)
-    if failed:
+    if failed or annotator.failure_count() != failures_before:
         return value_groups  # a transient model failure must not persist
     _write_json_atomic(cache_path, {"revision": context.revision, "value_groups": value_groups})
     return value_groups

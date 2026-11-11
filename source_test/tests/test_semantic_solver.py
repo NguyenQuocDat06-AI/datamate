@@ -541,3 +541,39 @@ def test_product_punctuation_and_diacritics_are_ignored():
 def test_excluded_quoted_filter_is_checked_too():
     filters = [{"dim": "brand", "value": "acme", "exclude": True}]
     assert _ungrounded_dim("doanh thu tháng 3", filters) == "brand"
+
+
+def _record_model_failures(conn: sqlite3.Connection, *stages: str) -> None:
+    conn.execute("CREATE TABLE model_failures (stage TEXT)")
+    conn.executemany("INSERT INTO model_failures VALUES (?)", [(stage,) for stage in stages])
+
+
+def test_model_failure_in_layer_abstains_before_any_answer(reached: list[str]):
+    conn = make_db()
+    _record_model_failures(conn, "line_kinds", "status")
+    prediction, trace = solve(ParseResult(Intent(measure="revenue", shape="scalar")),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: line_kinds"
+    assert trace.decision == "abstain"
+    assert reached == []
+
+
+def test_model_failure_does_not_turn_an_unanswerable_question_into_unanswerable(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_address=0, has_orders=1)
+    _record_model_failures(conn, "value_groups:channel")
+    prediction, _ = solve(ParseResult(Intent(measure="order_count", location="Main street")),
+                          FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: value_groups:channel"
+
+
+def test_empty_model_failures_table_leaves_answers_unchanged():
+    conn = make_db()
+    _record_model_failures(conn)
+    prediction, trace = solve(ParseResult(Intent(measure="revenue", shape="scalar")),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.NUMBER
+    assert prediction.answer == 150
+    assert trace.decision == "value"

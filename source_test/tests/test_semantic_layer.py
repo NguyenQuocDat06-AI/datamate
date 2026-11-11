@@ -1619,3 +1619,23 @@ def test_ranking_by_employee_counts_the_merged_name_once(tmp_path: Path) -> None
                                [april]).value == "Hà Loan Đạt"
     finally:
         con.close()
+
+
+def test_build_writes_model_failures_table_and_report_count(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100")])}
+
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)], model_failures=["line_kinds"])
+
+    assert _query(out, "SELECT stage FROM model_failures") == [("line_kinds",)]
+    assert report["model_failures"] == 1
+
+
+def test_build_without_model_failures_leaves_an_empty_table(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100")])}
+
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)])
+
+    assert _query(out, "SELECT COUNT(*) FROM model_failures") == [(0,)]
+    assert report["model_failures"] == 0
