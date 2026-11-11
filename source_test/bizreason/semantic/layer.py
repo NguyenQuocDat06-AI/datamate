@@ -247,7 +247,10 @@ def _choose_column(dst: sqlite3.Connection | None, table: TableMeta, role: str, 
     if role in ("product_id", "customer_id"):
         # the id that joins the matching catalog's ids wins; a barcode-like id that joins nothing loses
         catalog = {row[0] for row in dst.execute("SELECT id FROM temp.catalog_ids WHERE role=?", (role,))}
-        score = {c: _share_in(_distinct_texts(dst, table, c), catalog) for c in columns}
+        score = {c: _share_in(_distinct_texts(dst, table, c), catalog) for c in columns} if catalog else {}
+        if not score or _no_clear_winner(score):
+            # no catalog evidence: the id with the most filled, distinct values wins (a mostly blank barcode loses)
+            score = {c: float(len(_distinct_texts(dst, table, c))) for c in columns}
     elif role in ("ordered_at", "order_time"):
         # a column carrying a clock time other than midnight beats a date-only column
         score = {c: float(sum(_has_clock(v) for v in _distinct_texts(dst, table, c))) for c in columns}
@@ -261,6 +264,12 @@ def _choose_column(dst: sqlite3.Connection | None, table: TableMeta, role: str, 
         return columns[0]
     best = max(columns, key=lambda c: score[c])  # max returns the first of equal scores
     return best if score[best] > 0 else columns[0]
+
+
+def _no_clear_winner(score: dict[str, float]) -> bool:
+    """True when every candidate scores 0, or the best score is shared."""
+    best = max(score.values())
+    return best == 0 or sum(value == best for value in score.values()) > 1
 
 
 def _distinct_texts(dst: sqlite3.Connection, table: TableMeta, column: str) -> list[str]:
@@ -750,13 +759,17 @@ def _load_product_attrs(dst: sqlite3.Connection, table: TableMeta, kind: str, ro
     kind_column = roles.get("product_kind") if kind == "alias" else None
     if not (roles.get("prescription_flag") or roles.get("active_ingredient") or kind_column):
         return
+    # A row with an id and no name takes the name the catalogs give that id; an id with no single name keeps
+    # joining by id alone, as before.
     dst.execute(
         "INSERT INTO temp.product_attrs (product_id, name_key, prescription, active_ingredient, product_kind) "
-        f"SELECT pid, NULLIF(lookup(nm), ''), rx, ai, pk FROM (SELECT {_text(roles.get('product_id'))} AS pid, "
-        f"{_text(roles.get('product_name'))} AS nm, {_prescription_sql(roles.get('prescription_flag'))} AS rx, "
+        f"SELECT pid, NULLIF(lookup(full_nm), ''), rx, ai, pk FROM (SELECT pid, "
+        f"COALESCE(nm, {_catalog_name('product_id', 'pid')}) AS full_nm, rx, ai, pk FROM (SELECT "
+        f"{_text(roles.get('product_id'))} AS pid, {_text(roles.get('product_name'))} AS nm, "
+        f"{_prescription_sql(roles.get('prescription_flag'))} AS rx, "
         f"{_text(roles.get('active_ingredient'))} AS ai, {_text(kind_column)} AS pk "
-        f"FROM source.{q(table.name)} AS src) "
-        "WHERE (pid IS NOT NULL OR nm IS NOT NULL) AND (rx IS NOT NULL OR ai IS NOT NULL OR pk IS NOT NULL)"
+        f"FROM source.{q(table.name)} AS src)) "
+        "WHERE (pid IS NOT NULL OR full_nm IS NOT NULL) AND (rx IS NOT NULL OR ai IS NOT NULL OR pk IS NOT NULL)"
     )
 
 
@@ -932,9 +945,11 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             report["unannotated"].append(table.name)
         else:
             annotated.append((table, note))
-    # catalog ids and names are read first, so that a duplicated id column can be judged by how it joins them
-    for table, note in annotated:
-        _load_catalog_keys(dst, table, note["kind"], effective_roles(table, note))
+    # catalog ids and names are read first, so that a duplicated id column can be judged by how it joins them.
+    # Every table's roles are chosen before any id is loaded, so the first pass cannot judge a column by its own ids.
+    first_pass = [(table, note["kind"], effective_roles(table, note, dst)) for table, note in annotated]
+    for table, kind, roles in first_pass:
+        _load_catalog_keys(dst, table, kind, roles)
     for table, note in annotated:
         unresolved = _given_by_column(table, note.get("roles") or {})[1]
         roles = effective_roles(table, note, dst)

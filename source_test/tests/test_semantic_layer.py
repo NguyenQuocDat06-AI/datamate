@@ -1461,3 +1461,81 @@ def test_unknown_value_group_role_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         _run_with(tmp_path, specs, [_record(SALES_LINE_COLUMNS, "sales", SALES_LINE_ROLES)],
                   value_groups={"colour": {"red": "blue"}})
+
+
+def test_blank_barcode_id_listed_first_loses_to_the_full_sku_id_in_the_catalog(tmp_path: Path) -> None:
+    catalog_columns = ["barcode", "sku", "name"]
+    # the barcode is filled on 20 of 50 rows and is listed first; the sku is filled on every row
+    catalog_rows = [
+        (f"893456789{n:04d}" if n <= 20 else None, f"P{n}", f"Mon {n}") for n in range(1, 51)
+    ]
+    specs: Specs = {
+        "sales": (["order", "sku", "amount"], [("O1", "P1", "100"), ("O2", "P2", "50")]),
+        "products": (catalog_columns, catalog_rows),
+    }
+    records = [
+        _record(["order", "sku", "amount"], "sales", {"order": "order_id", "sku": "product_id",
+                                                     "amount": "line_amount"}),
+        _record(catalog_columns, "product_catalog", {"barcode": "product_id", "sku": "product_id",
+                                                     "name": "product_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, product_id, product_name FROM lines ORDER BY order_id") == [
+        ("O1", "P1", "Mon 1"), ("O2", "P2", "Mon 2"),
+    ]
+
+
+def test_equally_filled_id_columns_keep_the_first_column(tmp_path: Path) -> None:
+    catalog_columns = ["first", "second", "name"]
+    sales_columns = ["order", "pid", "amount"]
+    specs: Specs = {
+        "sales": (sales_columns, [("O1", "A1", "100")]),  # references the first column's ids
+        "products": (catalog_columns, [("A1", "B1", "Tra sua"), ("A2", "B2", "Ca phe")]),
+    }
+    records = [
+        _record(sales_columns, "sales", {"order": "order_id", "pid": "product_id", "amount": "line_amount"}),
+        _record(catalog_columns, "product_catalog", {"first": "product_id", "second": "product_id",
+                                                     "name": "product_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT product_id, product_name FROM lines") == [("A1", "Tra sua")]
+
+
+def test_prescription_and_ingredient_reach_lines_when_the_attribute_sheet_has_no_name(tmp_path: Path) -> None:
+    attr_columns = ["sku", "ingredient", "rx"]
+    specs: Specs = {
+        "sales": (["order", "item", "amount"], [("O1", "Paracetamol", "100"), ("O2", "Vitamin C", "50")]),
+        "attributes": (attr_columns, [("P1", "paracetamol", "yes"), ("P2", "ascorbic", "no")]),
+        "names": (["code", "name"], [("P1", "Paracetamol"), ("P2", "Vitamin C")]),
+    }
+    records = [
+        _record(["order", "item", "amount"], "sales", SALES_ROLES),
+        _record(attr_columns, "product_catalog", {"sku": "product_id", "ingredient": "active_ingredient",
+                                                  "rx": "prescription_flag"}),
+        _record(["code", "name"], "product_catalog", {"code": "product_id", "name": "product_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, prescription, active_ingredient FROM lines ORDER BY order_id") == [
+        ("O1", 1, "paracetamol"), ("O2", 0, "ascorbic"),
+    ]
+
+
+def test_attribute_row_whose_id_has_no_single_name_still_joins_by_id(tmp_path: Path) -> None:
+    attr_columns = ["sku", "rx"]
+    specs: Specs = {
+        "sales": (["order", "sku", "amount"], [("O1", "P1", "100"), ("O2", "P9", "50")]),
+        "attributes": (attr_columns, [("P1", "yes"), ("P9", "yes")]),
+        "names": (["code", "name"], [("P1", "Paracetamol"), ("P9", "Gift"), ("P9", "Gift 2")]),
+    }
+    records = [
+        _record(["order", "sku", "amount"], "sales", {"order": "order_id", "sku": "product_id",
+                                                     "amount": "line_amount"}),
+        _record(attr_columns, "product_catalog", {"sku": "product_id", "rx": "prescription_flag"}),
+        _record(["code", "name"], "product_catalog", {"code": "product_id", "name": "product_name"}),
+    ]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id, prescription FROM lines ORDER BY order_id") == [("O1", 1), ("O2", 1)]
