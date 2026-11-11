@@ -131,3 +131,7 @@ GENERIC_FILTER_WORDS = (
 )
 # Rulebook §7: a question about a customer's address needs a column carrying one.
 ADDRESS_HEADER_TOKENS = ("dia chi", "addr", "address", "duong pho")
+# Question wording that asks for a value beside each entity of a ranked list ("with the amount", "each person's
+# amount", "and the number"). Compared after lookup normalization, as whole words. Used only with a top-k intent
+# that groups by an entity, so a plain list of values is never matched by these words.
+TABLE_ASK_CUES = ("kem", "moi nguoi", "tung nguoi", "va so")

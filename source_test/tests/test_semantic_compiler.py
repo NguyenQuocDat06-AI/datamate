@@ -1176,3 +1176,43 @@ def test_breakdown_with_group_by_and_second_measure_still_raises() -> None:
     intent = Intent(measure="revenue", measure2="order_count", shape="breakdown", group_by="channel")
     with pytest.raises(Unsupported, match="second measure"):
         compiler.answer(intent, [MARCH])
+
+
+# Table answers: a top-k ranking with the value of each entity beside its name.
+def test_table_lists_each_top_name_with_its_value_in_rank_order() -> None:
+    # Revenue by customer in March: Lan 150, Minh 110, then an unnamed customer.
+    compiler = Compiler(make_timed_db())
+    intent = Intent(measure="revenue", shape="top_k", group_by="customer", top_k=2)
+    assert compiler.table(intent, [MARCH]) == Answer(
+        "table", {"columns": ["name", "value"], "rows": [["Lan", 150], ["Minh", 110]]}
+    )
+
+
+def test_table_with_a_null_name_in_the_ranking_raises() -> None:
+    compiler = Compiler(make_timed_db())
+    with pytest.raises(Unsupported, match="no name"):
+        compiler.table(Intent(measure="revenue", shape="top_k", group_by="customer", top_k=3), [MARCH])
+
+
+def test_table_needs_a_top_k_with_grouping() -> None:
+    compiler = Compiler(make_timed_db())
+    with pytest.raises(Unsupported, match="top_k with grouping"):
+        compiler.table(Intent(measure="revenue", shape="breakdown", group_by="customer"), [MARCH])
+
+
+def test_table_matches_a_gold_shaped_reference_under_the_scorer() -> None:
+    from bizreason.evaluation.scorer import matches
+
+    compiler = Compiler(make_timed_db())
+    predicted = compiler.table(Intent(measure="revenue", shape="top_k", group_by="customer", top_k=2), [MARCH])
+    # A reference with other column names and the rows in another order is still the same table.
+    reference = {
+        "type": "table",
+        "answer": {"columns": ["khach_hang", "so_tien_no"], "rows": [["Minh", 110], ["Lan", 150]]},
+    }
+    assert matches({"type": predicted.type, "answer": predicted.value}, reference)
+    wrong_value = {
+        "type": "table",
+        "answer": {"columns": ["khach_hang", "so_tien_no"], "rows": [["Minh", 110], ["Lan", 151]]},
+    }
+    assert not matches({"type": predicted.type, "answer": predicted.value}, wrong_value)

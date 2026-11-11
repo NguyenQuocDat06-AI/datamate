@@ -8,7 +8,7 @@ import pytest
 
 from bizreason.contracts import AnswerType, Question, TimeWindow
 from bizreason.semantic import solver as solver_module
-from bizreason.semantic.compiler import Intent, Unsupported
+from bizreason.semantic.compiler import Answer, Intent, Unsupported
 from bizreason.semantic.solver import SemanticSolver, _ungrounded_dim, filter_choices
 from bizreason.utils import normalize_lookup
 
@@ -576,4 +576,106 @@ def test_empty_model_failures_table_leaves_answers_unchanged():
                               FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
     assert prediction.type == AnswerType.NUMBER
     assert prediction.answer == 150
+    assert trace.decision == "value"
+
+
+# Table cues: wording that asks for a value beside each entity of a ranked list.
+@pytest.mark.parametrize("text", [
+    "Top 3 khách hàng có công nợ lớn nhất và số nợ của từng người?",
+    "Liệt kê 5 khách nợ nhiều nhất, kèm số tiền còn nợ.",
+    "5 khách nào đang nợ nhiều nhất, mỗi người còn nợ bao nhiêu?",
+    "3 khách nợ nhiều nhất, moi nguoi con no bnhiu",
+    "Cho bảng 3 khách còn nợ, kèm số tiền",
+])
+def test_table_cue_is_found_in_entity_value_questions(text: str) -> None:
+    assert solver_module.asks_entity_values(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Doanh thu từng tháng của 3 tháng 11/2025 lần lượt là bao nhiêu?",
+    "Top 3 khách hàng nợ nhiều nhất tính đến hết ngày 14/08/2026",
+    "Doanh thu tháng này là bao nhiêu?",
+    "Số lượng đơn hủy là bao nhiêu, kể cả đơn trả?",
+])
+def test_table_cue_is_not_found_in_other_questions(text: str) -> None:
+    assert not solver_module.asks_entity_values(text)
+
+
+def test_list_answer_with_table_cue_abstains_for_answer_shape(monkeypatch: pytest.MonkeyPatch):
+    # A breakdown by group answers a list of values; with a cue asking each entity's value it must abstain.
+    class ListCompiler:
+        def __init__(self, connection):
+            pass
+
+        def answer(self, intent, windows):
+            return Answer("list", [120, 80])
+
+    monkeypatch.setattr(solver_module, "Compiler", ListCompiler)
+    intent = Intent(measure="revenue", shape="breakdown", group_by="channel")
+    prediction, trace = solve(
+        ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-04-01")]),
+        text="Doanh thu của kênh dine và take, kèm số tiền mỗi người",
+    )
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "answer shape: table expected"
+    assert trace.decision == "abstain"
+
+
+def test_top_k_with_table_cue_abstains_when_no_table_can_be_built(monkeypatch: pytest.MonkeyPatch):
+    class NoTableCompiler:
+        def __init__(self, connection):
+            pass
+
+        def table(self, intent, windows):
+            raise Unsupported("ranked entity has no name")
+
+    monkeypatch.setattr(solver_module, "Compiler", NoTableCompiler)
+    intent = Intent(measure="revenue", shape="top_k", group_by="customer", top_k=3)
+    prediction, trace = solve(
+        ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-04-01")]),
+        text="Top 3 khách mua nhiều nhất, kèm số tiền",
+    )
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "ranked entity has no name"
+
+
+def test_list_answer_without_table_cue_is_returned_unchanged(monkeypatch: pytest.MonkeyPatch):
+    class ListCompiler:
+        def __init__(self, connection):
+            pass
+
+        def answer(self, intent, windows):
+            return Answer("list", ["Lan", "Minh", "Hoa"])
+
+    monkeypatch.setattr(solver_module, "Compiler", ListCompiler)
+    intent = Intent(measure="revenue", shape="top_k", group_by="customer", top_k=3)
+    prediction, _ = solve(
+        ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-04-01")]),
+        text="Top 3 khách mua nhiều nhất trong quý",
+    )
+    assert prediction.type == AnswerType.LIST
+    assert prediction.answer == ["Lan", "Minh", "Hoa"]
+
+
+def test_top_k_with_table_cue_returns_the_table_from_the_compiler(monkeypatch: pytest.MonkeyPatch):
+    table = {"columns": ["name", "value"], "rows": [["Lan", 150], ["Minh", 110]]}
+
+    class TableCompiler:
+        def __init__(self, connection):
+            pass
+
+        def table(self, intent, windows):
+            return Answer("table", table)
+
+        def answer(self, intent, windows):
+            raise AssertionError("a table question must not take the list path")
+
+    monkeypatch.setattr(solver_module, "Compiler", TableCompiler)
+    intent = Intent(measure="revenue", shape="top_k", group_by="customer", top_k=2)
+    prediction, trace = solve(
+        ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-04-01")]),
+        text="Top 2 khách mua nhiều nhất, kèm số tiền",
+    )
+    assert prediction.type == AnswerType.TABLE
+    assert prediction.answer == table
     assert trace.decision == "value"

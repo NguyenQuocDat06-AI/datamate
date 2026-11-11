@@ -10,7 +10,7 @@ from typing import Any, Protocol
 from bizreason.contracts import AnswerType, Prediction, Question, TimeWindow
 from bizreason.semantic.compiler import DEBT_MEASURES, Compiler, Intent, Unsupported
 from bizreason.semantic.quality import QualityFlags, assess
-from bizreason.semantic.vocabulary import QUOTED_DIMENSIONS
+from bizreason.semantic.vocabulary import QUOTED_DIMENSIONS, TABLE_ASK_CUES
 from bizreason.temporal import TemporalResolver
 from bizreason.utils import normalize_lookup
 
@@ -129,6 +129,15 @@ def _ungrounded_dim(question_text: str, filters: list[dict[str, Any]]) -> str | 
     return None
 
 
+_TABLE_CUES = tuple(normalize_lookup(cue) for cue in TABLE_ASK_CUES)
+
+
+def asks_entity_values(question_text: str) -> bool:
+    """True when the question asks for a value beside each entity, by whole-word match of TABLE_ASK_CUES."""
+    text = f" {normalize_lookup(question_text)} "
+    return any(f" {cue} " in text for cue in _TABLE_CUES)
+
+
 def _quality_reason(flags: QualityFlags, name: str) -> str:
     """The first reason the assessment gives for one flag; reasons are written as 'flag name: detail'."""
     return next(reason for reason in flags.reasons if reason.startswith(f"{name}:"))
@@ -230,8 +239,16 @@ class SemanticSolver:
             if getattr(flags, name):
                 return self._finish(question, trace, "abstain", f"data quality: {_quality_reason(flags, name)}")
 
+        wants_table = intent.group_by is not None and asks_entity_values(question.question)
         try:
-            answer = Compiler(self.connection).answer(intent, windows)
+            compiler = Compiler(self.connection)
+            if wants_table and intent.shape == "top_k" and (intent.top_k or 0) >= 2:
+                answer = compiler.table(intent, windows)
+            else:
+                answer = compiler.answer(intent, windows)
+                if wants_table and answer.type == "list":
+                    # A plain list cannot carry the value each entity was asked with; abstaining is safer than a wrong list.
+                    raise Unsupported("answer shape: table expected")
         except Unsupported as exc:
             return self._finish(question, trace, "abstain", str(exc) or "unsupported")
         except Exception as exc:

@@ -1019,6 +1019,33 @@ class Compiler:
             return value / self._weekday_days(intent, window)
         return value
 
+    def table(self, intent: Intent, windows: list[TimeWindow]) -> Answer:
+        """The top-k ranking with the value of each entity beside its name, in rank order.
+
+        The values are formatted as the scalar answers of the measure are. Column names are generic; the
+        scorer compares a table by position when its column names differ from the reference.
+        """
+        if intent.shape != "top_k" or intent.group_by is None:
+            raise Unsupported("table needs a top_k with grouping")
+        if intent.location is not None or intent.threshold is not None:
+            raise Unsupported("table with a location or threshold")
+        if intent.measure2 not in (None, intent.measure):
+            raise Unsupported("table with a second measure")
+        _check_age(intent)
+        target = [w for w in windows if w.role != "comparison"]
+        if not target:
+            raise Unsupported("no time window")
+        k = 1 if intent.top_k is None else intent.top_k
+        if k < 1:
+            raise Unsupported("top_k below one")
+        picked = self._ranked(intent, target[0])[:k]
+        if not picked:
+            raise Unsupported("empty ranking")
+        if any(label is None for label, _ in picked):
+            raise Unsupported("ranked entity has no name")
+        rows = [[label, self._format(intent.measure, value).value] for label, value in picked]
+        return Answer("table", {"columns": ["name", "value"], "rows": rows})
+
     def answer(self, intent: Intent, windows: list[TimeWindow]) -> Answer:
         shape = intent.shape
         if intent.location is not None:
