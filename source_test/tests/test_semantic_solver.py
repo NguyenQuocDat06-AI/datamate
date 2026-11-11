@@ -9,7 +9,7 @@ import pytest
 from bizreason.contracts import AnswerType, Question, TimeWindow
 from bizreason.semantic import solver as solver_module
 from bizreason.semantic.compiler import Intent, Unsupported
-from bizreason.semantic.solver import SemanticSolver, filter_choices
+from bizreason.semantic.solver import SemanticSolver, _ungrounded_dim, filter_choices
 from bizreason.utils import normalize_lookup
 
 
@@ -72,10 +72,11 @@ def question(text: str = "q") -> Question:
     return Question(id="q1", business_id="b1", question=text, as_of_date=date(2026, 3, 1))
 
 
-def solve(parser_result: ParseResult, temporal: FakeTemporal, conn: sqlite3.Connection | None = None):
+def solve(parser_result: ParseResult, temporal: FakeTemporal, conn: sqlite3.Connection | None = None,
+          text: str = "q"):
     conn = conn or make_db()
     solver = SemanticSolver(FakeParser(parser_result), temporal, conn)
-    return solver.solve(question())
+    return solver.solve(question(text))
 
 
 def add_facts(conn: sqlite3.Connection, **facts: object) -> None:
@@ -227,7 +228,8 @@ def test_customer_group_filter_not_recorded_is_unanswerable(reached: list[str]):
     conn = make_db()
     add_facts(conn, has_customer_group=0, has_orders=1)
     intent = Intent(measure="revenue", filters=[{"dim": "customer_group", "value": "vip", "exclude": False}])
-    prediction, trace = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    prediction, trace = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn,
+                              text="doanh thu khach vip")
     assert prediction.type == AnswerType.UNANSWERABLE
     assert prediction.reason == "customer group not recorded"
     assert trace.decision == "unanswerable"
@@ -247,7 +249,8 @@ def test_customer_group_recorded_reaches_compiler(reached: list[str]):
     conn = make_db()
     add_facts(conn, has_customer_group=1, has_orders=1)
     intent = Intent(measure="revenue", filters=[{"dim": "customer_group", "value": "vip", "exclude": False}])
-    solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn,
+          text="doanh thu khach vip")
     assert reached == ["revenue"]
 
 
@@ -255,7 +258,8 @@ def test_customer_group_rule_needs_orders_recorded(reached: list[str]):
     conn = make_db()
     add_facts(conn, has_customer_group=0, has_orders=0)
     intent = Intent(measure="revenue", filters=[{"dim": "customer_group", "value": "vip", "exclude": False}])
-    solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn,
+          text="doanh thu khach vip")
     assert reached == ["revenue"]
 
 
@@ -411,7 +415,8 @@ def test_broken_quantity_abstains_for_a_unit_filter(reached: list[str]):
     conn = make_db()
     add_stats(conn, qty_cells_nonblank=1000, qty_cells_unparsed=50)
     intent = Intent(measure="order_count", filters=[{"dim": "unit", "value": "box", "exclude": False}])
-    prediction, _ = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    prediction, _ = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn,
+                          text="so don box")
     assert prediction.type == AnswerType.ABSTAIN
     assert prediction.reason.startswith("data quality: qty_unreliable:")
     assert reached == []
@@ -490,3 +495,49 @@ def test_missing_build_stats_leaves_answers_unchanged():
     assert prediction.type == AnswerType.NUMBER
     assert prediction.answer == 150
     assert trace.quality == []
+
+
+def test_invented_customer_group_gives_abstain_end_to_end(reached: list[str]):
+    conn = make_db()
+    add_facts(conn, has_customer_group=1, has_orders=1)
+    intent = Intent(measure="revenue", filters=[
+        {"dim": "size", "value": "m", "exclude": False},
+        {"dim": "customer_group", "value": "si", "exclude": False},
+    ])
+    prediction, trace = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn,
+                              text="quan ban dc bnhiu ly size m trong thang 10/2025")
+    assert prediction.type == AnswerType.ABSTAIN
+    assert trace.decision == "abstain"
+    assert trace.reason == "filter not in question: customer_group"
+    assert trace.intent is intent
+    assert reached == []
+
+
+def test_ungrounded_quoted_filter_is_named():
+    filters = [{"dim": "size", "value": "m", "exclude": False}, {"dim": "customer_group", "value": "si", "exclude": False}]
+    assert _ungrounded_dim("quan ban dc bnhiu ly size m trong thang 10/2025", filters) == "customer_group"
+
+
+def test_quoted_filter_matches_despite_diacritics():
+    filters = [{"dim": "customer_group", "value": "sỉ", "exclude": False}]
+    assert _ungrounded_dim("Doanh thu khách sỉ tháng 3", filters) is None
+
+
+def test_canonical_shift_value_is_not_checked():
+    filters = [{"dim": "shift", "value": "afternoon", "exclude": False}]
+    assert _ungrounded_dim("doanh thu ca chiều", filters) is None
+
+
+def test_canonical_channel_value_is_not_checked():
+    filters = [{"dim": "channel", "value": "phone", "exclude": False}]
+    assert _ungrounded_dim("dthu don qua dien thoai", filters) is None
+
+
+def test_product_punctuation_and_diacritics_are_ignored():
+    filters = [{"dim": "product", "value": "Cà phê sữa (L)", "exclude": False}]
+    assert _ungrounded_dim("so ly Ca phe sua (L) ban dc", filters) is None
+
+
+def test_excluded_quoted_filter_is_checked_too():
+    filters = [{"dim": "brand", "value": "acme", "exclude": True}]
+    assert _ungrounded_dim("doanh thu tháng 3", filters) == "brand"

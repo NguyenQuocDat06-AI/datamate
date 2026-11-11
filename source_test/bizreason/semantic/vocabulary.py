@@ -78,6 +78,13 @@ DIMENSIONS: dict[str, str] = {
     "vehicle": "a vehicle or plate",
 }
 
+# Dimensions whose filter value is copied from the question text, so the value must be found in the question.
+# Other dimensions carry canonical values (for example "yes", "afternoon", "phone") that need not appear in it.
+QUOTED_DIMENSIONS = frozenset({
+    "product", "product_group", "customer", "customer_group", "employee", "supplier", "size", "unit", "brand",
+    "active_ingredient", "service_item", "vehicle",
+})
+
 # Rulebook §3: an order without a customer identity is a walk-in and is not a customer.
 WALK_IN_NAMES = ("khach le", "khach vang lai")
 # Rulebook §1 and §5: wording of a cancelled document, compared after lookup normalization.

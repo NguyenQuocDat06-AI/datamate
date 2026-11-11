@@ -10,7 +10,9 @@ from typing import Any, Protocol
 from bizreason.contracts import AnswerType, Prediction, Question, TimeWindow
 from bizreason.semantic.compiler import DEBT_MEASURES, Compiler, Intent, Unsupported
 from bizreason.semantic.quality import QualityFlags, assess
+from bizreason.semantic.vocabulary import QUOTED_DIMENSIONS
 from bizreason.temporal import TemporalResolver
+from bizreason.utils import normalize_lookup
 
 POINT_IN_TIME = {"debt_outstanding", "debtor_count", "inventory_qty", "inventory_value", "out_of_stock_count"}
 ORDER_MEASURES = {
@@ -114,6 +116,19 @@ def _required_flags(intent: Intent) -> list[str]:
     return required
 
 
+def _ungrounded_dim(question_text: str, filters: list[dict[str, Any]]) -> str | None:
+    """The first quoted-dimension filter whose value shares no whole word with the question, or None."""
+    question_words = set(normalize_lookup(question_text).split())
+    for item in filters:
+        dim = item.get("dim")
+        if dim not in QUOTED_DIMENSIONS:
+            continue
+        value_words = normalize_lookup(str(item.get("value") or "")).split()
+        if not any(word in question_words for word in value_words):
+            return dim
+    return None
+
+
 def _quality_reason(flags: QualityFlags, name: str) -> str:
     """The first reason the assessment gives for one flag; reasons are written as 'flag name: detail'."""
     return next(reason for reason in flags.reasons if reason.startswith(f"{name}:"))
@@ -145,6 +160,9 @@ class SemanticSolver:
         trace.intent = intent
         if intent is None:
             return self._finish(question, trace, "abstain", parsed.reason)
+        ungrounded = _ungrounded_dim(question.question, intent.filters)
+        if ungrounded is not None:
+            return self._finish(question, trace, "abstain", f"filter not in question: {ungrounded}")
         if intent.measure == "outside":
             return self._finish(question, trace, "abstain", "outside known measures")
 
