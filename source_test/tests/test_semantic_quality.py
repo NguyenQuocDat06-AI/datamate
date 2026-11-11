@@ -147,3 +147,16 @@ def test_missing_keys_and_unreadable_values_do_not_fire():
 
 def test_negative_stat_is_unknown():
     assert assess(stats_db(qty_cells_nonblank=100, qty_cells_unparsed=-4)).qty_unreliable is False
+
+
+def test_zero_unresolved_annotation_keys_do_not_block_orders():
+    conn = stats_db(annotation_keys_unresolved=0, product_rows_without_order=0, tables_skipped_missing_order_id=0)
+    flags = assess(conn)
+    assert flags.order_structure_broken is False
+    assert flags.reasons == []
+
+
+def test_unresolved_annotation_key_blocks_orders_with_its_flag_name():
+    flags = assess(stats_db(annotation_keys_unresolved=1))
+    assert flags.order_structure_broken is True
+    assert flags.reasons == ["order_structure_broken: annotation_keys_unresolved is 1"]

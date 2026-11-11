@@ -68,6 +68,9 @@ ORDER_SIGNAL_ROLES = ("ordered_at", "order_status", "customer_id", "customer_nam
 COUNTED_ROLES = ("order_id", "product_name", "product_id", "qty", "line_amount", "ordered_at", "order_status",
                  "order_total_due", "paid_amount", "customer_id")
 FUZZY_KEY_RATIO = 0.85  # minimum difflib ratio for an annotation key to name a column it does not spell exactly
+AFFIX_KEY_MIN = 4  # shortest compact key that may name a column by being its prefix or suffix
+TYPO_KEY_MIN = 6  # shortest compact key that may name a column one or two typing errors away
+TYPO_MAX_EDITS = 2
 BUILD_STAT_KEYS = (
     "qty_cells_nonblank", "qty_cells_unparsed", "money_cells_nonblank", "money_cells_unparsed",
     "product_rows_without_order", "annotation_keys_unresolved", "tables_skipped_missing_order_id",
@@ -225,19 +228,44 @@ def _given_by_column(table: TableMeta, given: dict[str, Any]) -> tuple[dict[str,
     return by_column, unresolved
 
 
+def _compact_key(value: str) -> str:
+    """Lookup form without spaces: case, accents, separators and spacing do not count."""
+    return normalize_lookup(value).replace(" ", "")
+
+
 def _column_named(key: str, table: TableMeta, by_column: dict[str, Any]) -> str | None:
-    """The unassigned column a mistyped key names: equal after lookup normalization, else the one column
-    whose name is close enough. Two equal matches, or two close ones, name nothing."""
-    wanted = normalize_lookup(key)
+    """The unassigned column a mistyped key names. Each tier is tried in turn: the same letters after case, accent,
+    separator and spacing are dropped; the key is a prefix or suffix of the column name; the names are close by
+    difflib ratio; or they are one or two typing errors apart. The first tier that matches any column decides, and
+    a tier with two matches names nothing (ambiguous)."""
+    wanted = _compact_key(key)
+    if not wanted:
+        return None
     free = [column.name for column in table.columns if not _is_role(by_column.get(column.name))]
-    equal = [name for name in free if normalize_lookup(name) == wanted]
-    if equal:
-        return equal[0] if len(equal) == 1 else None
-    close = [
-        name for name in free
-        if difflib.SequenceMatcher(None, wanted, normalize_lookup(name)).ratio() >= FUZZY_KEY_RATIO
-    ]
-    return close[0] if len(close) == 1 else None
+    tiers = (
+        lambda name: _compact_key(name) == wanted,
+        lambda name: (len(wanted) >= AFFIX_KEY_MIN and _compact_key(name) != wanted
+                      and (_compact_key(name).startswith(wanted) or _compact_key(name).endswith(wanted))),
+        lambda name: difflib.SequenceMatcher(None, wanted, _compact_key(name)).ratio() >= FUZZY_KEY_RATIO,
+        lambda name: (len(wanted) >= TYPO_KEY_MIN
+                      and _edit_distance(wanted, _compact_key(name)) <= TYPO_MAX_EDITS),
+    )
+    for tier in tiers:
+        matches = [name for name in free if tier(name)]
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+    return None
+
+
+def _edit_distance(first: str, second: str) -> int:
+    """Levenshtein distance: insertions, deletions and substitutions, one character each."""
+    previous = list(range(len(second) + 1))
+    for i, char in enumerate(first, start=1):
+        current = [i]
+        for j, other in enumerate(second, start=1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (char != other)))
+        previous = current
+    return previous[-1]
 
 
 def _choose_column(dst: sqlite3.Connection | None, table: TableMeta, role: str, columns: list[str]) -> str:

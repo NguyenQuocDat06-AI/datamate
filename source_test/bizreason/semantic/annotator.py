@@ -156,6 +156,11 @@ GRAIN_KIND = {
 }
 # A sales table needs at least one of these roles, unless its grain is a sales grain.
 SALES_EVIDENCE_ROLES = ("order_id", "ordered_at", "qty", "line_amount", "order_goods_total", "order_total_due")
+# A failed table takes the kind and roles of a sibling table of its shop whose column names are this alike: the
+# Jaccard similarity of the normalized name sets, or, for equal column counts, the share of equal names by position.
+SIBLING_MIN_SHARE = 0.8
+# The retried kind call lists at most this many headers, with no documentation and no sample values.
+KIND_SHORT_COLUMNS = 40
 
 
 def group_tables(context: BusinessContext) -> list[list[TableMeta]]:
@@ -203,6 +208,68 @@ def _describe_columns(columns: list[ColumnMeta]) -> str:
 
 def _describe(group: list[TableMeta]) -> str:
     return _describe_columns(group[0].columns)
+
+
+def _describe_headers(columns: list[ColumnMeta]) -> str:
+    return "\n".join(f"- {c.name} | header: {c.original_name}" for c in columns[:KIND_SHORT_COLUMNS])
+
+
+def _sibling_fit(names: list[str], other: list[str]) -> tuple[float, bool] | None:
+    """How closely another table's column names match: (score, positional) or None when they do not match.
+
+    Names compare after normalize_lookup. positional is True when the counts are equal and at least
+    SIBLING_MIN_SHARE of the columns sit at the same position with the same name.
+    """
+    mine = [normalize_lookup(name) for name in names]
+    theirs = [normalize_lookup(name) for name in other]
+    union = set(mine) | set(theirs)
+    jaccard = len(set(mine) & set(theirs)) / len(union) if union else 0.0
+    same_count = bool(mine) and len(mine) == len(theirs)
+    positional = sum(a == b for a, b in zip(mine, theirs)) / len(mine) if same_count else 0.0
+    if jaccard >= SIBLING_MIN_SHARE:
+        return jaccard, positional >= SIBLING_MIN_SHARE
+    if same_count and positional >= SIBLING_MIN_SHARE:
+        return positional, True
+    return None
+
+
+def _failed(record: dict[str, Any]) -> bool:
+    """A record whose table has no usable annotation: the whole call failed, or the kind call failed and the
+    kind came from the grain."""
+    return "error" in record or bool(record.get("kind_failed"))
+
+
+def _usable(record: dict[str, Any]) -> bool:
+    """A record that can serve as a sibling: annotated by the model with every role call answered."""
+    return "kind" in record and not _failed(record) and not record.get("partial")
+
+
+def _sibling_record(context: BusinessContext, group: list[TableMeta], sibling: dict[str, Any],
+                    positional: bool) -> dict[str, Any]:
+    """The record for a failed group, taking the sibling's kind. Roles map by normalized column name; when the
+    sibling matches positionally, a column whose name does not match takes the role at its position."""
+    table = group[0]
+    sibling_roles = sibling.get("roles") or {}
+    by_name: dict[str, str] = {}
+    for name in sibling["columns"]:
+        by_name.setdefault(normalize_lookup(name), sibling_roles.get(name, "other"))
+    by_position = [sibling_roles.get(name, "other") for name in sibling["columns"]]
+    roles: dict[str, str] = {}
+    for index, column in enumerate(table.columns):
+        role = by_name.get(normalize_lookup(column.name))
+        if role is None and positional:
+            role = by_position[index]
+        roles[column.name] = role or "other"
+    return {
+        "biz": context.business_id,
+        "table": table.name,
+        "columns": [column.name for column in table.columns],
+        "kind": sibling["kind"],
+        "kind_source": "sibling",
+        "source": f"sibling:{sibling['table']}",
+        "roles": roles,
+        "seconds": 0.0,
+    }
 
 
 STATUS_MEANINGS = {
@@ -361,19 +428,48 @@ class Annotator:
         return taken
 
     def annotate(self, context: BusinessContext) -> list[dict[str, Any]]:
+        """One record per group of identical column names, in group order.
+
+        A failed group takes the kind and roles of a sibling table (see _sibling_record) when one qualifies; then
+        nothing is recorded as a failure. Otherwise its stages are recorded. A stage of an attempt that a retry
+        replaced is never recorded.
+        """
         groups = group_tables(context)
         if not groups:
             return []
         with ThreadPoolExecutor(self.workers) as pool:
-            return list(pool.map(lambda group: self._annotate_retrying(context, group), groups))
+            results = list(pool.map(lambda group: self._annotate_retrying(context, group), groups))
+        records = [record for record, _ in results]
+        stages = [list(found) for _, found in results]
+        usable = [index for index, record in enumerate(records) if _usable(record)]
+        for index, group in enumerate(groups):
+            if not _failed(records[index]):
+                continue
+            best: tuple[float, bool, int] | None = None
+            for other in usable:
+                if other == index:
+                    continue
+                fit = _sibling_fit([c.name for c in group[0].columns], records[other]["columns"])
+                if fit is not None and (best is None or fit[0] > best[0]):
+                    best = (fit[0], fit[1], other)
+            if best is not None:
+                records[index] = _sibling_record(context, group, records[best[2]], best[1])
+                stages[index] = []
+        for found in stages:
+            for stage in found:
+                self._record_failure(stage)
+        return records
 
-    def _annotate_retrying(self, context: BusinessContext, group: list[TableMeta]) -> dict[str, Any]:
-        """One retry for a failed group, so a transient model error does not skip its tables."""
-        record = self._annotate_group(context, group)
+    def _annotate_retrying(self, context: BusinessContext, group: list[TableMeta]) -> tuple[dict[str, Any], list[str]]:
+        """One retry for a failed group, so a transient model error does not skip its tables.
+
+        Returns the record and the failure stages of the attempt that produced it.
+        """
+        record, found = self._annotate_group(context, group)
         if "error" in record:
             # Only the retry may fall back to kind "other" when the kind call keeps failing.
-            record = self._annotate_group(context, group, kind_fallback=True)
-        return record
+            record, found = self._annotate_group(context, group, kind_fallback=True)
+        return record, found
 
     def classify_status_values(self, values: list[str]) -> dict[str, str]:
         """Map raw order status values to a meaning in STATUS_MEANINGS; invalid answers are dropped."""
@@ -579,15 +675,16 @@ class Annotator:
             for column, role in reply.items()
         }
 
-    def _assign_roles(self, doc: str, table: TableMeta, roles: dict[str, str]) -> tuple[dict[str, str], bool]:
+    def _assign_roles(self, doc: str, table: TableMeta, roles: dict[str, str]) -> tuple[dict[str, str], int]:
         """Roles for every column of the table, asked in batches when needed.
 
-        Returns (roles, partial). Raises the last model error when every call failed.
+        Returns (roles, failed_batches); a batch that failed leaves its columns out. Raises the last model error
+        when every call failed.
         """
         columns = list(table.columns)
         if len(columns) <= ROLE_SINGLE_CALL_MAX:
             try:
-                return self._ask_roles(doc, columns, roles), False
+                return self._ask_roles(doc, columns, roles), 0
             except Exception:
                 pass  # retried below as batches; only a batch that still fails is a failure
         batches = [columns[i:i + ROLE_BATCH_SIZE] for i in range(0, len(columns), ROLE_BATCH_SIZE)] or [[]]
@@ -598,14 +695,34 @@ class Annotator:
             try:
                 merged.update(self._ask_roles(doc, batch, roles))
             except Exception as exc:
-                self._record_failure(f"roles:{table.name}")
                 failed += 1
                 last_error = exc
         if failed == len(batches) and last_error is not None:
             raise last_error
-        return merged, failed > 0
+        return merged, failed
 
-    def _annotate_group(self, context: BusinessContext, group: list[TableMeta], kind_fallback: bool = False) -> dict[str, Any]:
+    def _ask_kind(self, group: list[TableMeta], doc: str) -> str | None:
+        """The kind the model names. A failed call, or a reply that is not a JSON object, is retried once with a
+        shorter prompt (no documentation, no sample values, a capped header list); if that fails too it raises."""
+        table = group[0]
+        instruction = (
+            'Classify a Vietnamese shop data table. Reply with JSON only: {"kind": "<kind>"}.\n'
+            "Kinds:\n" + _role_list(KINDS)
+        )
+        full = f"Documentation:\n{doc}\n\nFile {table.sources[0].path}, table {table.name}:\n{_describe(group)}"
+        short = f"File {table.sources[0].path}, table {table.name}:\n{_describe_headers(table.columns)}"
+        try:
+            reply = self.model.generate_json(instruction, full, timeout=self.timeout)
+        except Exception:
+            reply = self.model.generate_json(instruction, short, timeout=self.timeout)
+        if not isinstance(reply, dict):
+            raise TypeError("kind reply is not a JSON object")
+        return reply.get("kind")
+
+    def _annotate_group(self, context: BusinessContext, group: list[TableMeta],
+                        kind_fallback: bool = False) -> tuple[dict[str, Any], list[str]]:
+        """One attempt at a group. Returns the record and the failure stages of this attempt; the caller records
+        them only for the attempt it keeps."""
         table = group[0]
         doc = relevant_readme(context.readme, table)
         record: dict[str, Any] = {
@@ -613,28 +730,25 @@ class Annotator:
             "table": table.name,
             "columns": [column.name for column in table.columns],
         }
+        found: list[str] = []
         started = time.time()
         try:
             kind_source = "model"
             try:
-                kind_reply = self.model.generate_json(
-                    'Classify a Vietnamese shop data table. Reply with JSON only: {"kind": "<kind>"}.\n'
-                    "Kinds:\n" + _role_list(KINDS),
-                    f"Documentation:\n{doc}\n\nFile {table.sources[0].path}, table {table.name}:\n{_describe(group)}",
-                    timeout=self.timeout,
-                )
-                kind = kind_reply.get("kind")
+                kind = self._ask_kind(group, doc)
             except Exception:
                 if not kind_fallback:
                     raise
-                self._record_failure(f"kind:{table.name}")
+                found.append(f"kind:{table.name}")
+                record["kind_failed"] = True
                 kind = None
             if not isinstance(kind, str) or kind not in KINDS:
                 kind = "other"
             if kind == "other" and table.grain in GRAIN_KIND:
                 kind = GRAIN_KIND[table.grain]
                 kind_source = "grain"
-            roles, partial = self._assign_roles(doc, table, SCOPE[kind])
+            roles, failed_batches = self._assign_roles(doc, table, SCOPE[kind])
+            found.extend(f"roles:{table.name}" for _ in range(failed_batches))
             if kind == "sales" and GRAIN_KIND.get(table.grain) != "sales" and not any(
                 role in SALES_EVIDENCE_ROLES for role in roles.values()
             ):
@@ -644,13 +758,13 @@ class Annotator:
             record["kind"] = kind
             record["kind_source"] = kind_source
             record["roles"] = roles
-            if partial:
+            if failed_batches:
                 record["partial"] = True
         except Exception as exc:
-            self._record_failure(f"annotation:{table.name}")
+            found.append(f"annotation:{table.name}")
             record["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         record["seconds"] = round(time.time() - started, 1)
-        return record
+        return record, found
 
 
 def load_or_annotate(annotator: Annotator, context: BusinessContext, cache_path: Path) -> list[dict[str, Any]]:

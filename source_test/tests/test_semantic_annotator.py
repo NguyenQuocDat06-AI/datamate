@@ -17,6 +17,7 @@ from bizreason.semantic.annotator import (
     load_value_groups,
     needs_reannotation,
     order_status_values,
+    _sibling_fit,
     relevant_readme,
 )
 from bizreason.semantic.vocabulary import PAYMENT_CANONICAL
@@ -357,8 +358,9 @@ def test_group_failing_twice_records_error_after_one_retry() -> None:
     record = Annotator(model, workers=1).annotate(_context([table]))[0]
 
     assert record["error"] == "RuntimeError: boom"
-    # attempt 1: kind call. retry: kind call (falls back to "other"), role call, one batch call.
-    assert len(model.calls) == 4
+    # attempt 1: kind call, shorter kind retry. attempt 2: kind call, shorter kind retry (kind falls back to
+    # "other"), role call, one batch call.
+    assert len(model.calls) == 6
 
 
 def test_load_status_map_does_not_cache_failure(tmp_path: Path) -> None:
@@ -487,7 +489,9 @@ def test_kind_failing_twice_falls_back_to_other_after_retry() -> None:
     assert record["kind"] == "other"
     assert record["roles"] == {"ref_no": "order_id"}
     assert model.calls[1][0].startswith("Classify")  # kind call was retried before falling back
-    assert model.calls[2][0].startswith("Give the meaning")
+    assert "Documentation:" not in model.calls[1][1]  # the retry is the shorter prompt
+    assert model.calls[-1][0].startswith("Give the meaning")
+    assert len(model.calls) == 5  # two kind calls per attempt, two attempts: four; then the role call
 
 
 class EchoLineModel:
@@ -962,3 +966,110 @@ def test_load_status_map_skips_cache_when_a_failure_was_recorded(tmp_path: Path)
 
     assert result == {"delivered": "completed"}
     assert not cache.exists()
+
+
+SIBLING_ROLES = {
+    "order_no": "order_id", "order_date": "ordered_at", "item": "product_name", "qty": "qty",
+    "amount": "line_amount", "discount": "line_discount", "note": "note", "cashier": "employee_name",
+    "shift": "shift",
+}
+SIBLING_COLUMNS = list(SIBLING_ROLES)
+
+
+class ShapeModel:
+    """Kind call answers `kind` for every table. Role calls raise when their prompt lists `broken_column`.
+    Kind calls raise when their prompt lists `kind_broken_column`. Every other column takes its SIBLING_ROLES role."""
+
+    def __init__(self, broken_column: str | None = None, kind_broken_column: str | None = None):
+        self.broken_column = broken_column
+        self.kind_broken_column = kind_broken_column
+        self.calls: list[tuple[str, str]] = []
+        self.usage = None
+
+    def generate_json(self, system: str, prompt: str, *, timeout: float) -> dict[str, Any]:
+        self.calls.append((system, prompt))
+        if system.startswith("Classify"):
+            if self.kind_broken_column and f"- {self.kind_broken_column} |" in prompt:
+                raise RuntimeError("kind down")
+            return {"kind": "sales"}
+        if self.broken_column and f"- {self.broken_column} |" in prompt:
+            raise RuntimeError("invalid json")
+        return {column: SIBLING_ROLES.get(column, "other") for column in _columns_in(prompt)}
+
+
+def test_failed_table_takes_sibling_kind_and_roles_and_records_no_failure() -> None:
+    good = _table("sales_jan", SIBLING_COLUMNS)
+    # one column renamed: Jaccard 8/10 = 0.8 and 8 of 9 positions equal, so the sibling qualifies
+    bad = _table("sales_feb", SIBLING_COLUMNS[:-1] + ["shifts"])
+    model = ShapeModel(broken_column="shifts")
+    annotator = Annotator(model, workers=1)
+
+    records = annotator.annotate(_context([good, bad]))
+
+    assert "error" not in records[1]
+    assert records[1]["kind"] == "sales"
+    assert records[1]["source"] == "sibling:sales_jan"
+    assert records[1]["kind_source"] == "sibling"
+    assert records[1]["roles"]["order_no"] == "order_id"
+    assert records[1]["roles"]["shifts"] == "shift"  # no name match: the role at the same position
+    assert annotator.take_failures() == []
+
+
+def test_failed_table_with_no_sibling_stays_an_error_and_is_recorded() -> None:
+    good = _table("sales_jan", SIBLING_COLUMNS)
+    # six names in common: Jaccard 6/13 is under 0.8, and the counts differ, so nothing qualifies
+    bad = _table("sales_feb", SIBLING_COLUMNS[:6] + ["extra_1", "extra_2", "extra_3", "extra_4"])
+    model = ShapeModel(broken_column="extra_1")
+    annotator = Annotator(model, workers=1)
+
+    records = annotator.annotate(_context([good, bad]))
+
+    assert "error" in records[1]
+    assert "source" not in records[1]
+    assert annotator.take_failures() == ["annotation:sales_feb"]
+
+
+def test_failed_kind_call_takes_sibling_kind_and_records_no_failure() -> None:
+    good = _table("sales_jan", SIBLING_COLUMNS)
+    bad = _table("sales_feb", SIBLING_COLUMNS[:-1] + ["shifts"], grain="unknown")
+    model = ShapeModel(kind_broken_column="shifts")
+    annotator = Annotator(model, workers=1)
+
+    records = annotator.annotate(_context([good, bad]))
+
+    assert records[1]["kind"] == "sales"
+    assert records[1]["source"] == "sibling:sales_jan"
+    assert annotator.take_failures() == []
+
+
+def test_failed_kind_call_without_sibling_is_recorded_as_kind_failure() -> None:
+    bad = _table("sales_feb", SIBLING_COLUMNS, grain="unknown")
+    model = ShapeModel(kind_broken_column="order_no")
+    annotator = Annotator(model, workers=1)
+
+    records = annotator.annotate(_context([bad]))
+
+    assert records[0]["kind"] == "other"
+    assert "source" not in records[0]
+    assert annotator.take_failures() == ["kind:sales_feb"]
+
+
+def test_a_recovered_kind_call_records_no_failure_and_retries_with_a_shorter_prompt() -> None:
+    table = _table("t_one", ["ref_no", "amount"])
+    model = FlakyModel(1, kind="sales", roles={"ref_no": "order_id", "amount": "line_amount"})
+    annotator = Annotator(model, workers=1)
+
+    record = annotator.annotate(_context([table]))[0]
+
+    assert record["kind"] == "sales"
+    assert record["kind_source"] == "model"
+    assert "Documentation:" not in model.calls[1][1]  # the retried kind call is the shorter prompt
+    assert annotator.take_failures() == []
+
+
+def test_sibling_fit_needs_eighty_percent_by_name_or_by_position() -> None:
+    nine = [f"c{i}" for i in range(9)]
+    assert _sibling_fit(nine, nine) == (1.0, True)
+    assert _sibling_fit(nine, nine[:-1] + ["other"]) == (0.8, True)  # 8/10 by name, 8/9 by position
+    assert _sibling_fit(["a", "b", "c", "d"], ["a", "b", "c", "e"]) is None  # 3/5 by name
+    assert _sibling_fit(["a", "b", "c", "d", "e"], ["e", "a", "b", "c", "d"]) == (1.0, False)  # same names, shifted

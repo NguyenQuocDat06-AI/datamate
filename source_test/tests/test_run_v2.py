@@ -5,19 +5,36 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import shutil
+import sqlite3
+import threading
+import time
+from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from bizreason import run_v2
-from bizreason.contracts import AnswerType, Prediction
+from bizreason.contracts import AnswerType, Prediction, Question
 from bizreason.data import schema
 from bizreason.formatting import SubmissionWriter
+from bizreason.llm import ModelError
 from bizreason.semantic.annotator import SCOPE
 from bizreason.semantic.intent import SYSTEM
 from bizreason.semantic.solver import SemanticSolver
-from bizreason.run_v2 import Checkpoint, STAGES, format_summary, main, submission_line
+from bizreason.run_v2 import (
+    Checkpoint,
+    GatedModel,
+    STAGES,
+    ShopJob,
+    build_order,
+    build_shop_in_worker,
+    format_summary,
+    main,
+    submission_line,
+)
 from bizreason.utils import PathPolicy
 
 TOKEN = "TOKEN-DO-NOT-LEAK-7731"
@@ -227,3 +244,151 @@ def test_summary_projection_uses_workers_for_question_time() -> None:
     # 15 s per shop; mean over the two attempted questions is 3 s; 3 * 15 + 10 * 3 / 2 = 60
     assert "projected for 3 shops and 10 questions: 60 s" in text
     assert "shops built this run: 1" in text
+
+
+def add_shop(root: Path, biz: str) -> None:
+    """Copies shop_a's data under another business id and asks one question about it."""
+    shutil.copytree(root / "data" / "shop_a", root / "data" / biz)
+    question = {"id": f"{biz}-q1", "business_id": biz, "question": "How many orders?", "as_of_date": "2026-03-10"}
+    with (root / "questions.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(question) + "\n")
+
+
+class MarkerClient(FakeClient):
+    """FakeClient whose model calls fail when the text mentions a marker word (one shop's documentation)."""
+
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self.marker = marker
+
+    def generate_json(self, system: str, prompt: str, *, timeout: float) -> dict[str, Any]:
+        if self.marker in system or self.marker in prompt:
+            raise ModelError("marked failure")
+        return super().generate_json(system, prompt, timeout=timeout)
+
+
+SLOW_SHOP_SECONDS = {"shop_c": 1.0}
+
+
+def fake_slow_build(biz: str, ctx: Any) -> Path:
+    """Stands in for build_shop: sleeps per shop, writes an empty database, and records when it finished."""
+    time.sleep(SLOW_SHOP_SECONDS.get(biz, 0.05))
+    target = ctx.out / "sem" / f"{biz}.sqlite"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(target)):
+        pass
+    (ctx.out / "finished").mkdir(parents=True, exist_ok=True)
+    (ctx.out / "finished" / biz).write_text(repr(time.time()), encoding="utf-8")
+    return target
+
+
+def model_failure_stages(database: Path) -> list[str]:
+    with closing(sqlite3.connect(database)) as connection:
+        return [row[0] for row in connection.execute("SELECT stage FROM model_failures")]
+
+
+def test_questions_of_a_shop_start_before_the_last_shop_finishes(setup, monkeypatch) -> None:
+    root = setup["root"]
+    add_shop(root, "shop_b")
+    add_shop(root, "shop_c")
+    monkeypatch.setattr(run_v2, "build_shop", fake_slow_build)
+    monkeypatch.setattr(run_v2, "TrammayClient", lambda settings, **_: FakeClient())
+    starts: list[tuple[str, float]] = []
+
+    class TimedSolver(SemanticSolver):
+        def solve(self, question):
+            starts.append((question.business_id, time.time()))
+            prediction = Prediction(id=question.id, type=AnswerType.ABSTAIN, reason="timed")
+            return prediction, SimpleNamespace(decision="abstain")
+
+    monkeypatch.setattr(run_v2, "SemanticSolver", TimedSolver)
+
+    assert main(command(setup, "--build-workers", "2")) == 0
+
+    finished_last = float((setup["out"] / "finished" / "shop_c").read_text(encoding="utf-8"))
+    assert min(started for _, started in starts) < finished_last  # answering began before the slow shop was done
+    assert sorted(biz for biz, _ in starts) == ["shop_a", "shop_a", "shop_b", "shop_c"]
+    final = read_jsonl(setup["out"] / "submission.final.jsonl")
+    assert [row["id"] for row in final] == ["q1", "q2", "shop_b-q1", "shop_c-q1"]  # sorted by id, not by finish
+    ready = [row for row in read_jsonl(setup["out"] / "timing.jsonl") if "ready_at" in row]
+    assert sorted(row["biz"] for row in ready) == ["shop_a", "shop_b", "shop_c"]
+
+
+def test_failures_of_one_shop_are_not_attributed_to_another_built_alongside(setup, monkeypatch) -> None:
+    root = setup["root"]
+    add_shop(root, "shop_b")  # copies shop_a's data, so its documentation must change after the copy
+    (root / "data" / "shop_a" / "README.md").write_text("ALPHA-MARKER orders and their lines.\n", encoding="utf-8")
+    monkeypatch.setattr(run_v2, "TrammayClient", lambda settings, **_: MarkerClient("ALPHA-MARKER"))
+
+    assert main(command(setup, "--build-workers", "2")) == 0
+
+    assert model_failure_stages(setup["out"] / "sem" / "shop_a.sqlite")  # the failing shop records its failures
+    assert model_failure_stages(setup["out"] / "sem" / "shop_b.sqlite") == []
+
+
+def test_model_gate_bounds_concurrent_model_calls() -> None:
+    class CountingModel:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.active = 0
+            self.peak = 0
+            self.calls = 0
+
+        def generate_json(self, system: str, prompt: str, *, timeout: float) -> dict[str, Any]:
+            with self.lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                self.calls += 1
+            time.sleep(0.02)
+            with self.lock:
+                self.active -= 1
+            return {}
+
+        def close(self) -> None:
+            pass
+
+    model = CountingModel()
+    gated = GatedModel(model, threading.BoundedSemaphore(2))
+    threads = [threading.Thread(target=gated.generate_json, args=("system", "prompt"), kwargs={"timeout": 1.0})
+               for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert model.calls == 8
+    assert model.peak <= 2
+
+
+def test_build_shop_in_worker_returns_database_path_and_stage_rows(setup, fake_client, monkeypatch) -> None:
+    monkeypatch.setattr(run_v2, "_MODEL_GATE", threading.BoundedSemaphore(1))
+    args = run_v2.parse_args(command(setup))
+    result = build_shop_in_worker(ShopJob("shop_a", setup["root"], setup["out"], args))
+    assert result.biz == "shop_a"
+    assert result.path == setup["out"] / "sem" / "shop_a.sqlite" and result.path.is_file()
+    assert set(STAGES) <= {row["stage"] for row in result.rows if "stage" in row}
+
+
+def test_build_order_puts_shops_with_more_questions_first() -> None:
+    def question(qid: str, biz: str) -> Question:
+        return Question.model_validate({"id": qid, "business_id": biz, "question": "q", "as_of_date": "2026-03-10"})
+
+    questions = [question("1", "b"), question("2", "a"), question("3", "c"), question("4", "c"), question("5", "a"),
+                 question("6", "a")]
+    assert build_order(questions) == ["a", "c", "b"]  # equal counts keep first-seen order
+
+
+def test_summary_projection_uses_overlap_of_builds_and_questions() -> None:
+    rows = [
+        {"biz": "a", "stage": "build", "seconds": 10.0},
+        {"biz": "a", "stage": "ingestion", "seconds": 5.0},
+        {"biz": "a", "ready_at": 15.0},
+        {"id": "q1", "seconds": 2.0, "decision": "value", "end_at": 20.0},
+        {"id": "q2", "seconds": 4.0, "decision": "abstain", "end_at": 30.0},
+        {"id": "q3", "seconds": 0.0, "decision": "budget", "end_at": 30.0},
+    ]
+    # Shop cost 15 s; steady question wall (30 - 18) / 2 = 6 s; build part 30 * 15 / 2 = 225 s.
+    text = format_summary(rows, workers=2, project_shops=30, project_questions=10, build_workers=2, wall_seconds=100.0)
+    assert "actual wall time: 100.0 s" in text
+    assert "projected for 30 shops and 10 questions: 225 s" in text  # builds dominate: 60 s of questions + 165 s
+    text = format_summary(rows, workers=2, project_shops=30, project_questions=3000, build_workers=2)
+    assert "projected for 30 shops and 3000 questions: 18015 s" in text  # 18000 s of questions + 15 s first ready

@@ -1639,3 +1639,85 @@ def test_build_without_model_failures_leaves_an_empty_table(tmp_path: Path) -> N
 
     assert _query(out, "SELECT COUNT(*) FROM model_failures") == [(0,)]
     assert report["model_failures"] == 0
+
+
+def _meta_table(*names: str) -> TableMeta:
+    return TableMeta(
+        name="t", sources=[SourceRef(path="t.csv")],
+        columns=[ColumnMeta(name=n, original_name=n, dtype="text") for n in names],
+        row_count=0, raw_row_count=0,
+    )
+
+
+@pytest.mark.parametrize("key", ["Mã_hóa đơn", "ma hoa don", "MA-HOA-DON", "mahoadon", "ma_hoa", "mahodon", "mahodan"])
+def test_key_variants_name_the_one_column_they_spell(key: str) -> None:
+    # case, accents, separators, spacing, a prefix, and one or two typing errors
+    table = _meta_table("mahoadon", "tengoi", "soluong")
+
+    assert layer._column_named(key, table, {}) == "mahoadon"
+
+
+def test_key_naming_two_columns_equal_after_normalization_names_nothing() -> None:
+    table = _meta_table("order_id", "orderid", "item")
+
+    assert layer._column_named("order id", table, {}) is None
+
+
+def test_key_prefix_matching_two_columns_names_nothing() -> None:
+    table = _meta_table("tongtienhang", "tongthanhtoan", "item")
+
+    assert layer._column_named("tong", table, {}) is None
+
+
+def test_key_names_only_an_unassigned_column() -> None:
+    table = _meta_table("mahoadon", "item")
+
+    assert layer._column_named("mahodan", table, {"mahoadon": "order_id"}) is None
+    assert layer._column_named("ghi chu", table, {}) is None
+
+
+def test_mistyped_order_key_one_typo_away_is_resolved_and_not_counted(tmp_path: Path) -> None:
+    columns = ["mahoadon", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100"), ("O2", "tea", "30")])}
+    records = [_record(columns, "sales", {"mahodan": "order_id", "item": "product_name",
+                                          "amount": "line_amount"})]
+    report, out = _run(tmp_path, specs, records)
+
+    assert _query(out, "SELECT order_id FROM orders ORDER BY order_id") == [("O1",), ("O2",)]
+    assert _stats(out)["annotation_keys_unresolved"] == 0
+
+
+def test_ambiguous_order_key_still_counts_and_blocks_the_order_structure(tmp_path: Path) -> None:
+    from bizreason.semantic.quality import assess
+
+    columns = ["order_id", "orderid", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "O1", "tea", "100")])}
+    records = [_record(columns, "sales", {"order id": "order_id", "item": "product_name",
+                                          "amount": "line_amount"})]
+    _, out = _run(tmp_path, specs, records)
+
+    assert _stats(out)["annotation_keys_unresolved"] == 1
+    con = sqlite3.connect(out)
+    try:
+        flags = assess(con)
+    finally:
+        con.close()
+    assert flags.order_structure_broken is True
+    assert any(r.startswith("order_structure_broken: annotation_keys_unresolved") for r in flags.reasons)
+
+
+def test_resolved_key_variants_do_not_trigger_the_order_structure_flag(tmp_path: Path) -> None:
+    from bizreason.semantic.quality import assess
+
+    columns = ["mahoadon", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100")])}
+    records = [_record(columns, "sales", {"mahodan": "order_id", "item": "product_name",
+                                          "amount": "line_amount"})]
+    _, out = _run(tmp_path, specs, records)
+
+    con = sqlite3.connect(out)
+    try:
+        flags = assess(con)
+    finally:
+        con.close()
+    assert flags.order_structure_broken is False
