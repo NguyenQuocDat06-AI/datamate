@@ -311,6 +311,11 @@ def _same_measure_pair(intent: Intent, windows: list[TimeWindow]) -> tuple[TimeW
     return window, members
 
 
+def _asks_weekday_average(intent: Intent) -> bool:
+    """True when the intent asks the average per weekday of a measure that has one."""
+    return intent.compare_as == "average_per_weekday" and intent.measure in WEEKDAY_AVERAGE_MEASURES
+
+
 class Compiler:
     def __init__(self, connection: sqlite3.Connection):
         self.db = connection
@@ -1003,9 +1008,12 @@ class Compiler:
 
     def _scalar(self, intent: Intent, window: TimeWindow) -> float | None:
         """One value. A weekday filter only filters, unless the average per weekday is asked for."""
-        value = self.value(intent, window)
         has_weekday = any(item.get("dim") == "weekday" for item in intent.filters)
-        if intent.compare_as == "average_per_weekday" and intent.measure in WEEKDAY_AVERAGE_MEASURES and has_weekday:
+        if _asks_weekday_average(intent) and not has_weekday:
+            # The average needs a weekday to divide by; the plain total would answer a different question.
+            raise Unsupported("average per weekday without a weekday")
+        value = self.value(intent, window)
+        if _asks_weekday_average(intent):
             if value is None:
                 return None
             return value / self._weekday_days(intent, window)
@@ -1034,6 +1042,9 @@ class Compiler:
         shape = intent.shape
         if intent.measure2 is not None and shape != "scalar":
             raise Unsupported(f"second measure on shape {shape}")
+        if _asks_weekday_average(intent) and shape != "scalar":
+            # Only the scalar path divides by the weekday count; any other shape would answer the total instead.
+            raise Unsupported(f"average per weekday on shape {shape}")
         target = [w for w in windows if w.role != "comparison"]
         other = [w for w in windows if w.role == "comparison"]
         if not target:
@@ -1115,6 +1126,9 @@ class Compiler:
             members, others = self._members(intent, intent.group_by)
             if not members:
                 raise Unsupported("breakdown names no member")
+            if len(members) == 1:
+                # A breakdown of several members answered with one value would be a different question.
+                raise Unsupported("breakdown names one member")
             values = [self.value(Intent(measure=intent.measure, filters=[*others, m]), window) for m in members]
             return Answer("list", [self._format(intent.measure, v).value for v in values])
         raise Unsupported(f"shape {shape}")

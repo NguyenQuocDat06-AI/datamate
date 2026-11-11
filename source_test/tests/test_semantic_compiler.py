@@ -152,6 +152,17 @@ def test_breakdown_without_member_filters_raises() -> None:
         compiler.answer(Intent(measure="revenue", shape="breakdown", group_by="channel"), [MARCH])
 
 
+def test_breakdown_with_one_member_filter_raises() -> None:
+    # A question for several members names one: the answer would be a one-element list, a different question.
+    compiler = Compiler(make_db())
+    intent = Intent(measure="revenue", shape="breakdown", group_by="channel", filters=[channel("dine")])
+    with pytest.raises(Unsupported, match="breakdown names one member"):
+        compiler.answer(intent, [MARCH])
+    # Two members of the same dimension still give two values.
+    two = Intent(measure="revenue", shape="breakdown", group_by="channel", filters=[channel("dine"), channel("take")])
+    assert compiler.answer(two, [MARCH]) == Answer("list", [180, 40])
+
+
 def test_multi_period_breakdown_still_works() -> None:
     # March valid revenue 220 (O1, O3, O5); February 50 (O6).
     compiler = Compiler(make_db())
@@ -1101,6 +1112,18 @@ def test_weekday_average_divides_by_the_days_of_that_weekday() -> None:
     tuesday = Intent(measure="revenue", shape="scalar", filters=[by("weekday", "thu 3")],
                      compare_as="average_per_weekday")
     assert compiler.answer(tuesday, [MARCH]) == Answer("number", 20)
+
+
+def test_weekday_average_without_a_weekday_raises() -> None:
+    compiler = Compiler(make_timed_db())
+    # "On average per order" for the week: there is no weekday to divide by, so the total must not be returned.
+    intent = Intent(measure="revenue", shape="scalar", compare_as="average_per_weekday")
+    with pytest.raises(Unsupported, match="average per weekday without a weekday"):
+        compiler.answer(intent, [MARCH])
+    # The same average with a weekday filter still divides by the days of that weekday.
+    with_weekday = Intent(measure="revenue", shape="scalar", filters=[by("weekday", "thu 2")],
+                          compare_as="average_per_weekday")
+    assert compiler.answer(with_weekday, [MARCH]) == Answer("number", 38)
 
 
 def test_weekday_without_average_only_filters() -> None:
