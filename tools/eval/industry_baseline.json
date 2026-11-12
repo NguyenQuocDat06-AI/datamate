@@ -1,0 +1,493 @@
+{
+  "source_run": "train_full_2",
+  "rulebook_for_run": "train rulebook (train_full_root/rulebook.md)",
+  "bootstrap": {
+    "resamples": 2000,
+    "seed": 0,
+    "min_shops": 3,
+    "unit": "shop"
+  },
+  "total": {
+    "questions": 3000,
+    "correct": 2634,
+    "wrong": 109,
+    "abstain": 257,
+    "pa": 0.8417
+  },
+  "groups": [
+    {
+      "industry": "Cà phê",
+      "shops": [
+        "biz_104",
+        "biz_105",
+        "biz_106",
+        "biz_111",
+        "biz_112"
+      ],
+      "n_shops": 5,
+      "questions": 593,
+      "correct": 521,
+      "wrong": 25,
+      "abstain": 47,
+      "pa": 0.8364,
+      "pa_ci95": [
+        0.7872,
+        0.8906
+      ],
+      "rulebook_rows_train": 1,
+      "rulebook_rule_names_train": [
+        "Size M, size L"
+      ],
+      "rulebook_rows_public": 2,
+      "rulebook_rule_names_public": [
+        "Size M, size L",
+        "Topping ghi chung ô với món"
+      ]
+    },
+    {
+      "industry": "Nhà thuốc",
+      "shops": [
+        "biz_119",
+        "biz_120",
+        "biz_121",
+        "biz_122",
+        "biz_123",
+        "biz_124"
+      ],
+      "n_shops": 6,
+      "questions": 708,
+      "correct": 588,
+      "wrong": 23,
+      "abstain": 97,
+      "pa": 0.798,
+      "pa_ci95": [
+        0.7373,
+        0.8545
+      ],
+      "rulebook_rows_train": 4,
+      "rulebook_rule_names_train": [
+        "Thuốc kê đơn",
+        "Hàng hết hạn trong N ngày tới",
+        "Doanh thu theo hoạt chất",
+        "Lô gần hết hạn nhất của một thuốc"
+      ],
+      "rulebook_rows_public": 4,
+      "rulebook_rule_names_public": [
+        "Thuốc kê đơn",
+        "Hàng hết hạn trong N ngày tới",
+        "Doanh thu theo hoạt chất",
+        "Lô gần hết hạn nhất của một thuốc"
+      ]
+    },
+    {
+      "industry": "Vật liệu xây dựng",
+      "shops": [
+        "biz_113",
+        "biz_114",
+        "biz_115",
+        "biz_116",
+        "biz_117",
+        "biz_118"
+      ],
+      "n_shops": 6,
+      "questions": 552,
+      "correct": 503,
+      "wrong": 16,
+      "abstain": 33,
+      "pa": 0.8822,
+      "pa_ci95": [
+        0.8354,
+        0.9293
+      ],
+      "rulebook_rows_train": 1,
+      "rulebook_rule_names_train": [
+        "Giao nhiều đợt"
+      ],
+      "rulebook_rows_public": 1,
+      "rulebook_rule_names_public": [
+        "Giao nhiều đợt"
+      ]
+    },
+    {
+      "industry": "Mẹ và bé",
+      "shops": [],
+      "n_shops": 0,
+      "questions": 0,
+      "correct": 0,
+      "wrong": 0,
+      "abstain": 0,
+      "pa": null,
+      "pa_ci95": null,
+      "rulebook_rows_train": null,
+      "rulebook_rule_names_train": [],
+      "rulebook_rows_public": 3,
+      "rulebook_rule_names_public": [
+        "Tiền giảm voucher, tiền giảm nhờ dùng điểm, phí ship",
+        "Số sữa, size bỉm",
+        "Khách thành viên mới trong tháng"
+      ]
+    },
+    {
+      "industry": "Sửa xe",
+      "shops": [],
+      "n_shops": 0,
+      "questions": 0,
+      "correct": 0,
+      "wrong": 0,
+      "abstain": 0,
+      "pa": null,
+      "pa_ci95": null,
+      "rulebook_rows_train": null,
+      "rulebook_rule_names_train": [],
+      "rulebook_rows_public": 6,
+      "rulebook_rule_names_public": [
+        "Lượt xe, phiếu",
+        "Việc ghi trong ô Làm gì",
+        "Dòng xe, biển số",
+        "Thợ làm nhiều nhất",
+        "Bảo hành",
+        "Khách quen, xe tới nhiều lần"
+      ]
+    },
+    {
+      "industry": "Cửa hàng điện thoại",
+      "shops": [],
+      "n_shops": 0,
+      "questions": 0,
+      "correct": 0,
+      "wrong": 0,
+      "abstain": 0,
+      "pa": null,
+      "pa_ci95": null,
+      "rulebook_rows_train": null,
+      "rulebook_rule_names_train": [],
+      "rulebook_rows_public": 4,
+      "rulebook_rule_names_public": [
+        "Thu máy cũ",
+        "Trả góp",
+        "Bảo hành",
+        "Dòng máy, hãng"
+      ]
+    },
+    {
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "shops": [
+        "biz_101",
+        "biz_102",
+        "biz_103",
+        "biz_107",
+        "biz_108",
+        "biz_109",
+        "biz_125",
+        "biz_126",
+        "biz_127",
+        "biz_128",
+        "biz_129",
+        "biz_130"
+      ],
+      "n_shops": 12,
+      "questions": 1107,
+      "correct": 983,
+      "wrong": 44,
+      "abstain": 80,
+      "pa": 0.8482,
+      "pa_ci95": [
+        0.7946,
+        0.8996
+      ],
+      "rulebook_rows_train": 0,
+      "rulebook_rule_names_train": [],
+      "rulebook_rows_public": null,
+      "rulebook_rule_names_public": []
+    },
+    {
+      "industry": "(khong xac dinh duoc)",
+      "shops": [
+        "biz_110"
+      ],
+      "n_shops": 1,
+      "questions": 40,
+      "correct": 39,
+      "wrong": 1,
+      "abstain": 0,
+      "pa": 0.95,
+      "pa_ci95": null,
+      "rulebook_rows_train": 0,
+      "rulebook_rule_names_train": [],
+      "rulebook_rows_public": null,
+      "rulebook_rule_names_public": []
+    }
+  ],
+  "shops": [
+    {
+      "biz": "biz_101",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 40,
+      "correct": 38,
+      "wrong": 1,
+      "abstain": 1
+    },
+    {
+      "biz": "biz_102",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 119,
+      "correct": 116,
+      "wrong": 1,
+      "abstain": 2
+    },
+    {
+      "biz": "biz_103",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 119,
+      "correct": 108,
+      "wrong": 4,
+      "abstain": 7
+    },
+    {
+      "biz": "biz_104",
+      "industry": "Cà phê",
+      "evidence": "keyword hits in data: (m)=35950, (l)=18184, ca phe=13181, tra sua=8368",
+      "questions": 119,
+      "correct": 113,
+      "wrong": 2,
+      "abstain": 4
+    },
+    {
+      "biz": "biz_105",
+      "industry": "Cà phê",
+      "evidence": "keyword hits in data: (m)=81566, (l)=41275, ca phe=29979, tra sua=18712",
+      "questions": 119,
+      "correct": 106,
+      "wrong": 3,
+      "abstain": 10
+    },
+    {
+      "biz": "biz_106",
+      "industry": "Cà phê",
+      "evidence": "keyword hits in data: (m)=74573, (l)=37552, ca phe=27651, tra sua=17242",
+      "questions": 119,
+      "correct": 97,
+      "wrong": 6,
+      "abstain": 16
+    },
+    {
+      "biz": "biz_107",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 40,
+      "correct": 40,
+      "wrong": 0,
+      "abstain": 0
+    },
+    {
+      "biz": "biz_108",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 119,
+      "correct": 113,
+      "wrong": 2,
+      "abstain": 4
+    },
+    {
+      "biz": "biz_109",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 118,
+      "correct": 95,
+      "wrong": 8,
+      "abstain": 15
+    },
+    {
+      "biz": "biz_110",
+      "industry": "(khong xac dinh duoc)",
+      "evidence": "README and data show only bill totals (Tien hang, TongTien, Bên mua); no product type to match an industry",
+      "questions": 40,
+      "correct": 39,
+      "wrong": 1,
+      "abstain": 0
+    },
+    {
+      "biz": "biz_111",
+      "industry": "Cà phê",
+      "evidence": "keyword hits in data: ca phe=23, (m)=21, (l)=21, tra sua=14",
+      "questions": 118,
+      "correct": 104,
+      "wrong": 6,
+      "abstain": 8
+    },
+    {
+      "biz": "biz_112",
+      "industry": "Cà phê",
+      "evidence": "keyword hits in data: (m)=65478, (l)=32843, ca phe=23928, tra sua=14987",
+      "questions": 118,
+      "correct": 101,
+      "wrong": 8,
+      "abstain": 9
+    },
+    {
+      "biz": "biz_113",
+      "industry": "Vật liệu xây dựng",
+      "evidence": "keyword hits in data: gach=3800, xi mang=2002",
+      "questions": 40,
+      "correct": 35,
+      "wrong": 0,
+      "abstain": 5
+    },
+    {
+      "biz": "biz_114",
+      "industry": "Vật liệu xây dựng",
+      "evidence": "keyword hits in data: gach=3059, xi mang=1861",
+      "questions": 40,
+      "correct": 38,
+      "wrong": 1,
+      "abstain": 1
+    },
+    {
+      "biz": "biz_115",
+      "industry": "Vật liệu xây dựng",
+      "evidence": "keyword hits in data: gach=6583, xi mang=3719, bien so=1",
+      "questions": 118,
+      "correct": 114,
+      "wrong": 3,
+      "abstain": 1
+    },
+    {
+      "biz": "biz_116",
+      "industry": "Vật liệu xây dựng",
+      "evidence": "keyword hits in data: gach=8566, xi mang=5621, bien so=1",
+      "questions": 118,
+      "correct": 113,
+      "wrong": 4,
+      "abstain": 1
+    },
+    {
+      "biz": "biz_117",
+      "industry": "Vật liệu xây dựng",
+      "evidence": "keyword hits in data: gach=7664, xi mang=4354, bien so=1",
+      "questions": 118,
+      "correct": 102,
+      "wrong": 1,
+      "abstain": 15
+    },
+    {
+      "biz": "biz_118",
+      "industry": "Vật liệu xây dựng",
+      "evidence": "keyword hits in data: gach=10208, xi mang=6366, bien so=1",
+      "questions": 118,
+      "correct": 101,
+      "wrong": 7,
+      "abstain": 10
+    },
+    {
+      "biz": "biz_119",
+      "industry": "Nhà thuốc",
+      "evidence": "keyword hits in data: panadol=3914, ke don=1, hoat chat=1",
+      "questions": 118,
+      "correct": 106,
+      "wrong": 2,
+      "abstain": 10
+    },
+    {
+      "biz": "biz_120",
+      "industry": "Nhà thuốc",
+      "evidence": "keyword hits in data: panadol=4972, ke don=1, hoat chat=1",
+      "questions": 118,
+      "correct": 100,
+      "wrong": 1,
+      "abstain": 17
+    },
+    {
+      "biz": "biz_121",
+      "industry": "Nhà thuốc",
+      "evidence": "keyword hits in data: panadol=4637, ke don=1, hoat chat=1",
+      "questions": 118,
+      "correct": 98,
+      "wrong": 3,
+      "abstain": 17
+    },
+    {
+      "biz": "biz_122",
+      "industry": "Nhà thuốc",
+      "evidence": "keyword hits in data: panadol=5912, ke don=1, hoat chat=1",
+      "questions": 118,
+      "correct": 104,
+      "wrong": 2,
+      "abstain": 12
+    },
+    {
+      "biz": "biz_123",
+      "industry": "Nhà thuốc",
+      "evidence": "keyword hits in data: panadol=6",
+      "questions": 118,
+      "correct": 91,
+      "wrong": 6,
+      "abstain": 21
+    },
+    {
+      "biz": "biz_124",
+      "industry": "Nhà thuốc",
+      "evidence": "keyword hits in data: panadol=5642, ke don=1, hoat chat=1",
+      "questions": 118,
+      "correct": 89,
+      "wrong": 9,
+      "abstain": 20
+    },
+    {
+      "biz": "biz_125",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 40,
+      "correct": 32,
+      "wrong": 3,
+      "abstain": 5
+    },
+    {
+      "biz": "biz_126",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 40,
+      "correct": 38,
+      "wrong": 0,
+      "abstain": 2
+    },
+    {
+      "biz": "biz_127",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 118,
+      "correct": 98,
+      "wrong": 4,
+      "abstain": 16
+    },
+    {
+      "biz": "biz_128",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 118,
+      "correct": 104,
+      "wrong": 5,
+      "abstain": 9
+    },
+    {
+      "biz": "biz_129",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 118,
+      "correct": 106,
+      "wrong": 5,
+      "abstain": 7
+    },
+    {
+      "biz": "biz_130",
+      "industry": "(khong thuoc nganh trong rulebook)",
+      "evidence": "general grocery or food/drink shop (products such as Mì, Trứng, Coca Cola, Bia Tiger, Thuốc lá, Tã/Sữa mixed in); no rulebook industry matches",
+      "questions": 118,
+      "correct": 95,
+      "wrong": 11,
+      "abstain": 12
+    }
+  ]
+}
