@@ -23,7 +23,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,7 @@ from bizreason.data import schema
 from bizreason.formatting import validate_answer
 from bizreason.llm import TrammayClient, endpoint_file_resolver
 from bizreason.semantic.annotator import Annotator, load_or_annotate, load_status_map, load_value_groups
-from bizreason.semantic.intent import IntentParser
+from bizreason.semantic.intent import IntentParser, ParsedIntent
 from bizreason.semantic.layer import annotations_by_signature, build, effective_roles, to_date, to_number
 from bizreason.semantic.solver import SemanticSolver
 from bizreason.temporal import TemporalResolver
@@ -59,6 +59,7 @@ STAGES = ("ingestion", "annotation", "status", "line_kinds", "value_groups", "bu
 # Decisions for questions that were never attempted: they are not checkpointed, so a rerun answers them.
 NOT_ATTEMPTED = frozenset({"budget", "no_shop"})
 SECRET_ARG_MARKERS = ("token", "secret", "password", "key")
+PROMPT_PROFILES = ("default", "qwen")
 
 # Shared by every model call of the run (builds and question parsing). Set in each build process by
 # _init_build_worker; a fork-context semaphore, so it bounds requests across processes.
@@ -73,6 +74,7 @@ class Outcome:
     line: str
     checkpoint: bool
     finished: float  # time.monotonic() when the answer was complete
+    trace: dict[str, Any] | None = None  # traces.jsonl row; None when --traces is off or nothing was solved
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,84 @@ class Checkpoint:
         self._handle.close()
 
 
+class TraceWriter:
+    """traces.jsonl: one row per solved question, appended and flushed as each answer is recorded.
+
+    On open, rows are kept only for ids already in submission.jsonl (keep_ids), first occurrence only, so a resumed
+    run never duplicates a trace and a question that is answered again gets exactly one fresh row.
+    """
+
+    def __init__(self, path: Path, keep_ids: set[str]):
+        self.path = writable_path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self.ids: set[str] = set()
+        kept: list[str] = []
+        if self.path.exists():
+            for raw in self.path.read_text(encoding="utf-8").splitlines():
+                try:
+                    qid = json.loads(raw)["id"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if isinstance(qid, str) and qid in keep_ids and qid not in self.ids:
+                    self.ids.add(qid)
+                    kept.append(raw)
+        _write_text_atomic(self.path, "".join(line + "\n" for line in kept))
+        self._handle = self.path.open("a", encoding="utf-8", newline="\n")
+
+    def append(self, row: dict[str, Any]) -> None:
+        with self._lock:
+            if row["id"] in self.ids:
+                return
+            self.ids.add(row["id"])
+            self._handle.write(dumps(row) + "\n")
+            self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+class _AttemptRecorder:
+    """Wraps the intent parser, transparently, to remember how many attempts the last parse of this thread took.
+
+    The solver does not report attempts in its trace, so the attempt count is read here.
+    """
+
+    def __init__(self, parser: Any):
+        self._parser = parser
+        self._local = threading.local()
+
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParsedIntent:
+        result = self._parser.parse(question, choices=choices)
+        self._local.attempts = getattr(result, "attempts", None)
+        return result
+
+    def reset(self) -> None:
+        self._local.attempts = None
+
+    def attempts(self) -> int | None:
+        return getattr(self._local, "attempts", None)
+
+
+def make_intent_parser(model: Any, profile: str) -> IntentParser:
+    """IntentParser with the prompt profile. The default profile is passed as the old, keyword-free call."""
+    if profile == "default":
+        return IntentParser(model)
+    try:
+        return IntentParser(model, profile=profile)
+    except TypeError as exc:
+        raise ValueError(f"--prompt-profile {profile!r} needs an IntentParser that accepts profile=; "
+                         f"this IntentParser does not ({exc})") from exc
+
+
+def _trace_row(question: Question, trace: Any, attempts: int | None, seconds: float) -> dict[str, Any]:
+    intent = asdict(trace.intent) if trace.intent is not None else None
+    windows = [[window.role, window.start.isoformat(), window.end_exclusive.isoformat()] for window in trace.windows]
+    return {"id": question.id, "business_id": question.business_id, "question": question.question,
+            "decision": trace.decision, "reason": trace.reason, "intent": intent, "windows": windows,
+            "attempts": attempts, "seconds": seconds}
+
+
 class GatedModel:
     """Thin proxy around a model client: generate_json holds one slot of the shared gate for the whole call.
 
@@ -188,8 +268,11 @@ class GatedModel:
 class SolverPool:
     """Answers questions. Each thread keeps its own read-only connection and solver per shop."""
 
-    def __init__(self, parser: IntentParser, temporal: TemporalResolver, paths: dict[str, Path]):
-        self._parser = parser
+    def __init__(self, parser: IntentParser, temporal: TemporalResolver, paths: dict[str, Path], *,
+                 traces: bool = False):
+        self._recorder = _AttemptRecorder(parser) if traces else None
+        self._parser = self._recorder if traces else parser
+        self._traces = traces
         self._temporal = temporal
         self._paths = paths
         self._local = threading.local()
@@ -203,13 +286,20 @@ class SolverPool:
         path = self._paths.get(question.business_id)
         if path is None:
             return _abstain(question, "shop not built", "no_shop", started, checkpoint=False)
+        if self._recorder is not None:
+            self._recorder.reset()
         try:
             prediction, trace = self._solver(question.business_id, path).solve(question)
             line = submission_line(prediction)
         except Exception as exc:  # one bad question must never stop the run
             return _abstain(question, f"error: {type(exc).__name__}", "error", started, checkpoint=True)
-        return Outcome(question.id, trace.decision, _elapsed(started), line, checkpoint=True,
-                       finished=time.monotonic())
+        seconds = _elapsed(started)
+        row = None
+        if self._traces:
+            attempts = self._recorder.attempts() if self._recorder is not None else None
+            row = _trace_row(question, trace, attempts, seconds)
+        return Outcome(question.id, trace.decision, seconds, line, checkpoint=True,
+                       finished=time.monotonic(), trace=row)
 
     def _solver(self, biz: str, path: Path) -> SemanticSolver:
         cache = getattr(self._local, "solvers", None)
@@ -250,6 +340,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="ignore the header alias list during ingestion (simulates unseen headers)")
     parser.add_argument("--project-shops", type=int, default=DEFAULT_PROJECT_SHOPS)
     parser.add_argument("--project-questions", type=int, default=DEFAULT_PROJECT_QUESTIONS)
+    parser.add_argument("--prompt-profile", choices=PROMPT_PROFILES, default="default",
+                        help="intent prompt profile passed to every IntentParser built for question solving")
+    parser.add_argument("--traces", action="store_true",
+                        help="also write traces.jsonl: one row per solved question with its intent and windows")
+    parser.add_argument("--questions-file", type=Path, metavar="PATH",
+                        help="questions.jsonl to use instead of <data>/questions.jsonl (same format)")
     return parser.parse_args(argv)
 
 
@@ -418,7 +514,7 @@ def build_and_answer(args: argparse.Namespace, data: Path, out: Path, questions:
         by_shop.setdefault(question.business_id, []).append(question)
     waiting = deque(build_order(questions))
     paths: dict[str, Path] = {}
-    solvers = SolverPool(parser, temporal, paths)
+    solvers = SolverPool(parser, temporal, paths, traces=args.traces)
     builds: dict[Future[ShopBuild], str] = {}
     answers: set[Future[Outcome]] = set()
 
@@ -567,7 +663,8 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         raise ValueError("--build-workers must be at least 1")
     if args.max_model_concurrency < 1:
         raise ValueError("--max-model-concurrency must be at least 1")
-    questions = load_questions(data / "questions.jsonl", args.business, args.limit)
+    questions_path = args.questions_file if args.questions_file is not None else data / "questions.jsonl"
+    questions = load_questions(questions_path, args.business, args.limit)
     if not questions:
         raise ValueError("No questions selected")
     out.mkdir(parents=True, exist_ok=True)
@@ -575,6 +672,8 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
     manifest: dict[str, Any] = {
         "git_commit": git_commit(),
         "arguments": {key: _plain(value) for key, value in vars(args).items() if not _is_secret_arg(key)},
+        "prompt_profile": args.prompt_profile,
+        "questions_path": str(questions_path),
         "rulebook_path": str(rulebook),
         "rulebook_sha256": file_hash(rulebook),
         "started_at": _now(),
@@ -584,6 +683,7 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
 
     checkpoint = Checkpoint(out / "submission.jsonl")
     log = RunLog(out / "timing.jsonl")
+    traces = TraceWriter(out / "traces.jsonl", set(checkpoint.lines)) if args.traces else None
     intent_client: TrammayClient | None = None
     saved_roles: dict[str, Any] | None = None
     try:
@@ -594,6 +694,7 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         intent_client = make_client(INTENT_MAX_TOKENS, INTENT_TIMEOUT)
         _, _rules, temporal = _builder(data, out / "cache")
         gate = multiprocessing.get_context("fork").BoundedSemaphore(args.max_model_concurrency)
+        intent_parser = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile)
         deadline = t0 + args.total_seconds - BUDGET_MARGIN_SECONDS
 
         pending = [question for question in questions if question.id not in checkpoint.lines]
@@ -605,17 +706,21 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
                      "end_at": round(outcome.finished - t0, 3)})
             if outcome.checkpoint:
                 checkpoint.append(outcome.question_id, outcome.line)
+                if traces is not None and outcome.trace is not None:
+                    traces.append(outcome.trace)
             lines[outcome.question_id] = outcome.line
             done[0] += 1
             print(f"[{done[0]}/{len(pending)}] {outcome.question_id}: {outcome.decision} ({outcome.seconds:.2f}s)",
                   flush=True)
 
-        build_and_answer(args, data, out, pending, IntentParser(GatedModel(intent_client, gate)), temporal, gate,
+        build_and_answer(args, data, out, pending, intent_parser, temporal, gate,
                          deadline, t0, log, record)
         write_final(out / "submission.final.jsonl", questions, lines)
     finally:
         checkpoint.close()
         log.close()
+        if traces is not None:
+            traces.close()
         if intent_client is not None:
             try:
                 intent_client.close()

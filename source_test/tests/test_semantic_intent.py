@@ -725,3 +725,170 @@ def test_system_prompt_has_location_measure2_and_mapping_rules() -> None:
     assert "product_kind" in SYSTEM
     assert "Never put a place into customer_group or customer." in SYSTEM
     assert "time expression is never a filter value" in SYSTEM
+
+
+# ---- prompt profiles -------------------------------------------------------------------------------------------
+
+# Digest of the default system prompt as it was before profiles existed; the default must stay byte-identical.
+DEFAULT_SYSTEM_SHA256 = "e87e6491d704839ae5eea12fefa929156a10fa02aa126f436ed7ddb8c571a544"
+
+
+def test_default_profile_system_prompt_is_unchanged() -> None:
+    import hashlib
+
+    from bizreason.semantic import intent as intent_module
+
+    assert len(SYSTEM) == 9067
+    assert hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest() == DEFAULT_SYSTEM_SHA256
+    assert intent_module.PROFILES == ("default", "qwen")
+
+    model = FakeModel(good(), good())
+    IntentParser(model).parse("question one")
+    IntentParser(model, profile="default").parse("question one")
+
+    assert model.calls[0]["system"] == SYSTEM
+    assert model.calls[1]["system"] == SYSTEM
+    assert model.calls[0]["prompt"] == model.calls[1]["prompt"] == "Question: question one"
+
+
+def test_qwen_profile_sends_qwen_system_prompt() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    model = FakeModel(good())
+    result = IntentParser(model, profile="qwen").parse("question one", choices={"channel": ["Shop A"]})
+
+    assert result.intent is not None
+    assert model.calls[0]["system"] == QWEN_SYSTEM
+    assert model.calls[0]["system"] != SYSTEM
+    assert model.calls[0]["prompt"].startswith("Question: question one\n\n")
+    assert 'channel: ["Shop A"]' in model.calls[0]["prompt"]
+
+
+def test_qwen_contract_comes_first_and_has_all_points() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    contract = QWEN_SYSTEM.index("OUTPUT CONTRACT")
+    assert contract < QWEN_SYSTEM.index("FIELDS") < QWEN_SYSTEM.index("CATALOGUES")
+    assert QWEN_SYSTEM.index("CATALOGUES") < QWEN_SYSTEM.index("RULES") < QWEN_SYSTEM.index("EXAMPLES")
+    for phrase in (
+        "one JSON object only",
+        "<think>",
+        "Use only these keys",
+        "copied exactly from the lists below",
+        "filters holds ONLY constraints that the question states",
+        "add no filter for it",
+        "Never invent a dimension name",
+        "copies the product text exactly as the question writes it",
+        "exactly one product filter",
+        "A time expression is never a filter value",
+    ):
+        assert phrase in QWEN_SYSTEM, phrase
+    assert contract < 400, "the contract must come before the long explanations"
+
+
+def test_qwen_profile_keeps_every_measure_shape_and_dimension_of_default() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    for key in MEASURES:
+        assert key in SYSTEM and key in QWEN_SYSTEM, key
+    for key in SHAPES:
+        assert key in SYSTEM and key in QWEN_SYSTEM, key
+    for key in DIMENSIONS:
+        assert key in SYSTEM and key in QWEN_SYSTEM, key
+    for definition in list(MEASURES.values()) + list(SHAPES.values()) + list(DIMENSIONS.values()):
+        assert definition in QWEN_SYSTEM, definition
+
+
+def test_qwen_profile_keeps_disambiguation_and_threshold_rules() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    for rule in (
+        "never revenue",
+        "dim unit",
+        "cancelled_count, never order_count",
+        "Counting customers who still owe money means debtor_count",
+        "Asking how much money is still owed means debt_outstanding, never debtor_count",
+        "morning or afternoon shift is a filter with dim shift",
+        "Shapes threshold_count and ratio_of_counts always need a threshold",
+        "1.3 million becomes 1300000",
+        "gross_profit",
+        "purchase_amount is only for goods bought from suppliers",
+        "Never put a place into customer_group or customer.",
+        "how many days had revenue at least X",
+    ):
+        assert rule in QWEN_SYSTEM, rule
+
+
+def test_qwen_examples_cover_the_observed_failure_classes() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    questions = [line for line in examples.splitlines() if line.startswith("Question: ")]
+    replies = [line for line in examples.splitlines() if line.startswith("{")]
+    assert 4 <= len(questions) <= 6
+    assert len(questions) == len(replies)
+    assert '"filters": []' in examples
+    assert '"shape": "top_k"' in examples
+    assert '"measure2": "order_count"' in examples
+    assert '"shape": "compare_periods"' in examples
+    assert "<product A>" in examples
+    assert "<period A>" in examples
+
+
+def test_qwen_examples_are_parseable_and_valid_intents() -> None:
+    import json
+
+    from bizreason.semantic.intent import QWEN_SYSTEM, _interpret
+
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    replies = [line for line in examples.splitlines() if line.startswith("{")]
+    for line in replies:
+        raw = json.loads(line)
+        assert set(raw) == {
+            "measure", "measure2", "shape", "group_by", "filters", "time", "location",
+            "top_k", "compare_as", "age_days", "threshold",
+        }
+        _interpret(raw, final=True)
+
+
+def test_invalid_profile_raises_value_error() -> None:
+    with pytest.raises(ValueError):
+        IntentParser(FakeModel(), profile="gemma")
+
+
+def test_profiles_tuple_matches_registered_prompts() -> None:
+    from bizreason.semantic import intent as intent_module
+
+    assert set(intent_module.PROFILES) == set(intent_module._SYSTEM_BY_PROFILE)
+
+
+@pytest.mark.parametrize("profile", ["default", "qwen"])
+def test_parse_of_same_reply_is_identical_for_both_profiles(profile: str) -> None:
+    reply = good(
+        measure="order_count",
+        shape="top_k",
+        group_by="product",
+        top_k=3,
+        compare_as="value",
+        filters=[{"dim": "product", "value": "<product A>", "exclude": True}],
+        location="  Main street ",
+    )
+    reference = IntentParser(FakeModel(reply)).parse("question one")
+    result = IntentParser(FakeModel(reply), profile=profile).parse("question one")
+
+    assert result.intent == reference.intent
+    assert result.reason == reference.reason == ""
+    assert result.attempts == reference.attempts == 1
+    assert result.raw == reference.raw
+
+
+@pytest.mark.parametrize("profile", ["default", "qwen"])
+def test_retry_and_unresolved_paths_are_identical_for_both_profiles(profile: str) -> None:
+    script = [good(measure="profit"), good(filters=[{"dim": "planet", "value": "mars", "exclude": False}])]
+
+    reference = IntentParser(FakeModel(*script)).parse("question one")
+    result = IntentParser(FakeModel(*script), profile=profile).parse("question one")
+
+    assert result.intent is None
+    assert result.reason == reference.reason == "unknown filter dimension: planet"
+    assert result.attempts == reference.attempts == 2
