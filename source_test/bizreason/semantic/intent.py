@@ -10,7 +10,20 @@ from typing import Any
 
 from bizreason.llm import LanguageModel, ModelError
 from bizreason.semantic.compiler import Intent
-from bizreason.semantic.vocabulary import DIMENSIONS, MEASURES, SHAPES
+from bizreason.semantic.vocabulary import (
+    CANCEL_WORDS,
+    CUSTOMER_GROUP_WORDS,
+    DIMENSIONS,
+    HOW_MANY_WORDS,
+    MEASURES,
+    MONEY_ASK_WORDS,
+    ORDER_WORDS,
+    PRODUCT_GROUP_WORDS,
+    QUANTITY_UNIT_WORDS,
+    SALE_WORDS,
+    SHAPES,
+    SHOP_SELF_WORDS,
+)
 
 COMPARE_MODES = ("percent", "value", "average_per_weekday")
 DEFAULT_COMPARE_AS = "percent"
@@ -119,6 +132,28 @@ def _catalogue(title: str, entries: dict[str, str]) -> str:
     return title + "\n" + "\n".join(f"- {k}: {v}" for k, v in entries.items()) + "\n"
 
 
+def _quoted(words: tuple[str, ...]) -> str:
+    return ", ".join(f'"{word}"' for word in words)
+
+
+def _vietnamese_reading_rules() -> str:
+    """Shop-talk rules for Vietnamese questions; every word is taken from the vocabulary tables."""
+    return (
+        "VIETNAMESE READING RULES\n"
+        f"- Shop words {_quoted(SHOP_SELF_WORDS)} name the shop itself, the subject of the question. They are never "
+        "a location, a channel, a customer or any other filter.\n"
+        f"- Count unit words {_quoted(QUANTITY_UNIT_WORDS)}. A unit word after a how-many word "
+        f"({_quoted(HOW_MANY_WORDS)}) asks for a quantity sold: measure qty_base_sold, never revenue.\n"
+        f"- Money words {_quoted(MONEY_ASK_WORDS)} ask for money: measure revenue, never qty_base_sold.\n"
+        f"- Cancel words {_quoted(CANCEL_WORDS)} select cancelled measures: cancelled_count for a count of orders, "
+        "cancel_rate for a percent of orders.\n"
+        f"- Product group words {_quoted(PRODUCT_GROUP_WORDS)} and customer group words "
+        f"{_quoted(CUSTOMER_GROUP_WORDS)} are the only reason to add a product_group or customer_group filter. "
+        "When none of them appears in the question, add no group filter.\n"
+        "\n"
+    )
+
+
 # Prompt profile for Qwen-family models. Same definitions and parsing as SYSTEM; only the framing and layout differ:
 # a strict output contract comes first, the catalogues are grouped, and a few short examples close the prompt.
 QWEN_SYSTEM = (
@@ -142,7 +177,8 @@ QWEN_SYSTEM = (
     "7. A time expression is never a filter value; it goes only into time.\n"
     "8. Use only what the question says.\n"
     "\n"
-    "FIELDS\n"
+    + _vietnamese_reading_rules()
+    + "FIELDS\n"
     "- measure: one measure key.\n"
     "- measure2: a second measure key when the question asks two different quantities; otherwise null.\n"
     "- shape: one shape key.\n"
@@ -229,11 +265,26 @@ QWEN_SYSTEM = (
     'Question: "How much revenue and how many orders were there?"\n'
     '{"measure": "revenue", "measure2": "order_count", "shape": "scalar", "group_by": null, "filters": [], '
     '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
-    "The last example compares two periods by percent change; the period phrase goes into time.\n"
+    "The next example compares two periods by percent change; the period phrase goes into time.\n"
     'Question: "By what percent did revenue change from <period A> to <period B>?"\n'
     '{"measure": "revenue", "measure2": null, "shape": "compare_periods", "group_by": null, "filters": [], '
     '"time": "from <period A> to <period B>", "location": null, "top_k": null, "compare_as": "percent", '
     '"age_days": null, "threshold": null}\n'
+    "\n"
+    "The next example is a shop question: the shop word names the shop, so it adds no filter, and the money word "
+    "asks for revenue.\n"
+    f'Question: "{SHOP_SELF_WORDS[0]} {SALE_WORDS[0]} {HOW_MANY_WORDS[0]} {MONEY_ASK_WORDS[0]}?"\n'
+    '{"measure": "revenue", "measure2": null, "shape": "scalar", "group_by": null, "filters": [], '
+    '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The next example asks how many units of one product were sold, so the measure is a quantity, not revenue.\n"
+    f'Question: "{SALE_WORDS[0]} {HOW_MANY_WORDS[0]} {QUANTITY_UNIT_WORDS[0]} <product A>?"\n'
+    '{"measure": "qty_base_sold", "measure2": null, "shape": "scalar", "group_by": null, '
+    '"filters": [{"dim": "product", "value": "<product A>", "exclude": false}], "time": null, "location": null, '
+    '"top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The last example counts cancelled orders; no group filter is added because no group word is stated.\n"
+    f'Question: "{HOW_MANY_WORDS[0]} {ORDER_WORDS[0]} {CANCEL_WORDS[0]}?"\n'
+    '{"measure": "cancelled_count", "measure2": null, "shape": "scalar", "group_by": null, "filters": [], '
+    '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
     "\n"
     "Before replying, check: one JSON object, only the allowed keys, every enum value from the lists, and "
     "filters only from the question."

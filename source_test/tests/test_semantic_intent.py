@@ -769,7 +769,8 @@ def test_qwen_contract_comes_first_and_has_all_points() -> None:
 
     contract = QWEN_SYSTEM.index("OUTPUT CONTRACT")
     assert contract < QWEN_SYSTEM.index("FIELDS") < QWEN_SYSTEM.index("CATALOGUES")
-    assert QWEN_SYSTEM.index("CATALOGUES") < QWEN_SYSTEM.index("RULES") < QWEN_SYSTEM.index("EXAMPLES")
+    # The heading is matched on its own line, because "VIETNAMESE READING RULES" also contains the word RULES.
+    assert QWEN_SYSTEM.index("CATALOGUES") < QWEN_SYSTEM.index("\nRULES\n") < QWEN_SYSTEM.index("EXAMPLES")
     for phrase in (
         "one JSON object only",
         "<think>",
@@ -825,7 +826,7 @@ def test_qwen_examples_cover_the_observed_failure_classes() -> None:
     examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
     questions = [line for line in examples.splitlines() if line.startswith("Question: ")]
     replies = [line for line in examples.splitlines() if line.startswith("{")]
-    assert 4 <= len(questions) <= 6
+    assert 4 <= len(questions) <= 8
     assert len(questions) == len(replies)
     assert '"filters": []' in examples
     assert '"shape": "top_k"' in examples
@@ -892,3 +893,48 @@ def test_retry_and_unresolved_paths_are_identical_for_both_profiles(profile: str
     assert result.intent is None
     assert result.reason == reference.reason == "unknown filter dimension: planet"
     assert result.attempts == reference.attempts == 2
+
+
+def test_qwen_vietnamese_reading_rules_sit_after_the_contract_and_name_every_word() -> None:
+    from bizreason.semantic import vocabulary as vocab
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    start = QWEN_SYSTEM.index("VIETNAMESE READING RULES")
+    section = QWEN_SYSTEM[start:QWEN_SYSTEM.index("FIELDS\n")]
+    assert QWEN_SYSTEM.index("OUTPUT CONTRACT") < start
+    for table in (
+        vocab.SHOP_SELF_WORDS, vocab.QUANTITY_UNIT_WORDS, vocab.HOW_MANY_WORDS, vocab.MONEY_ASK_WORDS,
+        vocab.CANCEL_WORDS, vocab.PRODUCT_GROUP_WORDS, vocab.CUSTOMER_GROUP_WORDS,
+    ):
+        for word in table:
+            assert f'"{word}"' in section, word
+    for phrase in (
+        "name the shop itself, the subject of the question",
+        "never a location, a channel, a customer or any other filter",
+        "measure qty_base_sold, never revenue",
+        "measure revenue, never qty_base_sold",
+        "cancelled_count for a count of orders",
+        "cancel_rate for a percent of orders",
+        "add no group filter",
+    ):
+        assert phrase in section, phrase
+
+
+def test_qwen_examples_cover_shop_unit_and_cancel_classes() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+    from bizreason.semantic.vocabulary import CANCEL_WORDS, QUANTITY_UNIT_WORDS, SHOP_SELF_WORDS
+
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    questions = [line for line in examples.splitlines() if line.startswith("Question: ")]
+    assert any(SHOP_SELF_WORDS[0] in line for line in questions)
+    assert any(QUANTITY_UNIT_WORDS[0] in line for line in questions)
+    assert any(CANCEL_WORDS[0] in line for line in questions)
+    assert '"measure": "qty_base_sold"' in examples
+    assert '"measure": "cancelled_count"' in examples
+
+
+def test_default_prompt_has_no_vietnamese_reading_rules() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    assert "VIETNAMESE READING RULES" not in SYSTEM
+    assert "VIETNAMESE READING RULES" in QWEN_SYSTEM

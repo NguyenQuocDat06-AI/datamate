@@ -135,3 +135,24 @@ ADDRESS_HEADER_TOKENS = ("dia chi", "addr", "address", "duong pho")
 # amount", "and the number"). Compared after lookup normalization, as whole words. Used only with a top-k intent
 # that groups by an entity, so a plain list of values is never matched by these words.
 TABLE_ASK_CUES = ("kem", "moi nguoi", "tung nguoi", "va so")
+
+# Shop talk for small shops, written with and without diacritics because questions are often typed without them.
+# A shop word names the shop itself, the subject of the question. It is never a location, channel or customer.
+SHOP_SELF_WORDS = ("cửa hàng", "cua hang", "quán", "quan", "tiệm", "tiem", "shop", "sốp", "sop")
+# Count unit words. After a how-many word they ask for a quantity sold, so the measure is qty_base_sold.
+QUANTITY_UNIT_WORDS = (
+    "đĩa", "dia", "ly", "cốc", "coc", "chai", "hộp", "hop", "cái", "cai", "gói", "goi", "lon", "thùng", "thung",
+    "kg", "bao", "cây", "cay", "viên", "vien", "vỉ", "vi",
+)
+# How-many words that come before a count unit or a money word, such as "how many" or "how much".
+HOW_MANY_WORDS = ("bao nhiêu", "bao nhieu", "bnhiu", "mấy", "may")
+# Money words: after how-many they ask for money (revenue), never for a quantity.
+MONEY_ASK_WORDS = ("tiền", "tien", "doanh thu", "dthu")
+# Cancel wording for prompts. Each form matches CANCEL_TOKENS after lookup normalization, which drops diacritics.
+CANCEL_WORDS = ("huỷ", "hủy", "huy", "cancel")
+# Words for a sale and for an order, used in the prompt examples.
+SALE_WORDS = ("bán", "ban")
+ORDER_WORDS = ("đơn", "don", "đơn hàng", "don hang")
+# Group words. They are the only reason to add a product_group or customer_group filter.
+PRODUCT_GROUP_WORDS = ("nhóm hàng", "nhom hang", "danh mục", "danh muc", "loại hàng", "loai hang")
+CUSTOMER_GROUP_WORDS = ("nhóm khách", "nhom khach", "loại khách", "loai khach", "phân loại khách", "phan loai khach")
