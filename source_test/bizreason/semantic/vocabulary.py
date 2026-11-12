@@ -156,3 +156,9 @@ ORDER_WORDS = ("đơn", "don", "đơn hàng", "don hang")
 # Group words. They are the only reason to add a product_group or customer_group filter.
 PRODUCT_GROUP_WORDS = ("nhóm hàng", "nhom hang", "danh mục", "danh muc", "loại hàng", "loai hang")
 CUSTOMER_GROUP_WORDS = ("nhóm khách", "nhom khach", "loại khách", "loai khach", "phân loại khách", "phan loai khach")
+# Average words. With a money word and a per-order phrase they ask for the average revenue of one order.
+AVERAGE_WORDS = ("bình quân", "binh quan", "trung bình", "trung binh")
+# Per-order phrases. They name one order, so an average over them is revenue per order.
+PER_ORDER_WORDS = ("mỗi đơn", "moi don", "một đơn", "mot don")
+# Import price words. With an average word they ask for the average import price of one unit.
+IMPORT_PRICE_WORDS = ("giá nhập", "gia nhap")

@@ -11,13 +11,16 @@ from typing import Any
 from bizreason.llm import LanguageModel, ModelError
 from bizreason.semantic.compiler import Intent
 from bizreason.semantic.vocabulary import (
+    AVERAGE_WORDS,
     CANCEL_WORDS,
     CUSTOMER_GROUP_WORDS,
     DIMENSIONS,
     HOW_MANY_WORDS,
+    IMPORT_PRICE_WORDS,
     MEASURES,
     MONEY_ASK_WORDS,
     ORDER_WORDS,
+    PER_ORDER_WORDS,
     PRODUCT_GROUP_WORDS,
     QUANTITY_UNIT_WORDS,
     SALE_WORDS,
@@ -147,8 +150,13 @@ def _vietnamese_reading_rules() -> str:
         f"- Money words {_quoted(MONEY_ASK_WORDS)} ask for money: measure revenue, never qty_base_sold.\n"
         f"- Cancel words {_quoted(CANCEL_WORDS)} select cancelled measures: cancelled_count for a count of orders, "
         "cancel_rate for a percent of orders.\n"
+        f"- Average words {_quoted(AVERAGE_WORDS)} with a money word or a per-order phrase "
+        f"({_quoted(PER_ORDER_WORDS)}) ask for the average revenue of one order: measure avg_per_order, not revenue.\n"
+        f"- Average words with import price words {_quoted(IMPORT_PRICE_WORDS)} ask for the average import price "
+        "of one unit: measure unit_purchase_price, never purchase_amount or purchase_receipt_count.\n"
         f"- Product group words {_quoted(PRODUCT_GROUP_WORDS)} and customer group words "
         f"{_quoted(CUSTOMER_GROUP_WORDS)} are the only reason to add a product_group or customer_group filter. "
+        "A product name, drug name, active ingredient or product kind is never a group. "
         "When none of them appears in the question, add no group filter.\n"
         "\n"
     )
@@ -186,7 +194,8 @@ QWEN_SYSTEM = (
     '- filters: a list of {"dim": <dimension key>, "value": <text copied from the question>, '
     '"exclude": true or false}.\n'
     "- time: the time phrase copied from the question, or null.\n"
-    "- location: the street, district or place the question restricts customers to, or null. "
+    "- location: the street, district or place the question restricts customers to, or null. A shop word is never "
+    "a location: a question that only names the shop has location null. "
     "Never put a place into customer_group or customer.\n"
     "- top_k: a positive integer, or null.\n"
     '- compare_as: "percent", "value" or "average_per_weekday".\n'
@@ -252,9 +261,9 @@ QWEN_SYSTEM = (
     'Question: "Which 3 customers had the highest revenue?"\n'
     '{"measure": "revenue", "measure2": null, "shape": "top_k", "group_by": "customer", "filters": [], '
     '"time": null, "location": null, "top_k": 3, "compare_as": "percent", "age_days": null, "threshold": null}\n'
-    "The next example has no filter, so filters is an empty list.\n"
-    'Question: "How many orders were cancelled?"\n'
-    '{"measure": "cancelled_count", "measure2": null, "shape": "scalar", "group_by": null, "filters": [], '
+    "The next example asks for an average per order, so the measure is avg_per_order, not revenue.\n"
+    f'Question: "{MONEY_ASK_WORDS[2]} {AVERAGE_WORDS[0]} {PER_ORDER_WORDS[0]}?"\n'
+    '{"measure": "avg_per_order", "measure2": null, "shape": "scalar", "group_by": null, "filters": [], '
     '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
     "The next example has exactly one product filter, copied from the question.\n"
     'Question: "How much did <product A> sell for in total?"\n'

@@ -938,3 +938,31 @@ def test_default_prompt_has_no_vietnamese_reading_rules() -> None:
 
     assert "VIETNAMESE READING RULES" not in SYSTEM
     assert "VIETNAMESE READING RULES" in QWEN_SYSTEM
+
+
+def test_qwen_iteration_three_rules_sit_in_the_reading_rules_and_contract_layout() -> None:
+    from bizreason.semantic import vocabulary as vocab
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    start = QWEN_SYSTEM.index("VIETNAMESE READING RULES")
+    section = QWEN_SYSTEM[start:QWEN_SYSTEM.index("FIELDS\n")]
+    for table in (vocab.AVERAGE_WORDS, vocab.PER_ORDER_WORDS, vocab.IMPORT_PRICE_WORDS):
+        for word in table:
+            assert f'"{word}"' in section, word
+    for phrase in (
+        "measure avg_per_order, not revenue",
+        "measure unit_purchase_price, never purchase_amount or purchase_receipt_count",
+        "A product name, drug name, active ingredient or product kind is never a group.",
+        "A shop word is never a location: a question that only names the shop has location null.",
+    ):
+        assert phrase in QWEN_SYSTEM, phrase
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    assert '"measure": "avg_per_order"' in examples
+    assert QWEN_SYSTEM.index("OUTPUT CONTRACT") < start < QWEN_SYSTEM.index("FIELDS\n")
+
+
+def test_qwen_prompt_length_grows_by_at_most_fifteen_percent() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    # The prompt was 13612 characters before the iteration-three rules; the budget is +15 percent.
+    assert len(QWEN_SYSTEM) <= 13612 * 1.15
