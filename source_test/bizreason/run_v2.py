@@ -35,6 +35,7 @@ from bizreason.data import schema
 from bizreason.formatting import validate_answer
 from bizreason.llm import TrammayClient, endpoint_file_resolver
 from bizreason.semantic.annotator import Annotator, load_or_annotate, load_status_map, load_value_groups
+from bizreason.semantic.fewshot import FewShotBank
 from bizreason.semantic.intent import IntentParser, ParsedIntent
 from bizreason.semantic.layer import annotations_by_signature, build, effective_roles, to_date, to_number
 from bizreason.semantic.solver import SemanticSolver
@@ -212,8 +213,8 @@ class _AttemptRecorder:
         self._parser = parser
         self._local = threading.local()
 
-    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParsedIntent:
-        result = self._parser.parse(question, choices=choices)
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None, **kwargs: Any) -> ParsedIntent:
+        result = self._parser.parse(question, choices=choices, **kwargs)
         self._local.attempts = getattr(result, "attempts", None)
         return result
 
@@ -224,8 +225,39 @@ class _AttemptRecorder:
         return getattr(self._local, "attempts", None)
 
 
-def make_intent_parser(model: Any, profile: str) -> IntentParser:
-    """IntentParser with the prompt profile. The default profile is passed as the old, keyword-free call."""
+class _QuestionBoundParser:
+    """Gives the intent parser the id and shop of the question being solved, which few-shot retrieval needs.
+
+    The solver calls parse(question, choices) and does not pass ids, so SolverPool binds each question before
+    solving it. The binding is per thread: each thread solves one question at a time with its own solvers.
+    A parse of any other text is refused, so retrieval can never run without the ids its leakage rules need.
+    """
+
+    def __init__(self, parser: Any):
+        self._parser = parser
+        self._local = threading.local()
+
+    def bind(self, question: Question | None) -> None:
+        self._local.question = question
+
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParsedIntent:
+        bound = getattr(self._local, "question", None)
+        if bound is None or bound.question != question:
+            raise RuntimeError("intent parse for a question that is not the bound question")
+        return self._parser.parse(question, choices=choices, question_id=bound.id, business_id=bound.business_id)
+
+
+def make_intent_parser(model: Any, profile: str, examples: Callable[..., str] | None = None) -> IntentParser:
+    """IntentParser with the prompt profile and optional few-shot examples.
+
+    The default profile without examples is passed as the old, keyword-free call.
+    """
+    if examples is not None:
+        try:
+            return IntentParser(model, profile=profile, examples=examples)
+        except TypeError as exc:
+            raise ValueError(f"--fewshot-bank needs an IntentParser that accepts examples=; "
+                             f"this IntentParser does not ({exc})") from exc
     if profile == "default":
         return IntentParser(model)
     try:
@@ -269,9 +301,12 @@ class SolverPool:
     """Answers questions. Each thread keeps its own read-only connection and solver per shop."""
 
     def __init__(self, parser: IntentParser, temporal: TemporalResolver, paths: dict[str, Path], *,
-                 traces: bool = False):
+                 traces: bool = False, bind_questions: bool = False):
         self._recorder = _AttemptRecorder(parser) if traces else None
         self._parser = self._recorder if traces else parser
+        self._binder = _QuestionBoundParser(self._parser) if bind_questions else None
+        if self._binder is not None:
+            self._parser = self._binder
         self._traces = traces
         self._temporal = temporal
         self._paths = paths
@@ -288,11 +323,17 @@ class SolverPool:
             return _abstain(question, "shop not built", "no_shop", started, checkpoint=False)
         if self._recorder is not None:
             self._recorder.reset()
+        if self._binder is not None:
+            self._binder.bind(question)
         try:
-            prediction, trace = self._solver(question.business_id, path).solve(question)
-            line = submission_line(prediction)
-        except Exception as exc:  # one bad question must never stop the run
-            return _abstain(question, f"error: {type(exc).__name__}", "error", started, checkpoint=True)
+            try:
+                prediction, trace = self._solver(question.business_id, path).solve(question)
+                line = submission_line(prediction)
+            except Exception as exc:  # one bad question must never stop the run
+                return _abstain(question, f"error: {type(exc).__name__}", "error", started, checkpoint=True)
+        finally:
+            if self._binder is not None:
+                self._binder.bind(None)
         seconds = _elapsed(started)
         row = None
         if self._traces:
@@ -346,6 +387,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="also write traces.jsonl: one row per solved question with its intent and windows")
     parser.add_argument("--questions-file", type=Path, metavar="PATH",
                         help="questions.jsonl to use instead of <data>/questions.jsonl (same format)")
+    parser.add_argument("--fewshot-bank", type=Path, metavar="PATH",
+                        help="few-shot bank jsonl (solved questions with intents); the k most similar, from other "
+                             "shops, are shown to the intent parser for each question")
+    parser.add_argument("--fewshot-k", type=int, default=4, metavar="N",
+                        help="number of few-shot examples per question when --fewshot-bank is given (default 4)")
     return parser.parse_args(argv)
 
 
@@ -514,7 +560,7 @@ def build_and_answer(args: argparse.Namespace, data: Path, out: Path, questions:
         by_shop.setdefault(question.business_id, []).append(question)
     waiting = deque(build_order(questions))
     paths: dict[str, Path] = {}
-    solvers = SolverPool(parser, temporal, paths, traces=args.traces)
+    solvers = SolverPool(parser, temporal, paths, traces=args.traces, bind_questions=args.fewshot_bank is not None)
     builds: dict[Future[ShopBuild], str] = {}
     answers: set[Future[Outcome]] = set()
 
@@ -663,6 +709,13 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         raise ValueError("--build-workers must be at least 1")
     if args.max_model_concurrency < 1:
         raise ValueError("--max-model-concurrency must be at least 1")
+    fewshot: FewShotBank | None = None
+    if args.fewshot_bank is not None:
+        if args.fewshot_k < 1:
+            raise ValueError("--fewshot-k must be at least 1")
+        fewshot = FewShotBank.load(args.fewshot_bank)
+        if len(fewshot) == 0:
+            raise ValueError(f"--fewshot-bank {args.fewshot_bank} has no examples")
     questions_path = args.questions_file if args.questions_file is not None else data / "questions.jsonl"
     questions = load_questions(questions_path, args.business, args.limit)
     if not questions:
@@ -673,6 +726,9 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         "git_commit": git_commit(),
         "arguments": {key: _plain(value) for key, value in vars(args).items() if not _is_secret_arg(key)},
         "prompt_profile": args.prompt_profile,
+        "fewshot_bank": str(args.fewshot_bank) if fewshot is not None else None,
+        "fewshot_bank_sha256": file_hash(args.fewshot_bank) if fewshot is not None else None,
+        "fewshot_k": args.fewshot_k if fewshot is not None else None,
         "questions_path": str(questions_path),
         "rulebook_path": str(rulebook),
         "rulebook_sha256": file_hash(rulebook),
@@ -694,7 +750,8 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         intent_client = make_client(INTENT_MAX_TOKENS, INTENT_TIMEOUT)
         _, _rules, temporal = _builder(data, out / "cache")
         gate = multiprocessing.get_context("fork").BoundedSemaphore(args.max_model_concurrency)
-        intent_parser = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile)
+        examples = fewshot.provider(args.fewshot_k) if fewshot is not None else None
+        intent_parser = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile, examples)
         deadline = t0 + args.total_seconds - BUDGET_MARGIN_SECONDS
 
         pending = [question for question in questions if question.id not in checkpoint.lines]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
@@ -966,3 +967,68 @@ def test_qwen_prompt_length_grows_by_at_most_fifteen_percent() -> None:
 
     # The prompt was 13612 characters before the iteration-three rules; the budget is +15 percent.
     assert len(QWEN_SYSTEM) <= 13612 * 1.15
+
+
+DEFAULT_SYSTEM_SHA256 = "e87e6491d704839ae5eea12fefa929156a10fa02aa126f436ed7ddb8c571a544"
+EXAMPLE_BLOCK = 'Similar solved questions:\nQ: Earlier?\nA: {"measure": "revenue", "shape": "scalar"}'
+
+
+def test_default_system_prompt_is_pinned() -> None:
+    assert hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest() == DEFAULT_SYSTEM_SHA256
+
+
+def test_default_user_prompt_is_unchanged_without_examples() -> None:
+    model = FakeModel(good())
+    IntentParser(model).parse("How many?")
+    assert model.calls[0]["prompt"] == "Question: How many?"
+    assert model.calls[0]["system"] == SYSTEM
+
+
+def test_default_user_prompt_with_choices_is_unchanged_without_examples() -> None:
+    model = FakeModel(good())
+    IntentParser(model).parse("How many?", choices={"product": ["Tea"]})
+    assert model.calls[0]["prompt"] == (
+        'Question: How many?\n\nStored values for filter dimensions:\n- product: ["Tea"]\n'
+        "When a filter refers to one of these values, copy the stored value exactly. "
+        "When the question uses a colloquial word that has the same meaning as a stored value, use that stored value. "
+        "If no stored value matches, keep the question's words."
+    )
+
+
+def test_examples_provider_changes_only_the_user_prompt() -> None:
+    seen: list[tuple[str, str | None, str | None]] = []
+
+    def provider(question: str, question_id: str | None, business_id: str | None) -> str:
+        seen.append((question, question_id, business_id))
+        return EXAMPLE_BLOCK
+
+    model = FakeModel(good())
+    IntentParser(model, examples=provider).parse("How many?", question_id="q-1", business_id="biz_9")
+    assert seen == [("How many?", "q-1", "biz_9")]
+    assert model.calls[0]["system"] == SYSTEM
+    assert model.calls[0]["prompt"] == "Question: How many?\n\n" + EXAMPLE_BLOCK
+
+
+def test_examples_block_goes_before_choices_and_survives_a_retry() -> None:
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def provider(question: str, question_id: str | None, business_id: str | None) -> str:
+        calls.append((question, question_id, business_id))
+        return EXAMPLE_BLOCK
+
+    model = FakeModel(good(measure="not_a_measure"), good())
+    result = IntentParser(model, examples=provider).parse("How many?", choices={"product": ["Tea"]})
+
+    assert result.intent is not None and result.attempts == 2
+    assert calls == [("How many?", None, None)]  # retrieved once per question, not once per attempt
+    first, retry = model.calls[0]["prompt"], model.calls[1]["prompt"]
+    assert first.startswith("Question: How many?\n\n" + EXAMPLE_BLOCK + "\n\nStored values for filter dimensions:")
+    assert retry.startswith("Question: How many?\n\n" + EXAMPLE_BLOCK + " ")
+    assert retry.endswith("If no stored value matches, keep the question's words.")
+    assert model.calls[0]["system"] == model.calls[1]["system"] == SYSTEM
+
+
+def test_empty_examples_block_leaves_the_prompt_as_it_was() -> None:
+    model = FakeModel(good())
+    IntentParser(model, examples=lambda question, question_id, business_id: "").parse("How many?")
+    assert model.calls[0]["prompt"] == "Question: How many?"

@@ -524,3 +524,109 @@ def test_questions_file_restricts_questions_and_shops(setup, fake_client) -> Non
     assert not (setup["out"] / "sem" / "shop_a.sqlite").exists()
     manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["questions_path"] == str(subset)
+
+
+@pytest.fixture
+def fewshot_bank(setup) -> Path:
+    """Shop_b examples are usable for shop_a questions; the shop_a row and the q1 variant must never be shown."""
+    rows = [
+        {"id": "shop_b-q9", "business_id": "shop_b", "question": "How many orders?",
+         "intent": {"measure": "order_count", "shape": "scalar", "filters": [], "group_by": None}},
+        {"id": "shop_a-q9", "business_id": "shop_a", "question": "How many orders?",
+         "intent": {"measure": "order_count", "shape": "scalar", "filters": [], "group_by": None}},
+        {"id": "q1__abbrev", "business_id": "shop_b", "question": "How many orders?",
+         "intent": {"measure": "order_count", "shape": "scalar", "filters": [], "group_by": None}},
+    ]
+    path = setup["out"].parent / "fewshot.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def recording(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """A fake parser that records its constructor keywords and every parse, and runs the examples provider."""
+    seen = SimpleNamespace(kwargs=[], calls=[], blocks={})
+
+    class RecordingParser:
+        def __init__(self, model: Any, **kwargs: Any) -> None:
+            seen.kwargs.append(kwargs)
+            self.examples = kwargs.get("examples")
+
+        def parse(self, question: str, choices: Any = None, *, question_id: Any = None,
+                  business_id: Any = None) -> ParsedIntent:
+            seen.calls.append((question, question_id, business_id))
+            if self.examples is not None:
+                seen.blocks[question_id] = self.examples(question, question_id, business_id)
+            return ParsedIntent(intent=Intent(measure="order_count"), reason="", attempts=1, raw=None)
+
+    class ScriptedSolver(SemanticSolver):
+        def solve(self, question):
+            parsed = self.parser.parse(question.question, choices=None)  # the solver passes no ids
+            trace = SolveTrace(question_id=question.id, intent=parsed.intent, windows=[], decision="value", reason="")
+            return Prediction(id=question.id, type=AnswerType.NUMBER, answer=2.0), trace
+
+    monkeypatch.setattr(run_v2, "IntentParser", RecordingParser)
+    monkeypatch.setattr(run_v2, "SemanticSolver", ScriptedSolver)
+    return seen
+
+
+def test_fewshot_flags_default_to_off_and_k_four(tmp_path: Path) -> None:
+    base = ["--data", str(tmp_path), "--out", str(tmp_path), "--connection", str(tmp_path / "c.json")]
+    args = run_v2.parse_args(base)
+    assert args.fewshot_bank is None and args.fewshot_k == 4
+    args = run_v2.parse_args(base + ["--fewshot-bank", str(tmp_path / "b.jsonl"), "--fewshot-k", "2"])
+    assert args.fewshot_bank == tmp_path / "b.jsonl" and args.fewshot_k == 2
+
+
+def test_without_a_bank_the_parser_gets_no_examples(setup, fake_client, recording) -> None:
+    assert main(command(setup)) == 0
+    assert recording.kwargs == [{}]  # the default profile without a bank is the old, keyword-free IntentParser(model)
+    assert recording.blocks == {}
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fewshot_bank"] is None and manifest["fewshot_k"] is None and manifest["fewshot_bank_sha256"] is None
+
+
+def test_fewshot_bank_reaches_the_parser_with_leakage_rules(setup, fake_client, recording, fewshot_bank) -> None:
+    assert main(command(setup, "--fewshot-bank", str(fewshot_bank), "--fewshot-k", "2")) == 0
+
+    assert len(recording.kwargs) == 1 and callable(recording.kwargs[0]["examples"])
+    # Each question reached the parser with its own id and shop, not only its text.
+    assert sorted(recording.calls) == [("How many orders?", "q1", "shop_a"), ("What is the revenue?", "q2", "shop_a")]
+    # For q1 only shop_b-q9 is usable: shop_a-q9 shares the shop and q1__abbrev shares q1's base id.
+    assert recording.blocks["q1"] == (
+        'Similar solved questions:\nQ: How many orders?\nA: {"measure": "order_count", "shape": "scalar"}'
+    )
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fewshot_bank"] == str(fewshot_bank)
+    assert manifest["fewshot_k"] == 2
+    assert manifest["fewshot_bank_sha256"] == hashlib.sha256(fewshot_bank.read_bytes()).hexdigest()
+
+
+def test_fewshot_k_must_be_positive(setup, fake_client, recording, fewshot_bank) -> None:
+    with pytest.raises(ValueError, match="--fewshot-k must be at least 1"):
+        main(command(setup, "--fewshot-bank", str(fewshot_bank), "--fewshot-k", "0"))
+
+
+def test_empty_fewshot_bank_is_refused(setup, fake_client, recording, tmp_path) -> None:
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="has no examples"):
+        main(command(setup, "--fewshot-bank", str(empty)))
+
+
+def test_bound_parser_refuses_text_that_is_not_the_bound_question() -> None:
+    class Inner:
+        def parse(self, question: str, choices: Any = None, **kwargs: Any) -> ParsedIntent:
+            return ParsedIntent(intent=None, reason=str(kwargs), attempts=1, raw=None)
+
+    bound = run_v2._QuestionBoundParser(Inner())
+    with pytest.raises(RuntimeError, match="not the bound question"):
+        bound.parse("What is the revenue?")  # nothing bound yet
+    question = Question(id="q2", business_id="shop_a", question="What is the revenue?", as_of_date=date(2026, 3, 10))
+    bound.bind(question)
+    assert bound.parse("What is the revenue?").reason == "{'question_id': 'q2', 'business_id': 'shop_a'}"
+    with pytest.raises(RuntimeError):
+        bound.parse("some other text")
+    bound.bind(None)
+    with pytest.raises(RuntimeError):
+        bound.parse("What is the revenue?")

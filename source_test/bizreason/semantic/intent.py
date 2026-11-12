@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -541,6 +542,7 @@ class IntentParser:
         timeout: float = 200.0,
         max_attempts: int = 2,
         profile: str = "default",
+        examples: Callable[[str, str | None, str | None], str] | None = None,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -551,9 +553,16 @@ class IntentParser:
         self.max_attempts = max_attempts
         self.profile = profile
         self.system = _SYSTEM_BY_PROFILE[profile]
+        # examples(question, question_id, business_id) returns a block of worked examples, or "" for none.
+        self.examples = examples
 
-    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParsedIntent:
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None, *,
+              question_id: str | None = None, business_id: str | None = None) -> ParsedIntent:
         base_prompt = "Question: " + question
+        if self.examples is not None:
+            block = self.examples(question, question_id, business_id)
+            if block:
+                base_prompt = base_prompt + "\n\n" + block
         section = _choices_section(choices)
         suffix = "\n\n" + section if section else ""
         prompt = base_prompt + suffix
