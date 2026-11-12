@@ -5,12 +5,29 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from bizreason.llm import LanguageModel, ModelError
 from bizreason.semantic.compiler import Intent
-from bizreason.semantic.vocabulary import DIMENSIONS, MEASURES, SHAPES
+from bizreason.semantic.vocabulary import (
+    AVERAGE_WORDS,
+    CANCEL_WORDS,
+    CUSTOMER_GROUP_WORDS,
+    DIMENSIONS,
+    HOW_MANY_WORDS,
+    IMPORT_PRICE_WORDS,
+    MEASURES,
+    MONEY_ASK_WORDS,
+    ORDER_WORDS,
+    PER_ORDER_WORDS,
+    PRODUCT_GROUP_WORDS,
+    QUANTITY_UNIT_WORDS,
+    SALE_WORDS,
+    SHAPES,
+    SHOP_SELF_WORDS,
+)
 
 COMPARE_MODES = ("percent", "value", "average_per_weekday")
 DEFAULT_COMPARE_AS = "percent"
@@ -110,6 +127,193 @@ SYSTEM = (
     "threshold_count, threshold subject product and metric order_count.\n"
     '- "how many days had revenue at least X" is shape threshold_count, threshold subject day and metric revenue.\n'
     "Use only what the question says. Never add a filter the question does not state."
+)
+
+PROFILES = ("default", "qwen")
+
+
+def _catalogue(title: str, entries: dict[str, str]) -> str:
+    return title + "\n" + "\n".join(f"- {k}: {v}" for k, v in entries.items()) + "\n"
+
+
+def _quoted(words: tuple[str, ...]) -> str:
+    return ", ".join(f'"{word}"' for word in words)
+
+
+def _vietnamese_reading_rules() -> str:
+    """Shop-talk rules for Vietnamese questions; every word is taken from the vocabulary tables."""
+    return (
+        "VIETNAMESE READING RULES\n"
+        f"- Shop words {_quoted(SHOP_SELF_WORDS)} name the shop itself, the subject of the question. They are never "
+        "a location, a channel, a customer or any other filter.\n"
+        f"- Count unit words {_quoted(QUANTITY_UNIT_WORDS)}. A unit word after a how-many word "
+        f"({_quoted(HOW_MANY_WORDS)}) asks for a quantity sold: measure qty_base_sold, never revenue.\n"
+        f"- Money words {_quoted(MONEY_ASK_WORDS)} ask for money: measure revenue, never qty_base_sold.\n"
+        f"- Cancel words {_quoted(CANCEL_WORDS)} select cancelled measures: cancelled_count for a count of orders, "
+        "cancel_rate for a percent of orders.\n"
+        f"- Average words {_quoted(AVERAGE_WORDS)} with a money word or a per-order phrase "
+        f"({_quoted(PER_ORDER_WORDS)}) ask for the average revenue of one order: measure avg_per_order, not revenue.\n"
+        f"- Average words with import price words {_quoted(IMPORT_PRICE_WORDS)} ask for the average import price "
+        "of one unit: measure unit_purchase_price, never purchase_amount or purchase_receipt_count.\n"
+        f"- Product group words {_quoted(PRODUCT_GROUP_WORDS)} and customer group words "
+        f"{_quoted(CUSTOMER_GROUP_WORDS)} are the only reason to add a product_group or customer_group filter. "
+        "A product name, drug name, active ingredient or product kind is never a group. "
+        "When none of them appears in the question, add no group filter.\n"
+        "\n"
+    )
+
+
+# Prompt profile for Qwen-family models. Same definitions and parsing as SYSTEM; only the framing and layout differ:
+# a strict output contract comes first, the catalogues are grouped, and a few short examples close the prompt.
+QWEN_SYSTEM = (
+    "You convert one business question into one JSON object. The question may be in Vietnamese and may have "
+    "typos, slang or no diacritics. Do not compute anything.\n"
+    "\n"
+    "OUTPUT CONTRACT (follow every point)\n"
+    "1. Reply with one JSON object only. No explanation, no markdown and no reasoning text. Never write a "
+    "<think> block.\n"
+    "2. Use only these keys: measure, measure2, shape, group_by, filters, time, location, top_k, compare_as, "
+    "age_days, threshold.\n"
+    "3. Every enum value (measure, measure2, shape, group_by, filters[].dim, threshold subject, metric and op, "
+    "compare_as) must be copied exactly from the lists below. Never invent a name.\n"
+    "4. filters holds ONLY constraints that the question states. Each filter needs a word or phrase in the "
+    "question that supports it. If the question names no customer group, product group, channel or other "
+    "dimension, add no filter for it. When the question states no filter, filters is [].\n"
+    "5. filters[].dim must be one of the dimension keys listed below. Never invent a dimension name, and never "
+    "use a time word, measure or shape name as a dimension.\n"
+    "6. A product filter copies the product text exactly as the question writes it, with the same spelling. "
+    "A question about one product has exactly one product filter.\n"
+    "7. A time expression is never a filter value; it goes only into time.\n"
+    "8. Use only what the question says.\n"
+    "\n"
+    + _vietnamese_reading_rules()
+    + "FIELDS\n"
+    "- measure: one measure key.\n"
+    "- measure2: a second measure key when the question asks two different quantities; otherwise null.\n"
+    "- shape: one shape key.\n"
+    "- group_by: one dimension key when the answer is split by that dimension; otherwise null.\n"
+    '- filters: a list of {"dim": <dimension key>, "value": <text copied from the question>, '
+    '"exclude": true or false}.\n'
+    "- time: the time phrase copied from the question, or null.\n"
+    "- location: the street, district or place the question restricts customers to, or null. A shop word is never "
+    "a location: a question that only names the shop has location null. "
+    "Never put a place into customer_group or customer.\n"
+    "- top_k: a positive integer, or null.\n"
+    '- compare_as: "percent", "value" or "average_per_weekday".\n'
+    "- age_days: a positive integer, or null.\n"
+    '- threshold: null, or {"subject": <subject>, "metric": <metric>, "op": <operator>, "value": <number>}.\n'
+    "\n"
+    "CATALOGUES\n"
+    + _catalogue("Measures:", MEASURES)
+    + _catalogue("Shapes:", SHAPES)
+    + _catalogue("Dimensions:", DIMENSIONS)
+    + "Threshold subjects: customer, order, product, day. Threshold metrics: order_count, revenue, qty. "
+    "Threshold operators: gte, gt, lte, lt.\n"
+    "\n"
+    "RULES\n"
+    "Compare, exclude and threshold fields:\n"
+    '- compare_as is "average_per_weekday" when the question asks for the average per given day of the week.\n'
+    '- compare_as is "percent" when a comparison asks for a percent change, and "value" when it asks for a '
+    "difference in units.\n"
+    "- exclude is true when the question says to leave that value out, and false otherwise.\n"
+    "- threshold keeps only the subjects whose metric satisfies the comparison; it is null when the question "
+    "has no such condition. Use it for questions like counting customers with at least N orders, or orders "
+    "with a value of at least X.\n"
+    "- Operators: \"from N upward\" and \"at least N\" mean gte, which includes N. \"over N\", \"more than N\" "
+    "and \"above N\" mean gt, which excludes N. \"up to N\" and \"at most N\" mean lte. \"below N\" and "
+    "\"under N\" mean lt.\n"
+    "- Money words such as million must become full numbers, so 1.3 million becomes 1300000.\n"
+    "- Shapes threshold_count and ratio_of_counts always need a threshold.\n"
+    "- age_days is set only when a debt question restricts to debts older than N days.\n"
+    "- measure2 is the second quantity when the question asks two different quantities; measure is the first.\n"
+    "Measure and shape choices:\n"
+    "- Asking how many of a countable physical unit were sold means qty_base_sold, never revenue. Add a filter "
+    "with dim unit only when the question sums across all products of that unit.\n"
+    "- Asking how many orders were cancelled means cancelled_count, never order_count.\n"
+    "- Counting bills, invoices, receipts or orders means order_count, even when the question is very short.\n"
+    "- Counting customers who still owe money means debtor_count.\n"
+    "- Asking how much money is still owed means debt_outstanding, never debtor_count.\n"
+    "- Asking which product, customer, employee or supplier is best means group_by with that dimension.\n"
+    "- Shapes top_k and argmax_entity always need group_by set to one dimension.\n"
+    "- A breakdown across several periods, such as months or weeks, has group_by null.\n"
+    "- A question asking to compare two subsets in one answer is breakdown, not compare_periods.\n"
+    "- A comparison between two shifts or two channels is compare_periods only when the question asks for a "
+    "percent change or a difference between them.\n"
+    "- A mention of a morning or afternoon shift is a filter with dim shift.\n"
+    "Field mappings:\n"
+    "- A time expression is never a filter value; time words belong only in the time field.\n"
+    '- "gross profit" is measure gross_profit.\n'
+    "- Money received from selling a product is measure revenue; purchase_amount is only for goods bought from "
+    "suppliers.\n"
+    "- revenue is only for questions about money received from sales.\n"
+    "- A filter on prescription drugs uses dim prescription. A filter on new or used devices uses dim "
+    "product_kind.\n"
+    "Threshold mappings:\n"
+    '- "what percent of customers bought at least N orders" is shape ratio_of_counts with the same threshold.\n'
+    '- "how many orders have value at least X" is measure order_count, shape threshold_count, threshold '
+    "subject order and metric revenue.\n"
+    '- "how many products appear in at least N orders" is measure orders_containing_product, shape '
+    "threshold_count, threshold subject product and metric order_count.\n"
+    '- "how many days had revenue at least X" is shape threshold_count, threshold subject day and metric '
+    "revenue.\n"
+    "\n"
+    "EXAMPLES (question, then the reply)\n"
+    "The first example takes a ranking with one value per entity, and no filter because none is stated.\n"
+    'Question: "Which 3 customers had the highest revenue?"\n'
+    '{"measure": "revenue", "measure2": null, "shape": "top_k", "group_by": "customer", "filters": [], '
+    '"time": null, "location": null, "top_k": 3, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The next example asks for an average per order, so the measure is avg_per_order, not revenue.\n"
+    f'Question: "{MONEY_ASK_WORDS[2]} {AVERAGE_WORDS[0]} {PER_ORDER_WORDS[0]}?"\n'
+    '{"measure": "avg_per_order", "measure2": null, "shape": "scalar", "group_by": null, "filters": [], '
+    '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The next example has exactly one product filter, copied from the question.\n"
+    'Question: "How much did <product A> sell for in total?"\n'
+    '{"measure": "revenue", "measure2": null, "shape": "scalar", "group_by": null, "filters": [{"dim": "product", '
+    '"value": "<product A>", "exclude": false}], "time": null, "location": null, "top_k": null, '
+    '"compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The next example asks two different quantities, so measure2 is set.\n"
+    'Question: "How much revenue and how many orders were there?"\n'
+    '{"measure": "revenue", "measure2": "order_count", "shape": "scalar", "group_by": null, "filters": [], '
+    '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The next example compares two periods by percent change; the period phrase goes into time.\n"
+    'Question: "By what percent did revenue change from <period A> to <period B>?"\n'
+    '{"measure": "revenue", "measure2": null, "shape": "compare_periods", "group_by": null, "filters": [], '
+    '"time": "from <period A> to <period B>", "location": null, "top_k": null, "compare_as": "percent", '
+    '"age_days": null, "threshold": null}\n'
+    "\n"
+    "The next example is a shop question: the shop word names the shop, so it adds no filter, and the money word "
+    "asks for revenue.\n"
+    f'Question: "{SHOP_SELF_WORDS[0]} {SALE_WORDS[0]} {HOW_MANY_WORDS[0]} {MONEY_ASK_WORDS[0]}?"\n'
+    '{"measure": "revenue", "measure2": null, "shape": "scalar", "group_by": null, "filters": [], '
+    '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The next example asks how many units of one product were sold, so the measure is a quantity, not revenue.\n"
+    f'Question: "{SALE_WORDS[0]} {HOW_MANY_WORDS[0]} {QUANTITY_UNIT_WORDS[0]} <product A>?"\n'
+    '{"measure": "qty_base_sold", "measure2": null, "shape": "scalar", "group_by": null, '
+    '"filters": [{"dim": "product", "value": "<product A>", "exclude": false}], "time": null, "location": null, '
+    '"top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "The last example counts cancelled orders; no group filter is added because no group word is stated.\n"
+    f'Question: "{HOW_MANY_WORDS[0]} {ORDER_WORDS[0]} {CANCEL_WORDS[0]}?"\n'
+    '{"measure": "cancelled_count", "measure2": null, "shape": "scalar", "group_by": null, "filters": [], '
+    '"time": null, "location": null, "top_k": null, "compare_as": "percent", "age_days": null, "threshold": null}\n'
+    "\n"
+    "Before replying, check: one JSON object, only the allowed keys, every enum value from the lists, and "
+    "filters only from the question."
+)
+
+_SYSTEM_BY_PROFILE = {"default": SYSTEM, "qwen": QWEN_SYSTEM}
+
+# Optional short reasoning before the intent (--reasoning on). It is appended to the profile's system prompt, which
+# itself stays unchanged. The analysis is the first key of the same JSON object, so parsing is unchanged: the parser
+# reads only the intent keys and the analysis is kept in the raw reply for traces.
+REASONING_KEY = "analysis"
+REASONING_ADDENDUM = (
+    "Reasoning step. Your JSON object must start with the key \"" + REASONING_KEY + "\", a string of at most three "
+    "short sentences written before you choose the other keys. In it state: (1) the quantity the question asks for "
+    "and the measure that computes it; (2) each filter the question itself states, quoting the question's words, or "
+    "\"no filters\" when it states none; (3) the time frame and the shape of the answer (one value, a list, a "
+    "ranking, a comparison or a yes/no check). Then give the other keys, consistent with that analysis. Never add a "
+    "filter, time frame or grouping that the analysis did not find in the question. Worked examples, when shown, "
+    "omit the analysis key; your reply must still include it."
 )
 
 _ERROR_HINT = (
@@ -345,15 +549,38 @@ def _choices_section(choices: dict[str, list[str]] | None) -> str:
 
 
 class IntentParser:
-    def __init__(self, model: LanguageModel, *, timeout: float = 200.0, max_attempts: int = 2):
+    def __init__(
+        self,
+        model: LanguageModel,
+        *,
+        timeout: float = 200.0,
+        max_attempts: int = 2,
+        profile: str = "default",
+        examples: Callable[[str, str | None, str | None], str] | None = None,
+        reasoning: bool = False,
+    ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if profile not in _SYSTEM_BY_PROFILE:
+            raise ValueError(f"unknown prompt profile {profile!r}; expected one of {', '.join(PROFILES)}")
         self.model = model
         self.timeout = timeout
         self.max_attempts = max_attempts
+        self.profile = profile
+        self.system = _SYSTEM_BY_PROFILE[profile]
+        self.reasoning = reasoning
+        if reasoning:
+            self.system = self.system + "\n\n" + REASONING_ADDENDUM
+        # examples(question, question_id, business_id) returns a block of worked examples, or "" for none.
+        self.examples = examples
 
-    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParsedIntent:
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None, *,
+              question_id: str | None = None, business_id: str | None = None) -> ParsedIntent:
         base_prompt = "Question: " + question
+        if self.examples is not None:
+            block = self.examples(question, question_id, business_id)
+            if block:
+                base_prompt = base_prompt + "\n\n" + block
         section = _choices_section(choices)
         suffix = "\n\n" + section if section else ""
         prompt = base_prompt + suffix
@@ -362,8 +589,10 @@ class IntentParser:
         attempts = 0
         for attempts in range(1, self.max_attempts + 1):
             try:
-                output = self.model.generate_json(SYSTEM, prompt, timeout=self.timeout)
-            except ModelError as exc:
+                output = self.model.generate_json(self.system, prompt, timeout=self.timeout)
+            except Exception as exc:
+                # Any failure of the model call (including raw transport errors) is a failed
+                # attempt, so the solver only ever sees the "model call failed" reason.
                 reason = f"model call failed: {type(exc).__name__}"
                 hint = _ERROR_HINT
             else:

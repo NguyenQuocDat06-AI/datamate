@@ -12,7 +12,7 @@ from typing import Any
 
 from bizreason.contracts import BusinessContext, ColumnMeta, Diagnostic, SourceRef, TableMeta
 from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
-from bizreason.data.layout import has_record_evidence, is_note, is_summary
+from bizreason.data.layout import ArithmeticSubtotals, has_record_evidence, is_note, is_summary
 from bizreason.data.readers import RawSheet, read_sheets
 from bizreason.data.identities import (
     canonicalize_products,
@@ -36,6 +36,12 @@ from bizreason.data.schema import (
     sheet_year,
 )
 from bizreason.rules import RuleRegistry
+from bizreason.data.vocabulary import (
+    CURRENCY_ANCHOR_RE,
+    DECLARED_END_RE,
+    DECLARED_START_RE,
+    NOTE_HEADER,
+)
 from bizreason.utils import (
     atomic_json,
     digest,
@@ -302,7 +308,7 @@ def infer_locale(values: list[Any], readme: str, *, currency: bool = False) -> s
     anchors.update(Decimal(value) for value in strings if re.fullmatch(r"-?\d+", value))
     if currency:
         for value in strings:
-            if re.search(r"(?:k|tr|triệu|trieu|vnd|vnđ|đ|₫)$", value, re.IGNORECASE):
+            if re.search(CURRENCY_ANCHOR_RE, value, re.IGNORECASE):
                 parsed = parse_number(value, unit="VND")
                 if parsed.status == ParseStatus.OK:
                     anchors.add(parsed.value)
@@ -471,15 +477,13 @@ class BusinessBuilder:
         finally:
             connection.close()
         temporary.replace(database)
-        match = re.search(
-            r"(?:đến hết|tới hết|đến ngày)\s+(\d{1,2}/\d{1,2}/\d{4})", readme, re.IGNORECASE
-        )
+        match = re.search(DECLARED_END_RE, readme, re.IGNORECASE)
         declared_end = None
         if match:
             parsed = parse_date(match.group(1))
             if parsed.status == ParseStatus.OK:
                 declared_end = date.fromisoformat(parsed.value)
-        start_match = re.search(r"dữ liệu có từ\s+(\d{1,2}/\d{1,2}/\d{4})", readme, re.IGNORECASE)
+        start_match = re.search(DECLARED_START_RE, readme, re.IGNORECASE)
         declared_start = None
         if start_match:
             parsed = parse_date(start_match.group(1))
@@ -697,7 +701,7 @@ class BusinessBuilder:
         inherited_fields = [
             index
             for index, role in enumerate(roles)
-            if role in GROUP_ROLES or normalize_lookup(headers[index]) == "ghi chu"
+            if role in GROUP_ROLES or normalize_lookup(headers[index]) == NOTE_HEADER
         ]
         raw_count, excluded, duplicate, kept = len(rows), 0, 0, 0
         year = sheet_year(sheet.path.stem + " " + sheet.name)
@@ -710,6 +714,7 @@ class BusinessBuilder:
             ),
             default=-1,
         )
+        subtotals = ArithmeticSubtotals(roles, locales)
         for position, (row_number, raw_row) in enumerate(rows):
             row = list(raw_row[:width]) + [None] * max(0, width - len(raw_row))
             if all(blank(cell) for cell in row) or tuple(row) == tuple(headers):
@@ -742,6 +747,8 @@ class BusinessBuilder:
             if kind:
                 excluded += 1
                 current_group = None
+                if kind == "summary":
+                    subtotals.reset()
                 diagnostics.append(
                     Diagnostic(
                         code=f"EXCLUDED_{kind.upper()}_ROW",
@@ -751,6 +758,20 @@ class BusinessBuilder:
                     )
                 )
                 continue
+            if subtotals.is_subtotal(row):
+                excluded += 1
+                current_group = None
+                subtotals.reset()
+                diagnostics.append(
+                    Diagnostic(
+                        code="EXCLUDED_SUBTOTAL_ROW",
+                        message="Arithmetic subtotal outside transaction rows: empty keys, amount equals the rows above",
+                        source=SourceRef(path=relative, table=sheet.name, row=row_number),
+                        severity="info",
+                    )
+                )
+                continue
+            subtotals.add(row)
             if grain == "order_line" and order_index is not None:
                 if not blank(row[order_index]):
                     row[order_index] = clean_text(row[order_index])

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bizreason.contracts import TimeWindow
+from bizreason.semantic import rulebook_params
 from bizreason.utils import normalize_lookup
 
 
@@ -55,11 +56,17 @@ class LunarCalendar:
                 raise ValueError("Required lunar date is not uniquely covered")
             return found[0]
 
+        # Read at call time from the active rulebook parameters (DEFAULTS: 23/12 of the previous lunar year to 10/1).
+        params = rulebook_params.active()
+
+        start_month, start_day, offset = params.tet_start
+        end_month, end_day = params.tet_end
+        when = {-1: "previous_lunar_year", 0: "lunar_year"}.get(offset, f"lunar_year{offset:+d}")
         return TimeWindow(
             role=role,
-            start=find(lunar_year - 1, 12, 23),
-            end_exclusive=find(lunar_year, 1, 10) + timedelta(days=1),
-            evidence=["calendar.csv", "tet:23/12_previous_lunar_year..10/1"],
+            start=find(lunar_year + offset, start_month, start_day),
+            end_exclusive=find(lunar_year, end_month, end_day) + timedelta(days=1),
+            evidence=["calendar.csv", f"tet:{start_day}/{start_month}_{when}..{end_day}/{end_month}"],
         )
 
 

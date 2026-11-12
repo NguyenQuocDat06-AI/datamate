@@ -16,6 +16,9 @@ QTY_UNPARSED_SHARE = 0.005
 MONEY_UNPARSED_SHARE = 0.005
 NULL_STATUS_SHARE = 0.05
 UNLINKED_PAYMENT_SHARE = 0.20
+# Orders with a customer id but no customer group, while the shop gives groups to other orders. Measured on the
+# shops with customer ids: none has an ungrouped share above zero.
+UNGROUPED_CUSTOMER_SHARE = 0.05
 
 # Build statistics keys, as the layer writes them.
 QTY_NONBLANK = "qty_cells_nonblank"
@@ -34,6 +37,7 @@ class QualityFlags:
     order_structure_broken: bool
     status_unreliable: bool
     payments_unlinked: bool
+    customer_group_incomplete: bool
     reasons: list[str] = field(default_factory=list)
 
 
@@ -91,6 +95,22 @@ def _unlinked_payment_share(connection: sqlite3.Connection) -> float | None:
     return (unlinked or 0) / dated
 
 
+def _ungrouped_customer_share(connection: sqlite3.Connection) -> float | None:
+    """Share of orders with a customer id that have no customer group. None when the shop gives no order a group, or
+    when no order has a customer id."""
+    try:
+        with_id, ungrouped, grouped = connection.execute(
+            "SELECT COUNT(CASE WHEN customer_id IS NOT NULL THEN 1 END), "
+            "COUNT(CASE WHEN customer_id IS NOT NULL AND customer_group IS NULL THEN 1 END), "
+            "COUNT(customer_group) FROM orders"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not with_id or not grouped:
+        return None
+    return (ungrouped or 0) / with_id
+
+
 def assess(connection: sqlite3.Connection) -> QualityFlags:
     reasons: list[str] = []
 
@@ -121,11 +141,17 @@ def assess(connection: sqlite3.Connection) -> QualityFlags:
     if payments_bad:
         reasons.append(f"payments_unlinked: {unlinked:.2%} of dated orders have no payment")
 
+    ungrouped = _ungrouped_customer_share(connection)
+    group_bad = ungrouped is not None and ungrouped > UNGROUPED_CUSTOMER_SHARE
+    if group_bad:
+        reasons.append(f"customer_group_incomplete: {ungrouped:.2%} of orders with a customer id have no customer group")
+
     return QualityFlags(
         qty_unreliable=qty_bad,
         money_unreliable=money_bad,
         order_structure_broken=order_bad,
         status_unreliable=status_bad,
         payments_unlinked=payments_bad,
+        customer_group_incomplete=group_bad,
         reasons=reasons,
     )

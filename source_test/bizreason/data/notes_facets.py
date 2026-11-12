@@ -10,6 +10,7 @@ from bizreason.contracts import ColumnMeta, TableMeta
 from bizreason.data.eligibility import propagate_order_returns
 from bizreason.data.parsing import ParseStatus, blank, parse_status
 from bizreason.rules import RuleRegistry
+from bizreason.data.vocabulary import CANCEL_TONE_MARKS
 from bizreason.utils import normalize_lookup, quote_identifier
 
 PAYMENT_PHRASE_RE = re.compile(
@@ -69,7 +70,7 @@ def classify_note_status(note_raw: Any) -> tuple[str | None, bool]:
 
     # Without its tone mark, a lone "huy" is usually a person's name; only the marked word states a cancellation.
     lowered = text.lower()
-    if ("hủy" in lowered or "huỷ" in lowered) and re.search(r"\bhuy\b", working_text):
+    if any(mark in lowered for mark in CANCEL_TONE_MARKS) and re.search(r"\bhuy\b", working_text):
         matched_states.add("cancelled")
 
     if not (has_payment or has_negation):

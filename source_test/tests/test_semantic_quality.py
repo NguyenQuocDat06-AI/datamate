@@ -160,3 +160,42 @@ def test_unresolved_annotation_key_blocks_orders_with_its_flag_name():
     flags = assess(stats_db(annotation_keys_unresolved=1))
     assert flags.order_structure_broken is True
     assert flags.reasons == ["order_structure_broken: annotation_keys_unresolved is 1"]
+
+
+def add_customer_orders(conn: sqlite3.Connection, rows: list[tuple[str, str | None, str | None]]) -> None:
+    """Rows of (order_id, customer_id, customer_group)."""
+    conn.execute("CREATE TABLE orders (order_id TEXT, customer_id TEXT, customer_group TEXT)")
+    conn.executemany("INSERT INTO orders VALUES (?, ?, ?)", rows)
+
+
+def test_customer_group_incomplete_fires_above_threshold_and_not_at_it():
+    rows = [(f"O{i}", f"C{i}", "Gold") for i in range(100)]
+    above = stats_db()
+    add_customer_orders(above, [(o, c, None if i < 6 else g) for i, (o, c, g) in enumerate(rows)])
+    flags = assess(above)
+    assert flags.customer_group_incomplete is True
+    assert any(r.startswith("customer_group_incomplete:") for r in flags.reasons)
+
+    at = stats_db()
+    add_customer_orders(at, [(o, c, None if i < 5 else g) for i, (o, c, g) in enumerate(rows)])
+    flags = assess(at)
+    assert flags.customer_group_incomplete is False
+    assert not any(r.startswith("customer_group_incomplete:") for r in flags.reasons)
+
+
+def test_customer_group_incomplete_ignores_orders_without_a_customer_id():
+    conn = stats_db()
+    add_customer_orders(conn, [("O1", "C1", "Gold"), ("O2", "C2", "Silver")] + [
+        (f"W{i}", None, None) for i in range(50)  # walk-in orders with no id: no group expected
+    ])
+    assert assess(conn).customer_group_incomplete is False
+
+
+def test_customer_group_incomplete_needs_some_group_in_the_shop():
+    conn = stats_db()
+    add_customer_orders(conn, [(f"O{i}", f"C{i}", None) for i in range(20)])
+    assert assess(conn).customer_group_incomplete is False
+
+
+def test_customer_group_incomplete_is_false_without_an_orders_table():
+    assert assess(stats_db(qty_cells_nonblank=10)).customer_group_incomplete is False

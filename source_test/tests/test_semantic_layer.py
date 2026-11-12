@@ -1260,6 +1260,79 @@ SALES_LINE_ROLES = {"order": "order_id", "date": "ordered_at", "item": "product_
 SALES_LINE_COLUMNS = ["order", "date", "item", "amount"]
 
 
+CUSTOMER_SALES = {"order": "order_id", "cust": "customer_id", "item": "product_name", "amount": "line_amount"}
+
+
+def _split_customer_run(tmp_path: Path, catalog_sheets: dict[str, tuple[list[str], list[tuple]]],
+                        roles: dict[str, str]) -> list[tuple]:
+    """Sales O1..O5 for customers C1..C5, and a customer catalog given as several sheets. The catalog is annotated
+    once, with the columns of its first sheet; the other sheets get that annotation through their columns."""
+    sales_columns = ["order", "cust", "item", "amount"]
+    specs: Specs = {"sales": (sales_columns, [
+        ("O1", "C1", "tea", "100"), ("O2", "C2", "tea", "50"), ("O3", "C3", "tea", "30"),
+        ("O4", "C4", "tea", "10"), ("O5", "C5", "tea", "5"),
+    ])}
+    specs.update(catalog_sheets)
+    annotated_columns = next(iter(catalog_sheets.values()))[0]
+    records = [
+        _record(sales_columns, "sales", CUSTOMER_SALES),
+        _record(annotated_columns, "customer_catalog", roles),
+    ]
+    _, out = _run(tmp_path, specs, records)
+    return _query(out, "SELECT order_id, customer_group FROM orders ORDER BY order_id")
+
+
+def test_customer_group_is_read_from_every_sheet_of_a_catalog_in_parts(tmp_path: Path) -> None:
+    # The first column is constant ("Ca nhan") and names the kind of customer, so a sheet whose customers all share
+    # one group (the one-customer sheet) used to take that constant column as its group.
+    columns = ["kind", "code", "segment"]
+    catalog = {
+        "customers_t01": (columns, [("Ca nhan", "C1", "Gold"), ("Ca nhan", "C2", "Silver")]),
+        "customers_t02": (columns, [("Ca nhan", "C3", "Gold"), ("Ca nhan", "C4", "Bronze")]),
+        "customers_t03": (columns, [("Ca nhan", "C5", "Silver")]),
+    }
+    roles = {"kind": "customer_group", "code": "customer_id", "segment": "customer_group"}
+
+    assert _split_customer_run(tmp_path, catalog, roles) == [
+        ("O1", "Gold"), ("O2", "Silver"), ("O3", "Gold"), ("O4", "Bronze"), ("O5", "Silver"),
+    ]
+
+
+def test_sheet_with_one_extra_column_still_contributes_its_customers(tmp_path: Path) -> None:
+    columns = ["kind", "code", "name", "segment", "phone"]
+    catalog = {
+        "customers_t01": (columns, [("Ca nhan", "C1", "An", "Gold", "1"), ("Ca nhan", "C2", "Binh", "Silver", "2")]),
+        "customers_t02": (columns, [("Ca nhan", "C3", "Cuong", "Gold", "3"), ("Ca nhan", "C4", "Dung", "Bronze", "4")]),
+        # one more column (a birth date): 5 of 6 names are shared, so it is a sibling of the catalog
+        "customers_t03": (columns + ["birth"], [("Ca nhan", "C5", "Em", "Silver", "5", None)]),
+    }
+    roles = {"kind": "customer_group", "code": "customer_id", "name": "customer_name",
+             "segment": "customer_group", "phone": "customer_phone"}
+
+    assert _split_customer_run(tmp_path, catalog, roles) == [
+        ("O1", "Gold"), ("O2", "Silver"), ("O3", "Gold"), ("O4", "Bronze"), ("O5", "Silver"),
+    ]
+
+
+def test_same_id_with_two_groups_across_sheets_takes_no_group(tmp_path: Path) -> None:
+    columns = ["code", "segment"]
+    catalog = {
+        "customers_t01": (columns, [("C1", "Gold"), ("C2", "Silver")]),
+        "customers_t02": (columns, [("C1", "Silver"), ("C2", "Silver"), ("C3", "Gold")]),  # C1 conflicts, C2 agrees
+    }
+    roles = {"code": "customer_id", "segment": "customer_group"}
+
+    assert _split_customer_run(tmp_path, catalog, roles) == [
+        ("O1", None), ("O2", "Silver"), ("O3", "Gold"), ("O4", None), ("O5", None),
+    ]
+
+
+def test_catalog_sibling_rule_matches_the_annotator() -> None:
+    from bizreason.semantic import annotator
+
+    assert layer.CATALOG_SIBLING_MIN_SHARE == annotator.SIBLING_MIN_SHARE
+
+
 def _run_with(tmp_path: Path, specs: Specs, records: list[dict[str, Any]], *, readme: str = "",
               diagnostics: tuple = (), **kwargs: Any) -> tuple[dict, Path]:
     context = _context(_source(tmp_path, specs), specs).model_copy(
@@ -1629,6 +1702,25 @@ def test_build_writes_model_failures_table_and_report_count(tmp_path: Path) -> N
 
     assert _query(out, "SELECT stage FROM model_failures") == [("line_kinds",)]
     assert report["model_failures"] == 1
+
+
+def test_build_writes_table_and_kind_of_each_model_failure(tmp_path: Path) -> None:
+    columns = ["order", "item", "amount"]
+    specs: Specs = {"sales": (columns, [("O1", "tea", "100")])}
+    failures = [
+        layer.ModelFailure("roles:danhsach_sheet1", "danhsach_sheet1", "product_catalog"),
+        layer.ModelFailure("kind:sales_feb", "sales_feb", None),
+        layer.ModelFailure("status"),
+    ]
+
+    report, out = _run(tmp_path, specs, [_record(columns, "sales", SALES_ROLES)], model_failures=failures)
+
+    assert _query(out, "SELECT stage, table_name, kind FROM model_failures ORDER BY rowid") == [
+        ("roles:danhsach_sheet1", "danhsach_sheet1", "product_catalog"),
+        ("kind:sales_feb", "sales_feb", None),
+        ("status", None, None),
+    ]
+    assert report["model_failures"] == 3
 
 
 def test_build_without_model_failures_leaves_an_empty_table(tmp_path: Path) -> None:

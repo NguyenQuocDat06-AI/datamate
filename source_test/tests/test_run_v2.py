@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,13 +18,14 @@ from typing import Any
 import pytest
 
 from bizreason import run_v2
-from bizreason.contracts import AnswerType, Prediction, Question
+from bizreason.contracts import AnswerType, Prediction, Question, TimeWindow
 from bizreason.data import schema
 from bizreason.formatting import SubmissionWriter
 from bizreason.llm import ModelError
 from bizreason.semantic.annotator import SCOPE
-from bizreason.semantic.intent import SYSTEM
-from bizreason.semantic.solver import SemanticSolver
+from bizreason.semantic.compiler import Intent
+from bizreason.semantic.intent import SYSTEM, ParsedIntent
+from bizreason.semantic.solver import SemanticSolver, SolveTrace
 from bizreason.run_v2 import (
     Checkpoint,
     GatedModel,
@@ -200,10 +202,51 @@ def test_budget_exhausted_writes_abstain_for_remaining_questions(setup, fake_cli
     assert decisions == ["budget", "budget"]
 
 
-def test_no_alias_restores_header_lookup(setup, fake_client) -> None:
+@pytest.fixture
+def seen_roles(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """ROLE_LOOKUP as it is when the shop context is built, i.e. inside the run."""
+    seen: list[dict[str, Any]] = []
+    real_build = run_v2.build_v2_context
+
+    def recording_build(*args: Any, **kwargs: Any) -> Any:
+        seen.append(dict(schema.ROLE_LOOKUP))
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(run_v2, "build_v2_context", recording_build)
+    return seen
+
+
+def test_aliases_default_off_clears_role_lookup_during_run_and_restores_after(setup, fake_client, seen_roles) -> None:
+    before = dict(schema.ROLE_LOOKUP)
+    assert before  # the alias list is populated, so clearing it is observable
+    assert main(command(setup)) == 0
+    assert seen_roles == [{}]
+    assert dict(schema.ROLE_LOOKUP) == before
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["arguments"]["aliases"] == "off"
+
+
+def test_aliases_on_keeps_role_lookup(setup, fake_client, seen_roles) -> None:
+    before = dict(schema.ROLE_LOOKUP)
+    assert main(command(setup, "--aliases", "on")) == 0
+    assert seen_roles == [before]
+    assert dict(schema.ROLE_LOOKUP) == before
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["arguments"]["aliases"] == "on"
+
+
+def test_no_alias_is_accepted_as_deprecated_off(setup, fake_client, seen_roles) -> None:
     before = dict(schema.ROLE_LOOKUP)
     assert main(command(setup, "--no-alias")) == 0
+    assert seen_roles == [{}]
     assert dict(schema.ROLE_LOOKUP) == before
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["arguments"]["aliases"] == "off"
+
+
+def test_aliases_rejects_unknown_value(setup) -> None:
+    with pytest.raises(SystemExit):
+        run_v2.parse_args(command(setup, "--aliases", "maybe"))
 
 
 def test_submission_line_matches_submission_writer(tmp_path: Path) -> None:
@@ -392,3 +435,248 @@ def test_summary_projection_uses_overlap_of_builds_and_questions() -> None:
     assert "projected for 30 shops and 10 questions: 225 s" in text  # builds dominate: 60 s of questions + 165 s
     text = format_summary(rows, workers=2, project_shops=30, project_questions=3000, build_workers=2)
     assert "projected for 30 shops and 3000 questions: 18015 s" in text  # 18000 s of questions + 15 s first ready
+
+
+@pytest.fixture
+def scripted(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Replaces IntentParser and SemanticSolver: every question parses to an order-count intent and is a value."""
+    kwargs_seen: list[dict[str, Any]] = []
+    parse_calls: list[str] = []
+
+    class ScriptedParser:
+        def __init__(self, model: Any, **kwargs: Any) -> None:
+            kwargs_seen.append(kwargs)
+
+        def parse(self, question: str, choices: Any = None) -> ParsedIntent:
+            parse_calls.append(question)
+            return ParsedIntent(intent=Intent(measure="order_count"), reason="", attempts=2, raw=None)
+
+    class ScriptedSolver(SemanticSolver):
+        def solve(self, question):
+            parsed = self.parser.parse(question.question, choices=None)
+            trace = SolveTrace(question_id=question.id, intent=parsed.intent,
+                               windows=[TimeWindow(role="target", start=date(2026, 3, 1), end_exclusive=date(2026, 3, 10))],
+                               decision="value", reason="")
+            return Prediction(id=question.id, type=AnswerType.NUMBER, answer=2.0), trace
+
+    monkeypatch.setattr(run_v2, "IntentParser", ScriptedParser)
+    monkeypatch.setattr(run_v2, "SemanticSolver", ScriptedSolver)
+    return SimpleNamespace(kwargs_seen=kwargs_seen, parse_calls=parse_calls)
+
+
+def test_traces_hold_intent_windows_attempts_and_decision(setup, fake_client, scripted) -> None:
+    assert main(command(setup, "--traces")) == 0
+    traces = read_jsonl(setup["out"] / "traces.jsonl")
+    assert sorted(row["id"] for row in traces) == ["q1", "q2"]
+    row = {row["id"]: row for row in traces}["q2"]
+    assert set(row) == {"id", "business_id", "question", "decision", "reason", "intent", "windows", "attempts", "seconds"}
+    assert row["business_id"] == "shop_a"
+    assert row["question"] == "What is the revenue?"
+    assert row["decision"] == "value" and row["reason"] == ""
+    assert row["intent"]["measure"] == "order_count" and row["intent"]["shape"] == "scalar"  # dataclass as a dict
+    assert row["windows"] == [["target", "2026-03-01", "2026-03-10"]]
+    assert row["attempts"] == 2
+    assert isinstance(row["seconds"], float) and row["seconds"] >= 0
+
+
+def test_traces_are_absent_unless_requested(setup, fake_client, scripted) -> None:
+    assert main(command(setup)) == 0
+    assert not (setup["out"] / "traces.jsonl").exists()
+
+
+def test_traces_null_intent_when_parser_gives_none(setup, fake_client) -> None:
+    assert main(command(setup, "--traces")) == 0  # the fake client yields no intent, so every question abstains
+    traces = read_jsonl(setup["out"] / "traces.jsonl")
+    assert sorted(row["id"] for row in traces) == ["q1", "q2"]
+    assert all(row["intent"] is None and row["decision"] == "abstain" and row["attempts"] >= 1 for row in traces)
+
+
+def test_traces_resume_does_not_duplicate_and_redoes_only_unanswered(setup, fake_client, scripted) -> None:
+    assert main(command(setup, "--traces")) == 0
+    traces_path = setup["out"] / "traces.jsonl"
+    first = traces_path.read_text(encoding="utf-8")
+    assert len(scripted.parse_calls) == 2
+
+    assert main(command(setup, "--traces")) == 0  # everything is checkpointed: nothing solved, nothing added
+    assert traces_path.read_text(encoding="utf-8") == first
+    assert len(scripted.parse_calls) == 2
+
+    # Drop q2 from the checkpoint: the rerun answers q2 again and writes exactly one new trace for it.
+    submission = setup["out"] / "submission.jsonl"
+    submission.write_text("".join(line + "\n" for line in submission.read_text(encoding="utf-8").splitlines()
+                                  if '"q1"' in line), encoding="utf-8")
+    assert main(command(setup, "--traces")) == 0
+    traces = read_jsonl(traces_path)
+    assert sorted(row["id"] for row in traces) == ["q1", "q2"]
+    assert len(scripted.parse_calls) == 3
+    assert sorted(row["id"] for row in read_jsonl(setup["out"] / "submission.jsonl")) == ["q1", "q2"]
+
+
+def test_prompt_profile_reaches_intent_parser_and_manifest(setup, fake_client, scripted) -> None:
+    assert main(command(setup, "--prompt-profile", "qwen")) == 0
+    assert scripted.kwargs_seen and all(kwargs == {"profile": "qwen"} for kwargs in scripted.kwargs_seen)
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["prompt_profile"] == "qwen"
+    assert manifest["arguments"]["prompt_profile"] == "qwen"
+
+
+def test_default_prompt_profile_passes_no_keyword(setup, fake_client, scripted) -> None:
+    assert main(command(setup)) == 0
+    assert scripted.kwargs_seen and all(kwargs == {} for kwargs in scripted.kwargs_seen)
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["prompt_profile"] == "default"
+
+
+def test_default_profile_works_with_parser_that_has_no_profile_keyword(setup, fake_client, monkeypatch) -> None:
+    class OldParser:
+        def __init__(self, model: Any) -> None:
+            pass
+
+        def parse(self, question: str, choices: Any = None) -> ParsedIntent:
+            return ParsedIntent(intent=None, reason="scripted", attempts=1, raw=None)
+
+    monkeypatch.setattr(run_v2, "IntentParser", OldParser)
+    assert main(command(setup)) == 0
+
+
+def test_qwen_profile_fails_fast_when_parser_lacks_the_keyword(setup, fake_client, monkeypatch) -> None:
+    class OldParser:
+        def __init__(self, model: Any) -> None:
+            pass
+
+    monkeypatch.setattr(run_v2, "IntentParser", OldParser)
+    with pytest.raises(ValueError, match="--prompt-profile 'qwen' needs an IntentParser that accepts profile="):
+        main(command(setup, "--prompt-profile", "qwen"))
+    assert (setup["out"] / "submission.jsonl").read_text(encoding="utf-8") == ""  # failed before any question ran
+
+
+def test_questions_file_restricts_questions_and_shops(setup, fake_client) -> None:
+    root = setup["root"]
+    add_shop(root, "shop_b")
+    subset = setup["out"].parent / "subset.jsonl"
+    subset.write_text("".join(line + "\n" for line in (root / "questions.jsonl").read_text(encoding="utf-8").splitlines()
+                              if '"shop_b"' in line), encoding="utf-8")
+
+    assert main(command(setup, "--questions-file", str(subset))) == 0
+
+    final = read_jsonl(setup["out"] / "submission.final.jsonl")
+    assert [row["id"] for row in final] == ["shop_b-q1"]
+    assert (setup["out"] / "sem" / "shop_b.sqlite").is_file()
+    assert not (setup["out"] / "sem" / "shop_a.sqlite").exists()
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["questions_path"] == str(subset)
+
+
+@pytest.fixture
+def fewshot_bank(setup) -> Path:
+    """Shop_b examples are usable for shop_a questions; the shop_a row and the q1 variant must never be shown."""
+    rows = [
+        {"id": "shop_b-q9", "business_id": "shop_b", "question": "How many orders?",
+         "intent": {"measure": "order_count", "shape": "scalar", "filters": [], "group_by": None}},
+        {"id": "shop_a-q9", "business_id": "shop_a", "question": "How many orders?",
+         "intent": {"measure": "order_count", "shape": "scalar", "filters": [], "group_by": None}},
+        {"id": "q1__abbrev", "business_id": "shop_b", "question": "How many orders?",
+         "intent": {"measure": "order_count", "shape": "scalar", "filters": [], "group_by": None}},
+    ]
+    path = setup["out"].parent / "fewshot.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def recording(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """A fake parser that records its constructor keywords and every parse, and runs the examples provider."""
+    seen = SimpleNamespace(kwargs=[], calls=[], blocks={})
+
+    class RecordingParser:
+        def __init__(self, model: Any, **kwargs: Any) -> None:
+            seen.kwargs.append(kwargs)
+            self.examples = kwargs.get("examples")
+
+        def parse(self, question: str, choices: Any = None, *, question_id: Any = None,
+                  business_id: Any = None) -> ParsedIntent:
+            seen.calls.append((question, question_id, business_id))
+            if self.examples is not None:
+                seen.blocks[question_id] = self.examples(question, question_id, business_id)
+            return ParsedIntent(intent=Intent(measure="order_count"), reason="", attempts=1, raw=None)
+
+    class ScriptedSolver(SemanticSolver):
+        def solve(self, question):
+            parsed = self.parser.parse(question.question, choices=None)  # the solver passes no ids
+            trace = SolveTrace(question_id=question.id, intent=parsed.intent, windows=[], decision="value", reason="")
+            return Prediction(id=question.id, type=AnswerType.NUMBER, answer=2.0), trace
+
+    monkeypatch.setattr(run_v2, "IntentParser", RecordingParser)
+    monkeypatch.setattr(run_v2, "SemanticSolver", ScriptedSolver)
+    return seen
+
+
+def test_fewshot_flags_default_to_off_and_k_four(tmp_path: Path) -> None:
+    base = ["--data", str(tmp_path), "--out", str(tmp_path), "--connection", str(tmp_path / "c.json")]
+    args = run_v2.parse_args(base)
+    assert args.fewshot_bank is None and args.fewshot_k == 4
+    args = run_v2.parse_args(base + ["--fewshot-bank", str(tmp_path / "b.jsonl"), "--fewshot-k", "2"])
+    assert args.fewshot_bank == tmp_path / "b.jsonl" and args.fewshot_k == 2
+
+
+def test_without_a_bank_the_parser_gets_no_examples(setup, fake_client, recording) -> None:
+    assert main(command(setup)) == 0
+    assert recording.kwargs == [{}]  # the default profile without a bank is the old, keyword-free IntentParser(model)
+    assert recording.blocks == {}
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fewshot_bank"] is None and manifest["fewshot_k"] is None and manifest["fewshot_bank_sha256"] is None
+
+
+def test_fewshot_bank_reaches_the_parser_with_leakage_rules(setup, fake_client, recording, fewshot_bank) -> None:
+    assert main(command(setup, "--fewshot-bank", str(fewshot_bank), "--fewshot-k", "2")) == 0
+
+    assert len(recording.kwargs) == 1 and callable(recording.kwargs[0]["examples"])
+    # Each question reached the parser with its own id and shop, not only its text.
+    assert sorted(recording.calls) == [("How many orders?", "q1", "shop_a"), ("What is the revenue?", "q2", "shop_a")]
+    # For q1 only shop_b-q9 is usable: shop_a-q9 shares the shop and q1__abbrev shares q1's base id.
+    assert recording.blocks["q1"] == (
+        'Similar solved questions:\nQ: How many orders?\nA: {"measure": "order_count", "shape": "scalar"}'
+    )
+    manifest = json.loads((setup["out"] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fewshot_bank"] == str(fewshot_bank)
+    assert manifest["fewshot_k"] == 2
+    assert manifest["fewshot_bank_sha256"] == hashlib.sha256(fewshot_bank.read_bytes()).hexdigest()
+
+
+def test_fewshot_k_must_be_positive(setup, fake_client, recording, fewshot_bank) -> None:
+    with pytest.raises(ValueError, match="--fewshot-k must be at least 1"):
+        main(command(setup, "--fewshot-bank", str(fewshot_bank), "--fewshot-k", "0"))
+
+
+def test_empty_fewshot_bank_is_refused(setup, fake_client, recording, tmp_path) -> None:
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="has no examples"):
+        main(command(setup, "--fewshot-bank", str(empty)))
+
+
+def test_bound_parser_refuses_text_that_is_not_the_bound_question() -> None:
+    class Inner:
+        def parse(self, question: str, choices: Any = None, **kwargs: Any) -> ParsedIntent:
+            return ParsedIntent(intent=None, reason=str(kwargs), attempts=1, raw=None)
+
+    bound = run_v2._QuestionBoundParser(Inner())
+    with pytest.raises(RuntimeError, match="not the bound question"):
+        bound.parse("What is the revenue?")  # nothing bound yet
+    question = Question(id="q2", business_id="shop_a", question="What is the revenue?", as_of_date=date(2026, 3, 10))
+    bound.bind(question)
+    assert bound.parse("What is the revenue?").reason == "{'question_id': 'q2', 'business_id': 'shop_a'}"
+    with pytest.raises(RuntimeError):
+        bound.parse("some other text")
+    bound.bind(None)
+    with pytest.raises(RuntimeError):
+        bound.parse("What is the revenue?")
+
+
+def test_make_intent_parser_reasoning_on():
+    from bizreason.run_v2 import make_intent_parser
+    from bizreason.semantic.intent import REASONING_ADDENDUM
+
+    parser = make_intent_parser(object(), "default", None, reasoning=True)
+    assert parser.reasoning and parser.system.endswith(REASONING_ADDENDUM)
+    assert not make_intent_parser(object(), "default").reasoning

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -24,6 +25,8 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 520, 522, 524}
 TUNNEL_DOWN_STATUS_CODES = {502, 503, 504, 530}
 ENDPOINT_RESOLVE_MIN_INTERVAL = 15.0
 OUTAGE_POLL_SECONDS = 20.0
+# Replaced clients are kept open this many deep, since other threads may still be using them.
+RETIRED_CLIENT_LIMIT = 4
 
 __all__ = [
     "LanguageModel",
@@ -420,6 +423,9 @@ class TrammayClient:
         self._outage_wait_seconds = float(outage_wait_seconds)
         self._outage_poll_seconds = float(outage_poll_seconds)
         self._last_resolve_at = None
+        # Guards self._client, self.settings and self._last_resolve_at, which are shared by all threads.
+        self._lock = threading.RLock()
+        self._retired_clients: list[httpx.Client] = []
         self._client = self._create_client(transport=transport)
 
     def _create_client(self, transport: httpx.BaseTransport | None = None) -> httpx.Client:
@@ -431,15 +437,37 @@ class TrammayClient:
             follow_redirects=False,
         )
 
-    def _reset_client_if_transport_error(self, error: Exception) -> None:
-        if isinstance(error, httpx.TransportError):
-            current_transport = getattr(self._client, "_transport", None)
-            if not isinstance(current_transport, httpx.MockTransport):
-                try:
-                    self._client.close()
-                except Exception:
-                    pass
-                self._client = self._create_client()
+    def _retire_client(self, client: httpx.Client) -> None:
+        """Keep a replaced client open for a while; caller must hold self._lock."""
+        self._retired_clients.append(client)
+        while len(self._retired_clients) > RETIRED_CLIENT_LIMIT:
+            oldest = self._retired_clients.pop(0)
+            try:
+                oldest.close()
+            except Exception:
+                pass
+
+    def _reset_client_if_transport_error(
+        self, error: Exception, failed_client: httpx.Client | None = None
+    ) -> None:
+        """Replace the shared client after a connection-level failure.
+
+        Compare-and-swap: only a thread whose failed client is still the current one rebuilds.
+        Threads that failed on an already-replaced client just retry with the current client.
+        """
+        if not isinstance(error, (httpx.TransportError, OSError)):
+            return
+        with self._lock:
+            current = self._client
+            if failed_client is None:
+                failed_client = current
+            if failed_client is not current:
+                return
+            current_transport = getattr(current, "_transport", None)
+            if isinstance(current_transport, httpx.MockTransport):
+                return
+            self._retire_client(current)
+            self._client = self._create_client(transport=self._transport)
 
     def _retry_delay_seconds(
         self,
@@ -468,41 +496,47 @@ class TrammayClient:
         return min(self.settings.transport_backoff * (2 ** attempt), cap)
 
     def close(self) -> None:
-        self._client.close()
+        with self._lock:
+            clients = [self._client, *self._retired_clients]
+            self._retired_clients = []
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _switch_base_url(self, new_url: str) -> None:
         # Only the host is logged; the query string and headers never are.
         logger.info("Model endpoint changed; rebuilding client for host %s", urlsplit(new_url).hostname or "?")
-        self.settings = replace(self.settings, base_url=new_url)
-        old_client = self._client
-        self._client = self._create_client(transport=self._transport)
-        try:
-            old_client.close()
-        except Exception:
-            pass
+        with self._lock:
+            self.settings = replace(self.settings, base_url=new_url)
+            old_client = self._client
+            self._client = self._create_client(transport=self._transport)
+            self._retire_client(old_client)
 
     def _try_switch_endpoint(self) -> bool:
         """Ask the resolver for the current base URL; switch if it changed. Rate-limited."""
         if self._endpoint_resolver is None:
             return False
-        now = time.monotonic()
-        if self._last_resolve_at is not None and now - self._last_resolve_at < ENDPOINT_RESOLVE_MIN_INTERVAL:
-            return False
-        self._last_resolve_at = now
-        try:
-            candidate = self._endpoint_resolver()
-        except Exception:
-            return False
-        if not isinstance(candidate, str):
-            return False
-        candidate = candidate.strip().rstrip("/")
-        parts = urlsplit(candidate)
-        if parts.scheme not in ("http", "https") or not parts.netloc:
-            return False
-        if candidate == self.settings.base_url.strip().rstrip("/"):
-            return False
-        self._switch_base_url(candidate)
-        return True
+        with self._lock:
+            now = time.monotonic()
+            if self._last_resolve_at is not None and now - self._last_resolve_at < ENDPOINT_RESOLVE_MIN_INTERVAL:
+                return False
+            self._last_resolve_at = now
+            try:
+                candidate = self._endpoint_resolver()
+            except Exception:
+                return False
+            if not isinstance(candidate, str):
+                return False
+            candidate = candidate.strip().rstrip("/")
+            parts = urlsplit(candidate)
+            if parts.scheme not in ("http", "https") or not parts.netloc:
+                return False
+            if candidate == self.settings.base_url.strip().rstrip("/"):
+                return False
+            self._switch_base_url(candidate)
+            return True
 
     def _request(self, method: str, path: str, *, count_call: bool = False, **kwargs: Any) -> dict[str, Any]:
         max_attempts = (
@@ -544,53 +578,64 @@ class TrammayClient:
             last_status_code: int | None = None
             transport_failure = False
 
+            with self._lock:
+                client = self._client
             try:
-                response = self._client.request(
-                    method, path, timeout=attempt_timeout, **kwargs
-                )
-                last_response = response
-                last_status_code = response.status_code
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise ProviderError("Provider returned a non-object response")
-
-                err_info = _extract_payload_provider_error(payload)
-                if err_info is not None:
-                    err_code, _ = err_info
-                    if err_code in RETRYABLE_STATUS_CODES:
-                        last_error = ProviderError(f"Provider error {err_code or 'unknown'}")
-                        last_status_code = err_code
-                    else:
-                        if count_call and not call_counted:
-                            self.usage.calls += 1
-                            call_counted = True
-                        raise ProviderError(f"Provider error {err_code or 'unknown'}")
-                else:
-                    if count_call and not call_counted:
-                        self.usage.calls += 1
-                        call_counted = True
-                    return payload
-            except httpx.HTTPStatusError as error:
-                status_code = error.response.status_code
-                last_response = error.response
-                last_status_code = status_code
-                tunnel_down = (
-                    self._endpoint_resolver is not None and status_code in TUNNEL_DOWN_STATUS_CODES
-                )
-                if status_code not in RETRYABLE_STATUS_CODES and not tunnel_down:
-                    if count_call and not call_counted:
-                        self.usage.calls += 1
-                        call_counted = True
-                    raise ProviderError(f"Provider HTTP {status_code}") from None
-                last_error = ProviderError(f"Provider HTTP {status_code}")
-                transport_failure = tunnel_down
-            except (httpx.HTTPError, ValueError) as error:
-                self._reset_client_if_transport_error(error)
+                response = client.request(method, path, timeout=attempt_timeout, **kwargs)
+            except (httpx.HTTPError, OSError, ValueError, RuntimeError) as error:
+                # Only the httpx call is wrapped. RuntimeError("client has been closed") comes from
+                # httpx for a retired client; OSError covers ssl.SSLError. ModelError is a RuntimeError,
+                # so catching it here would swallow errors raised later in the attempt.
+                self._reset_client_if_transport_error(error, client)
                 last_response = None
                 last_status_code = None
                 last_error = ProviderError(f"Provider request failed ({type(error).__name__})")
                 transport_failure = True
+            else:
+                try:
+                    last_response = response
+                    last_status_code = response.status_code
+                    response.raise_for_status()
+                    payload = response.json()
+                    if not isinstance(payload, dict):
+                        raise ProviderError("Provider returned a non-object response")
+
+                    err_info = _extract_payload_provider_error(payload)
+                    if err_info is not None:
+                        err_code, _ = err_info
+                        if err_code in RETRYABLE_STATUS_CODES:
+                            last_error = ProviderError(f"Provider error {err_code or 'unknown'}")
+                            last_status_code = err_code
+                        else:
+                            if count_call and not call_counted:
+                                self.usage.calls += 1
+                                call_counted = True
+                            raise ProviderError(f"Provider error {err_code or 'unknown'}")
+                    else:
+                        if count_call and not call_counted:
+                            self.usage.calls += 1
+                            call_counted = True
+                        return payload
+                except httpx.HTTPStatusError as error:
+                    status_code = error.response.status_code
+                    last_response = error.response
+                    last_status_code = status_code
+                    tunnel_down = (
+                        self._endpoint_resolver is not None and status_code in TUNNEL_DOWN_STATUS_CODES
+                    )
+                    if status_code not in RETRYABLE_STATUS_CODES and not tunnel_down:
+                        if count_call and not call_counted:
+                            self.usage.calls += 1
+                            call_counted = True
+                        raise ProviderError(f"Provider HTTP {status_code}") from None
+                    last_error = ProviderError(f"Provider HTTP {status_code}")
+                    transport_failure = tunnel_down
+                except (httpx.HTTPError, ValueError) as error:
+                    self._reset_client_if_transport_error(error, client)
+                    last_response = None
+                    last_status_code = None
+                    last_error = ProviderError(f"Provider request failed ({type(error).__name__})")
+                    transport_failure = True
 
             switched = False
             if transport_failure and self._endpoint_resolver is not None:

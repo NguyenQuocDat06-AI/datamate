@@ -9,20 +9,28 @@ import unicodedata
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from bizreason.contracts import BusinessContext, TableMeta
 from bizreason.data.notes_facets import classify_note_status
 from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
+from bizreason.semantic import rulebook_params
 from bizreason.semantic.vocabulary import (
     ADDRESS_HEADER_TOKENS,
     CANCEL_TOKENS,
     CURRENCY_SUFFIXES,
     INGESTION_ROLES,
-    SERVICE_FEE_NAMES,
-    WALK_IN_NAMES,
 )
 from bizreason.utils import normalize_lookup, quote_identifier as q
+
+class ModelFailure(NamedTuple):
+    """A model call that failed and was replaced by a fallback. `table_name` and `kind` are None for a shop-wide
+    stage (line_kinds, status, value_groups:<role>) and for a table whose kind is not known."""
+
+    stage: str
+    table_name: str | None = None
+    kind: str | None = None
+
 
 LINE_FIELDS = {
     "order_id": "order_id", "date": "ordered_at", "ts": "ordered_at", "status": "order_status",
@@ -52,6 +60,13 @@ DELIVERY_NUMBERS = {"qty": "delivery_qty"}
 CATALOG_ID_ROLE = {"product_catalog": "product_id", "customer_catalog": "customer_id"}  # catalog kind -> id role
 CATALOG_NAME_ROLE = {"product_id": "product_name", "customer_id": "customer_name", "supplier_id": "supplier_name"}
 PRODUCT_ATTR_KINDS = ("product_catalog", "alias")  # tables that describe products beyond name and category
+# Catalog kinds read across every sheet that shares their columns: a catalog exported in parts (one sheet per month)
+# is one catalog. A role is chosen from the values of all its sheets, and a sheet whose columns differ slightly
+# takes the annotation of its sibling.
+CATALOG_KINDS = ("customer_catalog", "product_catalog", "employee_catalog")
+# The sibling rule of annotator.SIBLING_MIN_SHARE. annotator imports this module, so the value is repeated here;
+# tests check that the two agree.
+CATALOG_SIBLING_MIN_SHARE = 0.8
 RECEIPT_FILL = ("date", "status", "supplier_id", "supplier_name")  # purchase columns a line can take from its receipt
 CANONICAL_STATUS = ("completed", "shipping", "cancelled", "returned")
 LINE_KINDS = ("sales", "service_ticket")  # kinds whose rows become raw_lines
@@ -165,11 +180,59 @@ def annotations_by_signature(records: list[dict[str, Any]]) -> dict[tuple[str, .
     return {tuple(r["columns"]): r for r in records if "kind" in r}
 
 
-def effective_roles(table: TableMeta, note: dict[str, Any], dst: sqlite3.Connection | None = None) -> dict[str, str]:
+def _catalog_sibling_fit(names: list[str], other: list[str]) -> tuple[float, bool] | None:
+    """The sibling rule of annotator._sibling_fit: (score, positional) when the normalized column names overlap by
+    CATALOG_SIBLING_MIN_SHARE (Jaccard), or the counts are equal and that share sits at the same positions; else None."""
+    mine = [normalize_lookup(name) for name in names]
+    theirs = [normalize_lookup(name) for name in other]
+    union = set(mine) | set(theirs)
+    jaccard = len(set(mine) & set(theirs)) / len(union) if union else 0.0
+    same_count = bool(mine) and len(mine) == len(theirs)
+    positional = sum(a == b for a, b in zip(mine, theirs)) / len(mine) if same_count else 0.0
+    if jaccard >= CATALOG_SIBLING_MIN_SHARE:
+        return jaccard, positional >= CATALOG_SIBLING_MIN_SHARE
+    if same_count and positional >= CATALOG_SIBLING_MIN_SHARE:
+        return positional, True
+    return None
+
+
+def _catalog_sibling(table: TableMeta,
+                     notes: dict[tuple[str, ...], dict[str, Any]]) -> tuple[tuple[str, ...], dict[str, Any]] | None:
+    """The annotation of the best-fitting catalog sibling for a table that has none of its own: (sibling key, note
+    with the roles of this table). Roles map by normalized column name; when the counts match and the sheets line up,
+    a column whose name differs takes the role at its position. None when no usable catalog annotation fits."""
+    names = [column.name for column in table.columns]
+    best: tuple[float, bool, tuple[str, ...], dict[str, Any]] | None = None
+    for key, note in notes.items():
+        if note.get("kind") not in CATALOG_KINDS or "error" in note or note.get("partial") or note.get("kind_failed"):
+            continue
+        fit = _catalog_sibling_fit(names, list(key))
+        if fit is not None and (best is None or fit[0] > best[0]):
+            best = (fit[0], fit[1], key, note)
+    if best is None:
+        return None
+    _, positional, key, sibling = best
+    sibling_roles = sibling.get("roles") or {}
+    by_name: dict[str, str] = {}
+    for name in key:
+        by_name.setdefault(normalize_lookup(name), sibling_roles.get(name, "other"))
+    by_position = [sibling_roles.get(name, "other") for name in key]
+    roles: dict[str, str] = {}
+    for index, name in enumerate(names):
+        role = by_name.get(normalize_lookup(name))
+        if role is None and positional:
+            role = by_position[index]
+        roles[name] = role or "other"
+    return key, {"kind": sibling["kind"], "columns": names, "roles": roles}
+
+
+def effective_roles(table: TableMeta, note: dict[str, Any], dst: sqlite3.Connection | None = None,
+                    pool: list[TableMeta] | None = None) -> dict[str, str]:
     """Role to column. The model's reading wins; ingestion evidence fills anything it left open.
 
-    When the model gives one role to several columns, the source data (read through dst) picks one.
-    Without dst the first such column wins.
+    When the model gives one role to several columns, the source data (read through dst) picks one. pool lists the
+    tables that share this annotation (a catalog in parts): the evidence is read from all of them, so that every
+    sheet of the catalog picks the same column. Without dst the first such column wins.
     """
     given, _ = _given_by_column(table, note.get("roles") or {})
     candidates: dict[str, list[str]] = {}
@@ -181,7 +244,7 @@ def effective_roles(table: TableMeta, note: dict[str, Any], dst: sqlite3.Connect
         mapped = INGESTION_ROLES.get(column.semantic_role or "")
         if mapped:
             fallback.setdefault(mapped, column.name)
-    chosen = {role: _choose_column(dst, table, role, columns) for role, columns in candidates.items()}
+    chosen = {role: _choose_column(dst, table, role, columns, pool) for role, columns in candidates.items()}
     for role in ("order_status", "qty_base"):
         if role in fallback:  # parsed and normalized at ingestion; stronger than a column-name reading
             chosen[role] = fallback[role]
@@ -268,25 +331,26 @@ def _edit_distance(first: str, second: str) -> int:
     return previous[-1]
 
 
-def _choose_column(dst: sqlite3.Connection | None, table: TableMeta, role: str, columns: list[str]) -> str:
+def _choose_column(dst: sqlite3.Connection | None, table: TableMeta, role: str, columns: list[str],
+                   pool: list[TableMeta] | None = None) -> str:
     """The column that best carries a role when several do. No evidence, or a tie, keeps the first column."""
     if dst is None or len(columns) < 2:
         return columns[0]
     if role in ("product_id", "customer_id"):
         # the id that joins the matching catalog's ids wins; a barcode-like id that joins nothing loses
         catalog = {row[0] for row in dst.execute("SELECT id FROM temp.catalog_ids WHERE role=?", (role,))}
-        score = {c: _share_in(_distinct_texts(dst, table, c), catalog) for c in columns} if catalog else {}
+        score = {c: _share_in(_distinct_texts(dst, table, c, pool), catalog) for c in columns} if catalog else {}
         if not score or _no_clear_winner(score):
             # no catalog evidence: the id with the most filled, distinct values wins (a mostly blank barcode loses)
-            score = {c: float(len(_distinct_texts(dst, table, c))) for c in columns}
+            score = {c: float(len(_distinct_texts(dst, table, c, pool))) for c in columns}
     elif role in ("ordered_at", "order_time"):
         # a column carrying a clock time other than midnight beats a date-only column
-        score = {c: float(sum(_has_clock(v) for v in _distinct_texts(dst, table, c))) for c in columns}
+        score = {c: float(sum(_has_clock(v) for v in _distinct_texts(dst, table, c, pool))) for c in columns}
     elif role in ("customer_group", "product_category"):
         # the column that varies wins; a constant column never does
         score = {}
         for c in columns:
-            distinct = len(_distinct_texts(dst, table, c))
+            distinct = len(_distinct_texts(dst, table, c, pool))
             score[c] = float(distinct) if distinct >= 2 else 0.0
     else:
         return columns[0]
@@ -300,10 +364,36 @@ def _no_clear_winner(score: dict[str, float]) -> bool:
     return best == 0 or sum(value == best for value in score.values()) > 1
 
 
-def _distinct_texts(dst: sqlite3.Connection, table: TableMeta, column: str) -> list[str]:
-    """Distinct non-blank values of a source column, as trimmed text. Read only."""
-    rows = dst.execute(f"SELECT DISTINCT {_text(column)} FROM source.{q(table.name)} AS src")
-    return [row[0] for row in rows if row[0] is not None]
+def _distinct_texts(dst: sqlite3.Connection, table: TableMeta, column: str,
+                    pool: list[TableMeta] | None = None) -> list[str]:
+    """Distinct non-blank values of a source column, as trimmed text. Read only.
+
+    With a pool, the values are those of every pool table (the table itself included) that has a column of the same
+    normalized name.
+    """
+    members = list(pool or [])
+    if not any(member.name == table.name for member in members):
+        members.insert(0, table)
+    texts: list[str] = []
+    seen: set[str] = set()
+    for member in members:
+        source_column = _column_like(member, column)
+        if source_column is None:
+            continue
+        for (value,) in dst.execute(f"SELECT DISTINCT {_text(source_column)} FROM source.{q(member.name)} AS src"):
+            if value is not None and value not in seen:
+                seen.add(value)
+                texts.append(value)
+    return texts
+
+
+def _column_like(table: TableMeta, column: str) -> str | None:
+    """The column of a table with this name, or else the one whose normalized name is the same; None when absent."""
+    names = [c.name for c in table.columns]
+    if column in names:
+        return column
+    wanted = normalize_lookup(column)
+    return next((name for name in names if normalize_lookup(name) == wanted), None)
 
 
 def _share_in(values: list[str], reference: set[str]) -> float:
@@ -978,12 +1068,12 @@ def _register(con: sqlite3.Connection) -> None:
 def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
           status_map: dict[str, str] | None = None, line_kinds: dict[str, str] | None = None,
           value_groups: dict[str, dict[str, str]] | None = None,
-          model_failures: list[str] | None = None) -> dict[str, Any]:
+          model_failures: list[ModelFailure | str] | None = None) -> dict[str, Any]:
     """line_kinds maps a product name (normalized by normalize_lookup) to a LINE_ITEM_KINDS value.
 
     value_groups maps a role (a key of VALUE_GROUP_FIELDS) to {raw value: canonical value}.
-    model_failures lists the model stages that failed and were replaced by fallbacks; the solver abstains
-    on a database that records any.
+    model_failures lists the model calls that failed and were replaced by fallbacks (a bare stage name counts as
+    shop-wide); the solver judges each by its table and kind.
     """
     pairs: list[tuple[str, str]] = []
     for name, kind in (line_kinds or {}).items():
@@ -1018,29 +1108,46 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.execute("CREATE TEMP TABLE alias_map (alias_key TEXT PRIMARY KEY, full_name TEXT)")
     dst.execute("CREATE TEMP TABLE employee_names (full_name TEXT)")
     dst.execute("CREATE TABLE build_stats (key TEXT, value INTEGER)")
-    dst.execute("CREATE TABLE model_failures (stage TEXT)")
-    dst.executemany("INSERT INTO model_failures VALUES (?)", [(stage,) for stage in model_failures or []])
+    dst.execute("CREATE TABLE model_failures (stage TEXT, table_name TEXT, kind TEXT)")
+    dst.executemany("INSERT INTO model_failures VALUES (?,?,?)", [_failure_row(item) for item in model_failures or []])
     stats: Counter[str] = Counter({key: 0 for key in BUILD_STAT_KEYS})
     report: dict[str, Any] = {
         "sales_tables": 0, "service_tables": 0, "purchase_tables": 0, "return_tables": 0, "unannotated": [],
         "duplicate_lines_removed": 0, "columns_with_locale_inferred": 0, "tickets_defaulted_completed": 0,
         "qty_base_derived": 0,
     }
+    # A table takes the annotation of its columns, else that of a catalog sibling; the catalog sheets that share one
+    # annotation form a pool, and their roles are chosen from the pooled values (see effective_roles).
     annotated: list[tuple[TableMeta, dict[str, Any]]] = []
+    annotation_key: dict[str, tuple[str, ...]] = {}
     for table in context.tables:
-        note = notes.get(tuple(c.name for c in table.columns))
+        key = tuple(c.name for c in table.columns)
+        note = notes.get(key)
         if note is None:
-            report["unannotated"].append(table.name)
-        else:
-            annotated.append((table, note))
+            sibling = _catalog_sibling(table, notes)
+            if sibling is None:
+                report["unannotated"].append(table.name)
+                continue
+            key, note = sibling
+        annotated.append((table, note))
+        annotation_key[table.name] = key
+    pools: dict[tuple[str, ...], list[TableMeta]] = {}
+    for table, note in annotated:
+        if note["kind"] in CATALOG_KINDS:
+            pools.setdefault(annotation_key[table.name], []).append(table)
+
+    def pool_of(table: TableMeta, note: dict[str, Any]) -> list[TableMeta] | None:
+        return pools.get(annotation_key[table.name]) if note["kind"] in CATALOG_KINDS else None
+
     # catalog ids and names are read first, so that a duplicated id column can be judged by how it joins them.
     # Every table's roles are chosen before any id is loaded, so the first pass cannot judge a column by its own ids.
-    first_pass = [(table, note["kind"], effective_roles(table, note, dst)) for table, note in annotated]
+    first_pass = [(table, note["kind"], effective_roles(table, note, dst, pool_of(table, note)))
+                  for table, note in annotated]
     for table, kind, roles in first_pass:
         _load_catalog_keys(dst, table, kind, roles)
     for table, note in annotated:
         unresolved = _given_by_column(table, note.get("roles") or {})[1]
-        roles = effective_roles(table, note, dst)
+        roles = effective_roles(table, note, dst, pool_of(table, note))
         # Only a role that stayed missing after every fallback can break the table.
         stats["annotation_keys_unresolved"] += sum(role in COUNTED_ROLES and not roles.get(role) for role in unresolved)
         if not roles.get("employee_id") and roles.get("employee_name"):
@@ -1127,6 +1234,12 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     return report
 
 
+def _failure_row(item: ModelFailure | str) -> tuple[str, str | None, str | None]:
+    if isinstance(item, str):
+        return (item, None, None)
+    return (item.stage, item.table_name, item.kind)
+
+
 def _mark_returned(dst: sqlite3.Connection) -> int:
     """Orders listed by a returns table are returned whole; cancelled orders stay cancelled.
 
@@ -1172,7 +1285,8 @@ def _derive(dst: sqlite3.Connection) -> None:
 
 
 def _derive_orders(dst: sqlite3.Connection) -> None:
-    walk_in = ",".join(f"'{name}'" for name in WALK_IN_NAMES)
+    # Read when the tables are built: rulebook_params.set_active must run before build.
+    walk_in = ",".join(_sql_text(name) for name in rulebook_params.active().walk_in_names)
     not_revenue = ",".join(_sql_text(kind) for kind in NOT_REVENUE_LINE_KINDS)
     dst.executescript(
         f"""
@@ -1215,12 +1329,17 @@ def _fill_customer_names(dst: sqlite3.Connection) -> None:
 
 def _fill_customer_groups(dst: sqlite3.Connection) -> None:
     """An order with no group takes its customer's group from a customer catalog: by id when the order
-    has an id, by normalized name when it has none (two codes sharing a name are two customers)."""
+    has an id, by normalized name when it has none (two codes sharing a name are two customers).
+
+    The catalog rows of every sheet are one list. A key that the catalog gives two different groups (the same id or
+    name in two sheets, say) takes no group: it is never resolved by picking one of them."""
     dst.execute(
         "UPDATE orders SET customer_group = COALESCE("
-        "(SELECT MIN(m.customer_group) FROM temp.customer_groups m "
+        "(SELECT CASE WHEN COUNT(DISTINCT m.customer_group)=1 THEN MIN(m.customer_group) END "
+        " FROM temp.customer_groups m "
         " WHERE orders.customer_id IS NOT NULL AND m.customer_id = orders.customer_id), "
-        "(SELECT MIN(m.customer_group) FROM temp.customer_groups m "
+        "(SELECT CASE WHEN COUNT(DISTINCT m.customer_group)=1 THEN MIN(m.customer_group) END "
+        " FROM temp.customer_groups m "
         " WHERE orders.customer_id IS NULL AND m.name_key = NULLIF(lookup(orders.customer_name), ''))) "
         "WHERE customer_group IS NULL"
     )
@@ -1239,7 +1358,7 @@ def _product_fact(column: str, source: str = "temp.product_facts") -> str:
 def _derive_lines(dst: sqlite3.Connection) -> None:
     not_revenue = ",".join(_sql_text(kind) for kind in NOT_REVENUE_LINE_KINDS)
     status = "','".join(CANONICAL_STATUS)
-    service_fees = ",".join(_sql_text(normalize_lookup(name)) for name in SERVICE_FEE_NAMES)
+    service_fees = ",".join(_sql_text(name) for name in rulebook_params.active().service_fee_names)
     dst.executescript(
         f"""
         CREATE TABLE lines AS

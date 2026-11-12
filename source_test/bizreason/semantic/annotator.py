@@ -8,6 +8,7 @@ model call. Nothing here is specific to a particular dataset.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -22,12 +23,14 @@ from typing import Any
 
 from bizreason.contracts import BusinessContext, ColumnMeta, TableMeta
 from bizreason.llm import LanguageModel
-from bizreason.semantic.layer import CANONICAL_STATUS, LINE_KINDS, annotations_by_signature, effective_roles, _load_catalog_keys
+from bizreason.semantic.layer import (
+    CANONICAL_STATUS, LINE_KINDS, ModelFailure, annotations_by_signature, effective_roles, _load_catalog_keys,
+)
 from bizreason.semantic.vocabulary import PAYMENT_CANONICAL
 from bizreason.utils import normalize_lookup, quote_identifier as q
 
 KINDS = {
-    "sales": "orders or order lines of goods sold to customers",
+    "sales": "transactions in which the shop sells goods or services to customers — invoices, orders, bookings, tickets, treatments, service orders — one row per transaction or per line",
     "payment": "one row per money receipt paid by a customer for an order",
     "purchase": "goods bought from suppliers (import receipts and their lines)",
     "inventory": "stock on hand or stock movements",
@@ -40,7 +43,7 @@ KINDS = {
     "expense": "operating expense ledger",
     "shift_report": "cash report per work shift",
     "sales_return": "returned goods or refunds",
-    "service_ticket": "repair or service visits, one row per visit",
+    "service_ticket": "repair, maintenance or service jobs done for a customer (visits, service tickets, work orders), one row per visit or job",
     "delivery": "delivery trips of orders",
     "debt_ledger": "credit sale or debt notes, installment plans",
     "warranty": "warranty claims",
@@ -156,11 +159,22 @@ GRAIN_KIND = {
 }
 # A sales table needs at least one of these roles, unless its grain is a sales grain.
 SALES_EVIDENCE_ROLES = ("order_id", "ordered_at", "qty", "line_amount", "order_goods_total", "order_total_due")
+# An "other" table is promoted to sales when its roles hold an order id, a date and one of these money roles.
+PROMOTION_MONEY_ROLES = ("line_amount", "order_goods_total", "order_total_due")
+logger = logging.getLogger(__name__)
 # A failed table takes the kind and roles of a sibling table of its shop whose column names are this alike: the
 # Jaccard similarity of the normalized name sets, or, for equal column counts, the share of equal names by position.
 SIBLING_MIN_SHARE = 0.8
 # The retried kind call lists at most this many headers, with no documentation and no sample values.
 KIND_SHORT_COLUMNS = 40
+# A role call is tried this many times, with the same prompt, before its batch counts as failed.
+ROLE_CALL_ATTEMPTS = 3
+
+
+def _has_order_roles(roles: Any) -> bool:
+    """True when the roles hold an order id, a date of the order and a money amount of the order."""
+    found = set(roles)
+    return "order_id" in found and "ordered_at" in found and any(role in found for role in PROMOTION_MONEY_ROLES)
 
 
 def group_tables(context: BusinessContext) -> list[list[TableMeta]]:
@@ -405,14 +419,14 @@ class Annotator:
         self.model = model
         self.timeout = timeout
         self.workers = workers
-        # Stage names of model calls that failed and were replaced by a fallback; see take_failures().
-        self.failures: list[str] = []
+        # Model calls that failed and were replaced by a fallback; see take_failures().
+        self.failures: list[ModelFailure] = []
         self._failures_lock = threading.Lock()
         self._failure_seq = 0
 
-    def _record_failure(self, stage: str) -> None:
+    def _record_failure(self, stage: str, table: str | None = None, kind: str | None = None) -> None:
         with self._failures_lock:
-            self.failures.append(stage)
+            self.failures.append(ModelFailure(stage, table, kind))
             self._failure_seq += 1
 
     def failure_count(self) -> int:
@@ -420,8 +434,9 @@ class Annotator:
         with self._failures_lock:
             return self._failure_seq
 
-    def take_failures(self) -> list[str]:
-        """Return the stage names of model failures recorded since the last call, and clear them."""
+    def take_failures(self) -> list[ModelFailure]:
+        """Return the model failures recorded since the last call, and clear them. Each carries its stage, the
+        table it belongs to (None for a shop-wide stage) and that table's kind (None when unknown)."""
         with self._failures_lock:
             taken = list(self.failures)
             self.failures.clear()
@@ -456,14 +471,14 @@ class Annotator:
                 records[index] = _sibling_record(context, group, records[best[2]], best[1])
                 stages[index] = []
         for found in stages:
-            for stage in found:
-                self._record_failure(stage)
+            for failure in found:
+                self._record_failure(failure.stage, failure.table_name, failure.kind)
         return records
 
-    def _annotate_retrying(self, context: BusinessContext, group: list[TableMeta]) -> tuple[dict[str, Any], list[str]]:
+    def _annotate_retrying(self, context: BusinessContext, group: list[TableMeta]) -> tuple[dict[str, Any], list[ModelFailure]]:
         """One retry for a failed group, so a transient model error does not skip its tables.
 
-        Returns the record and the failure stages of the attempt that produced it.
+        Returns the record and the failures of the attempt that produced it.
         """
         record, found = self._annotate_group(context, group)
         if "error" in record:
@@ -675,25 +690,36 @@ class Annotator:
             for column, role in reply.items()
         }
 
+    def _ask_roles_retrying(self, doc: str, columns: list[ColumnMeta], roles: dict[str, str]) -> dict[str, str]:
+        """_ask_roles, tried up to ROLE_CALL_ATTEMPTS times with the same prompt. Raises the last error."""
+        last_error: Exception | None = None
+        for _ in range(ROLE_CALL_ATTEMPTS):
+            try:
+                return self._ask_roles(doc, columns, roles)
+            except Exception as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
     def _assign_roles(self, doc: str, table: TableMeta, roles: dict[str, str]) -> tuple[dict[str, str], int]:
         """Roles for every column of the table, asked in batches when needed.
 
-        Returns (roles, failed_batches); a batch that failed leaves its columns out. Raises the last model error
-        when every call failed.
+        Each call is retried before it counts as failed. Returns (roles, failed_batches); a batch that failed
+        leaves its columns out. Raises the last model error when every call failed.
         """
         columns = list(table.columns)
         if len(columns) <= ROLE_SINGLE_CALL_MAX:
             try:
-                return self._ask_roles(doc, columns, roles), 0
+                return self._ask_roles_retrying(doc, columns, roles), 0
             except Exception:
-                pass  # retried below as batches; only a batch that still fails is a failure
+                pass  # asked again below as batches; only a batch that still fails is a failure
         batches = [columns[i:i + ROLE_BATCH_SIZE] for i in range(0, len(columns), ROLE_BATCH_SIZE)] or [[]]
         merged: dict[str, str] = {}
         failed = 0
         last_error: Exception | None = None
         for batch in batches:
             try:
-                merged.update(self._ask_roles(doc, batch, roles))
+                merged.update(self._ask_roles_retrying(doc, batch, roles))
             except Exception as exc:
                 failed += 1
                 last_error = exc
@@ -720,8 +746,8 @@ class Annotator:
         return reply.get("kind")
 
     def _annotate_group(self, context: BusinessContext, group: list[TableMeta],
-                        kind_fallback: bool = False) -> tuple[dict[str, Any], list[str]]:
-        """One attempt at a group. Returns the record and the failure stages of this attempt; the caller records
+                        kind_fallback: bool = False) -> tuple[dict[str, Any], list[ModelFailure]]:
+        """One attempt at a group. Returns the record and the failures of this attempt; the caller records
         them only for the attempt it keeps."""
         table = group[0]
         doc = relevant_readme(context.readme, table)
@@ -730,7 +756,9 @@ class Annotator:
             "table": table.name,
             "columns": [column.name for column in table.columns],
         }
-        found: list[str] = []
+        found: list[ModelFailure] = []
+        # The kind this table was annotated as, once known: a failure recorded with it is judged by that kind.
+        asked_kind: str | None = None
         started = time.time()
         try:
             kind_source = "model"
@@ -739,7 +767,7 @@ class Annotator:
             except Exception:
                 if not kind_fallback:
                     raise
-                found.append(f"kind:{table.name}")
+                found.append(ModelFailure(f"kind:{table.name}", table.name, None))
                 record["kind_failed"] = True
                 kind = None
             if not isinstance(kind, str) or kind not in KINDS:
@@ -747,13 +775,22 @@ class Annotator:
             if kind == "other" and table.grain in GRAIN_KIND:
                 kind = GRAIN_KIND[table.grain]
                 kind_source = "grain"
-            roles, failed_batches = self._assign_roles(doc, table, SCOPE[kind])
-            found.extend(f"roles:{table.name}" for _ in range(failed_batches))
+            asked_kind = kind
+            # An "other" table is asked the sales roles too, so that promotion can see an amount and a date.
+            roles, failed_batches = self._assign_roles(doc, table, SCOPE["sales" if kind == "other" else kind])
+            found.extend(ModelFailure(f"roles:{table.name}", table.name, asked_kind) for _ in range(failed_batches))
+            # Only a kind the model answered can be promoted; a failed kind call stays "other" as before.
+            if kind == "other" and not record.get("kind_failed") and _has_order_roles(roles.values()):
+                kind = "sales"
+                kind_source = "roles"
+                logger.info("table %s promoted from other to sales: roles hold order id, date and amount", table.name)
             if kind == "sales" and GRAIN_KIND.get(table.grain) != "sales" and not any(
                 role in SALES_EVIDENCE_ROLES for role in roles.values()
             ):
-                # Not a sales table: keep only the roles that the "other" scope also defines.
                 kind = "other"
+                logger.info("table %s demoted from sales to other: no sales evidence role", table.name)
+            if kind == "other":
+                # Not a sales table: keep only the roles that the "other" scope also defines.
                 roles = {column: (role if role in SCOPE["other"] else "other") for column, role in roles.items()}
             record["kind"] = kind
             record["kind_source"] = kind_source
@@ -761,7 +798,7 @@ class Annotator:
             if failed_batches:
                 record["partial"] = True
         except Exception as exc:
-            found.append(f"annotation:{table.name}")
+            found.append(ModelFailure(f"annotation:{table.name}", table.name, asked_kind))
             record["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         record["seconds"] = round(time.time() - started, 1)
         return record, found

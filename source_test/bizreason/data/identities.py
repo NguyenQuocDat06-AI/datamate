@@ -8,14 +8,15 @@ import unicodedata
 from collections import Counter, defaultdict
 
 from bizreason.contracts import TableMeta
+from bizreason.data.vocabulary import PHONE_LABEL_RE, RETAIL_CUSTOMER_NAMES
 from bizreason.utils import normalize_lookup, quote_identifier
 
 RETAIL_ALIASES = {"kl", "le", "khach le", "khachle", "khach vang lai", "vang lai"}
 PHONE_PATTERN = re.compile(
-    r"""(?:
-        \s* \(\s* (?:(?:sdt|sđt|tel|phone)\s*[:.]?\s*)? (?P<p1> (?:\+?84\s*|0) [235789] [\d\.\-\s]* \d ) \s*\)
-      | \s* [-–—:] \s* (?:(?:sdt|sđt|tel|phone)\s*[:.]?\s*)? (?P<p2> (?:\+?84\s*|0) [235789] [\d\.\-\s]* \d )
-      | \s+ (?:(?:sdt|sđt|tel|phone)\s*[:.]?\s*)? (?P<p3> (?:\+?84\s*|0) [235789] [\d\.\-\s]* \d )
+    rf"""(?:
+        \s* \(\s* (?:{PHONE_LABEL_RE}\s*[:.]?\s*)? (?P<p1> (?:\+?84\s*|0) [235789] [\d\.\-\s]* \d ) \s*\)
+      | \s* [-–—:] \s* (?:{PHONE_LABEL_RE}\s*[:.]?\s*)? (?P<p2> (?:\+?84\s*|0) [235789] [\d\.\-\s]* \d )
+      | \s+ (?:{PHONE_LABEL_RE}\s*[:.]?\s*)? (?P<p3> (?:\+?84\s*|0) [235789] [\d\.\-\s]* \d )
     )\s*$""",
     re.VERBOSE | re.IGNORECASE,
 )
@@ -61,7 +62,7 @@ def _pick_display(counts: dict[str, int]) -> str:
 
 def is_retail_customer(value: object) -> bool:
     text = " ".join(re.sub(r"[^\w\s]", " ", clean_text(value).casefold()).split())
-    return text in RETAIL_ALIASES | {"lẻ", "khách lẻ", "khách vãng lai", "vãng lai"}
+    return text in RETAIL_ALIASES | RETAIL_CUSTOMER_NAMES
 
 
 def canonicalize_products(connection: sqlite3.Connection, tables: list[TableMeta]) -> dict[str, str]:

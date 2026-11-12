@@ -30,6 +30,7 @@ MONEY_MEASURES = {"revenue", "avg_per_order", "gross_profit", "purchase_amount",
 ORDER_BASED_MEASURES = ORDER_MEASURES | DEBT_MEASURES
 FLAG_NAMES = (
     "qty_unreliable", "money_unreliable", "order_structure_broken", "status_unreliable", "payments_unlinked",
+    "customer_group_incomplete",
 )
 PERIOD_SHAPES = {"breakdown", "argmax_period", "trend_check"}
 # Stored values offered to the parser, per filter dimension: (table, column).
@@ -40,6 +41,35 @@ CHOICE_COLUMNS = {
     "product_group": ("lines", "category"),
 }
 CHOICE_LIMIT = 40
+# A model failure on a catalog or auxiliary table blocks only the questions that read what that table feeds into
+# the layer: {table kind: the intent features it can change}. A feature is a filter dimension, a group_by
+# dimension, a measure, or a threshold subject (see _intent_features). Built from layer.py: _fill_from_catalogs,
+# _load_product_facts, _load_product_attrs, _load_unit_factors, _load_customer_groups, _map_employees and
+# _load_catalog_keys (which picks id columns by the catalog ids). A kind mapped to None cannot be decided, so
+# every question abstains. A kind missing from this dict is not a catalog: any failure on it blocks everything.
+_PRODUCT_FEATURES = frozenset({
+    "product", "product_group", "size", "unit", "prescription", "active_ingredient", "product_kind",
+    "gross_profit", "unit_sale_price_on_date", "unit_purchase_price", "qty_base_sold",
+    "orders_containing_product", "no_sale_count",
+})
+CATALOG_FEATURES: dict[str, frozenset[str] | None] = {
+    # category and base unit of products, prescription, active ingredient, base units per large unit (qty_base)
+    "product_catalog": _PRODUCT_FEATURES,
+    # base units per large unit, the same product features as the catalog
+    "unit_conversion": _PRODUCT_FEATURES,
+    # alias names resolve to full product names, and product kind
+    "alias": _PRODUCT_FEATURES,
+    # the layer does not read promotion rows, so no answer depends on them
+    "promotion": frozenset(),
+    # the layer does not read price rows; the price measures are the ones a price table would feed
+    "price_history": frozenset({"gross_profit", "unit_sale_price_on_date", "unit_purchase_price"}),
+    # customer group of an order when the order has none, and the id column choice for customers
+    "customer_catalog": frozenset({"customer", "customer_group", "distinct_customers"}),
+    # employee spellings are matched to the full names of this catalog
+    "employee_catalog": frozenset({"employee"}),
+    # "other" covers any table, so the features it can change cannot be bounded: every question abstains
+    "other": None,
+}
 
 
 class ParseResult(Protocol):
@@ -113,7 +143,37 @@ def _required_flags(intent: Intent) -> list[str]:
         required.extend(["order_structure_broken", "status_unreliable"])
     if intent.measure in DEBT_MEASURES:
         required.append("payments_unlinked")
+    if intent.group_by == "customer_group" or "customer_group" in filter_dims:
+        required.append("customer_group_incomplete")
     return required
+
+
+def _intent_features(intent: Intent) -> set[str]:
+    """Every filter dimension, group_by, measure and threshold subject that the intent reads."""
+    features = {item.get("dim") for item in intent.filters}
+    features |= {intent.group_by, intent.measure, intent.measure2}
+    subject = (intent.threshold or {}).get("subject")
+    if subject is not None:
+        features.add(subject)
+    features.discard(None)
+    return {str(feature) for feature in features}
+
+
+def _blocking_failure(failures: list[tuple[str, str | None, str | None]], intent: Intent | None) -> str | None:
+    """The stage of the first model failure that makes this question's answer untrusted, or None.
+
+    A shop-wide stage, a table of a kind that is not a catalog, a table of unknown kind, and every failure when the
+    intent is unknown all block. A catalog failure blocks only an intent that reads a feature its kind feeds.
+    """
+    for stage, table, kind in failures:
+        if table is None or intent is None:
+            return stage
+        if kind not in CATALOG_FEATURES:
+            return stage
+        features = CATALOG_FEATURES[kind]
+        if features is None or features & _intent_features(intent):
+            return stage
+    return None
 
 
 def _ungrounded_dim(question_text: str, filters: list[dict[str, Any]]) -> str | None:
@@ -167,11 +227,11 @@ class SemanticSolver:
         parsed = self.parser.parse(question.question, choices=filter_choices(self.connection))
         intent = parsed.intent
         trace.intent = intent
-        failed_stage = self._model_failure()
-        if failed_stage is not None:
-            # The layer was built with a model fallback, so no answer from it is trusted; this runs before the
-            # unanswerable paths so that a degraded shop is never reported as unanswerable.
-            return self._finish(question, trace, "abstain", f"model stage failed: {failed_stage}")
+        blocked = _blocking_failure(self._model_failures(), intent)
+        if blocked is not None:
+            # The layer was built with a model fallback that this question reads, so no answer from it is trusted;
+            # this runs before the unanswerable paths so that a degraded shop is never reported as unanswerable.
+            return self._finish(question, trace, "abstain", f"model stage failed: {blocked}")
         if intent is None:
             return self._finish(question, trace, "abstain", parsed.reason)
         ungrounded = _ungrounded_dim(question.question, intent.filters)
@@ -267,17 +327,26 @@ class SemanticSolver:
             return None
         return {str(key): value for key, value in self.connection.execute("SELECT key, value FROM shop_facts")}
 
-    def _model_failure(self) -> str | None:
-        """First model stage recorded as failed in the layer, or None; None too when the table is missing."""
+    def _model_failures(self) -> list[tuple[str, str | None, str | None]]:
+        """(stage, table_name, kind) of each model failure recorded in the layer. A table with only a stage column
+        (built before failures named their table) gives shop-wide failures. Empty when the table is missing."""
         exists = self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_failures'"
         ).fetchone()
         if exists is None:
-            return None
-        row = self.connection.execute("SELECT stage FROM model_failures ORDER BY rowid LIMIT 1").fetchone()
-        if row is None:
-            return None
-        return "unknown" if row[0] is None else str(row[0])
+            return []
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(model_failures)")}
+        if {"table_name", "kind"} <= columns:
+            rows = self.connection.execute("SELECT stage, table_name, kind FROM model_failures ORDER BY rowid").fetchall()
+        else:
+            rows = [(row[0], None, None) for row in self.connection.execute(
+                "SELECT stage FROM model_failures ORDER BY rowid").fetchall()]
+        return [
+            ("unknown" if stage is None else str(stage),
+             None if table is None else str(table),
+             None if kind is None else str(kind))
+            for stage, table, kind in rows
+        ]
 
     def _orders_range(self) -> tuple[date, date] | None:
         row = self.connection.execute("SELECT MIN(date), MAX(date) FROM orders").fetchone()

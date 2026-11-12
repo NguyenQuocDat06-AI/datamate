@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # A worktree has no cache of its own; set DATASET_CACHE_ROOT to scan table names from a real one.
 CACHE_ROOT = Path(os.environ.get("DATASET_CACHE_ROOT", ROOT))
 SEMANTIC = ROOT / "bizreason" / "semantic"
-# The ontology taken from the rulebook is the only place allowed to hold domain words.
+DATA = ROOT / "bizreason" / "data"
+TEMPORAL = ROOT / "bizreason" / "temporal.py"
+# The vocabulary modules are the only places allowed to hold domain words (generic synonyms, labels, statuses).
 ALLOWED_FILES = {"vocabulary.py"}
 
 RULES = {
@@ -66,10 +68,39 @@ def violations(path: Path, stems: set[str]) -> list[str]:
     return found
 
 
+def table_name_violations(path: Path, stems: set[str]) -> list[str]:
+    """Only the table/file-name rule: used for files whose Vietnamese words are not guarded."""
+    found = []
+    for line, value in string_constants(path.read_text(encoding="utf-8")):
+        lowered = value.lower()
+        for stem in stems:
+            if stem in lowered:
+                found.append(f"{path.name}:{line}: table_name: {stem}")
+                break
+    return found
+
+
 def test_semantic_package_has_no_dataset_literals() -> None:
     stems = table_stems()
     found = []
     for path in sorted(SEMANTIC.glob("**/*.py")) if SEMANTIC.exists() else []:
         if path.name not in ALLOWED_FILES:
             found.extend(violations(path, stems))
+    assert not found, "\n".join(found[:50])
+
+
+def test_data_package_has_no_dataset_literals() -> None:
+    stems = table_stems()
+    found = []
+    for path in sorted(DATA.glob("*.py")) if DATA.exists() else []:
+        if path.name not in ALLOWED_FILES:
+            found.extend(violations(path, stems))
+    assert not found, "\n".join(found[:50])
+
+
+def test_temporal_has_no_dataset_table_names() -> None:
+    """temporal.py is checked for table/file names only; its Vietnamese text is out of scope here."""
+    if not TEMPORAL.exists():
+        return
+    found = table_name_violations(TEMPORAL, table_stems())
     assert not found, "\n".join(found[:50])

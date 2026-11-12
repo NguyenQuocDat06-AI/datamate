@@ -13,12 +13,32 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from bizreason.contracts import TimeWindow
-from bizreason.semantic.vocabulary import (
-    DEBT_METHOD_TOKENS, GENERIC_FILTER_WORDS, NON_DEBT_METHOD_TOKENS, SHIFT_BASELINE, SHIFT_WINDOWS,
-)
+from bizreason.semantic import rulebook_params
+from bizreason.semantic.vocabulary import GENERIC_FILTER_WORDS
 from bizreason.utils import normalize_lookup
 
-VALID = "status IN ('completed','shipping')"
+
+def _status_sql(column: str, statuses: tuple[str, ...], *, negate: bool = False) -> str:
+    """SQL that tests a set of canonical order statuses. One status reads as '=' and several as IN, the forms the
+    SQL has always had, so the default sets give the same text as before the rulebook could change them."""
+    if not statuses or any(s not in rulebook_params.CANONICAL_ORDER_STATUSES for s in statuses):
+        raise ValueError(f"not canonical order statuses: {statuses!r}")
+    if len(statuses) == 1:
+        return f"{column} <> '{statuses[0]}'" if negate else f"{column}='{statuses[0]}'"
+    quoted = ",".join(f"'{s}'" for s in statuses)
+    return f"{column} {'NOT IN' if negate else 'IN'} ({quoted})"
+
+
+def _valid_sale_sql() -> str:
+    """Rulebook §1: the orders that count as sales, from the active rulebook parameters."""
+    return _status_sql("status", rulebook_params.active().valid_sale_statuses)
+
+
+def _cancelled_sql() -> str:
+    """Rulebook §1: the status of a cancelled order, from the active rulebook parameters."""
+    return _status_sql("status", rulebook_params.active().cancelled_statuses)
+
+
 MONEY = {
     "revenue", "avg_per_order", "purchase_amount", "gross_profit", "debt_outstanding", "debt_repaid", "debt_new",
     "unit_purchase_price", "unit_sale_price_on_date", "order_total_due",
@@ -76,8 +96,6 @@ WEEKDAY_TOKENS = {
     "thu 7": 6, "thu bay": 6, "saturday": 6,
     "chu nhat": 0, "cn": 0, "sunday": 0,
 }
-# The afternoon shift key (the other key of SHIFT_WINDOWS besides SHIFT_BASELINE, rulebook section 2).
-SHIFT_AFTERNOON = "chieu"
 _CLOCK = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
 # Generic phrases, longest first, so that a phrase is removed whole.
 _GENERIC_PHRASES = sorted(
@@ -251,7 +269,7 @@ def _check_age(intent: Intent) -> None:
 def _shift_key(text: Any) -> str:
     """The shift named by a filter value. Unknown or ambiguous wording is not an answer."""
     needle = normalize_lookup(text)
-    keys = [key for key in SHIFT_WINDOWS if key in needle]
+    keys = [key for key in rulebook_params.active().shift_windows if key in needle]
     if len(keys) != 1:
         raise Unsupported(f"unknown shift: {text}")
     return keys[0]
@@ -350,7 +368,7 @@ class Compiler:
     def _require_cancellations(self) -> None:
         if self._has_cancelled is None:
             self._has_cancelled = self.db.execute(
-                "SELECT 1 FROM orders WHERE status='cancelled' LIMIT 1"
+                f"SELECT 1 FROM orders WHERE {_cancelled_sql()} LIMIT 1"
             ).fetchone() is not None
         if not self._has_cancelled:
             raise Unsupported("cancellation not recorded")
@@ -387,7 +405,7 @@ class Compiler:
         """Rulebook §2: a shift is a window on the time of day of the order. Works on orders and lines alike."""
         key = _shift_key(text)
         self._require_order_time()
-        start, end = SHIFT_WINDOWS[key]
+        start, end = rulebook_params.active().shift_windows[key]
         return "(clock_of(ts) >= ? AND clock_of(ts) <= ?)", [start, end], False
 
     @staticmethod
@@ -576,7 +594,7 @@ class Compiler:
             # Rulebook §3: a service charge is not a product, so it is neither ranked nor counted.
             where = where + [self.items_only]
         span = [window.start.isoformat(), window.end_exclusive.isoformat()]
-        clause = " AND ".join(where + [VALID, "date>=? AND date<?", f"{key} IS NOT NULL"])
+        clause = " AND ".join(where + [_valid_sale_sql(), "date>=? AND date<?", f"{key} IS NOT NULL"])
         rows = self.db.execute(
             f"SELECT {metrics[metric]} FROM {table} WHERE {clause} GROUP BY {key}", args + span
         ).fetchall()
@@ -612,14 +630,16 @@ class Compiler:
                 if item["dim"] != "customer":
                     raise Unsupported(f"debt measure with filter {item['dim']}")
         where, args, _ = self._predicates(intent, skip_filters)
-        clause = " AND ".join(["COALESCE(status, '') <> 'cancelled'", *where])
+        not_cancelled = _status_sql("COALESCE(status, '')", rulebook_params.active().cancelled_statuses, negate=True)
+        clause = " AND ".join([not_cancelled, *where])
         rows = self.db.execute(
             f"SELECT order_id, customer_key, date, total_due, payment_method FROM orders WHERE {clause}", args
         ).fetchall()
+        params = rulebook_params.active()
         return [
-            (order_id, customer, day, due, _mentions(method, DEBT_METHOD_TOKENS))
+            (order_id, customer, day, due, _mentions(method, params.debt_method_tokens))
             for order_id, customer, day, due, method in rows
-            if not _mentions(method, NON_DEBT_METHOD_TOKENS)
+            if not _mentions(method, params.non_debt_method_tokens)
         ]
 
     def _payment_index(self) -> dict[Any, list[tuple[Any, Any]]]:
@@ -771,8 +791,8 @@ class Compiler:
             raise Unsupported("line detail unavailable")
         where, args, _ = self._predicates(intent, skip_filters)
         start, end = window.start.isoformat(), window.end_exclusive.isoformat()
-        before = " AND ".join(where + [VALID, "date<?", "product_key IS NOT NULL"])
-        inside = " AND ".join(where + [VALID, "date>=? AND date<?"])
+        before = " AND ".join(where + [_valid_sale_sql(), "date<?", "product_key IS NOT NULL"])
+        inside = " AND ".join(where + [_valid_sale_sql(), "date>=? AND date<?"])
         row = self.db.execute(
             f"SELECT COUNT(*) FROM (SELECT product_key FROM lines WHERE {before} GROUP BY product_key) p "
             f"WHERE NOT EXISTS (SELECT 1 FROM lines WHERE product_key = p.product_key AND {inside})",
@@ -832,7 +852,7 @@ class Compiler:
             # Rulebook §4: the total the customer owes for the order, after order-level discount, including shipping.
             if needs_lines:
                 raise Unsupported("order total with a line filter")
-            dues = [r[0] for r in self.db.execute(f"SELECT total_due FROM orders WHERE {VALID} AND {clause}", sql_args)]
+            dues = [r[0] for r in self.db.execute(f"SELECT total_due FROM orders WHERE {_valid_sale_sql()} AND {clause}", sql_args)]
             if dues and all(due is None for due in dues):
                 raise Unsupported("no total_due")
             present = [due for due in dues if due is not None]
@@ -844,15 +864,15 @@ class Compiler:
             raise Unsupported("line detail unavailable")
         amount = "amount" if source == "lines" else "revenue"
         expressions = {
-            "revenue": f"SELECT SUM({amount}) FROM {source} WHERE {VALID} AND {clause}",
-            "order_count": f"SELECT COUNT(DISTINCT order_id) FROM {source} WHERE {VALID} AND {clause}",
-            "cancelled_count": f"SELECT COUNT(DISTINCT order_id) FROM {source} WHERE status='cancelled' AND {clause}",
-            "avg_per_order": f"SELECT SUM({amount})*1.0/NULLIF(COUNT(DISTINCT order_id),0) FROM {source} WHERE {VALID} AND {clause}",
-            "qty_base_sold": f"SELECT SUM(COALESCE(qty_base, qty)) FROM lines WHERE {VALID} AND {self.items_only} AND {clause}",
-            "distinct_customers": f"SELECT COUNT(DISTINCT customer_key) FROM {source} WHERE {VALID} AND {clause}",
-            "gross_profit": f"SELECT SUM(amount)-SUM(qty*line_cost) FROM lines WHERE {VALID} AND {clause}",
+            "revenue": f"SELECT SUM({amount}) FROM {source} WHERE {_valid_sale_sql()} AND {clause}",
+            "order_count": f"SELECT COUNT(DISTINCT order_id) FROM {source} WHERE {_valid_sale_sql()} AND {clause}",
+            "cancelled_count": f"SELECT COUNT(DISTINCT order_id) FROM {source} WHERE {_cancelled_sql()} AND {clause}",
+            "avg_per_order": f"SELECT SUM({amount})*1.0/NULLIF(COUNT(DISTINCT order_id),0) FROM {source} WHERE {_valid_sale_sql()} AND {clause}",
+            "qty_base_sold": f"SELECT SUM(COALESCE(qty_base, qty)) FROM lines WHERE {_valid_sale_sql()} AND {self.items_only} AND {clause}",
+            "distinct_customers": f"SELECT COUNT(DISTINCT customer_key) FROM {source} WHERE {_valid_sale_sql()} AND {clause}",
+            "gross_profit": f"SELECT SUM(amount)-SUM(qty*line_cost) FROM lines WHERE {_valid_sale_sql()} AND {clause}",
             "cancel_rate": (
-                f"SELECT 100.0*COUNT(DISTINCT CASE WHEN status='cancelled' THEN order_id END)"
+                f"SELECT 100.0*COUNT(DISTINCT CASE WHEN {_cancelled_sql()} THEN order_id END)"
                 f"/NULLIF(COUNT(DISTINCT order_id),0) FROM {source} WHERE {clause}"
             ),
         }
@@ -912,7 +932,7 @@ class Compiler:
         }.get(m)
         if score is None:
             raise Unsupported(f"ranking of {m}")
-        status = "status='cancelled'" if m == "cancelled_count" else VALID
+        status = _cancelled_sql() if m == "cancelled_count" else _valid_sale_sql()
         if source == "lines" and dim in LINE_DIMS:
             where = where + [self.items_only]
         clause = " AND ".join(where + [status, "date>=? AND date<?", f"{key} IS NOT NULL"])
@@ -953,7 +973,7 @@ class Compiler:
             keys = [_shift_key(item["value"]) for item in members]
             if keys[0] == keys[1]:
                 raise Unsupported("two shifts needed")
-            if keys[1] != SHIFT_BASELINE:
+            if keys[1] != rulebook_params.active().shift_baseline:
                 members = members[::-1]
         first = self.value(Intent(measure=intent.measure, filters=[*others, members[0]]), target[0])
         second = self.value(Intent(measure=intent.measure, filters=[*others, members[1]]), target[0])
@@ -972,13 +992,14 @@ class Compiler:
         dims = [f.get("dim") for f in others if f.get("exclude") is not True]
         if len(dims) != len(set(dims)):
             raise Unsupported("comparison with several members of one dimension")
+        params = rulebook_params.active()
         morning = self.value(
-            Intent(measure=intent.measure, filters=[*others, {"dim": "shift", "value": SHIFT_BASELINE}],
+            Intent(measure=intent.measure, filters=[*others, {"dim": "shift", "value": params.shift_baseline}],
                    age_days=intent.age_days),
             window,
         )
         afternoon = self.value(
-            Intent(measure=intent.measure, filters=[*others, {"dim": "shift", "value": SHIFT_AFTERNOON}],
+            Intent(measure=intent.measure, filters=[*others, {"dim": "shift", "value": params.shift_afternoon}],
                    age_days=intent.age_days),
             window,
         )

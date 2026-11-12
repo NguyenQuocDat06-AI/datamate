@@ -23,23 +23,25 @@ from collections import Counter, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from bizreason.cli import _builder
 from bizreason.config import Settings
 from bizreason.contracts import AnswerType, OutputSpec, Prediction, Question
 from bizreason.data import schema
 from bizreason.formatting import validate_answer
 from bizreason.llm import TrammayClient, endpoint_file_resolver
 from bizreason.semantic.annotator import Annotator, load_or_annotate, load_status_map, load_value_groups
-from bizreason.semantic.intent import IntentParser
+from bizreason.semantic.fewshot import FewShotBank
+from bizreason.semantic.intent import IntentParser, ParsedIntent
 from bizreason.semantic.layer import annotations_by_signature, build, effective_roles, to_date, to_number
 from bizreason.semantic.solver import SemanticSolver
 from bizreason.temporal import TemporalResolver
 from bizreason.utils import PathPolicy, atomic_json, dumps, file_hash, normalize_lookup, quote_identifier, writable_path
+from bizreason.semantic import rulebook_params
+from bizreason.v2_setup import build_v2_context
 
 WORKTREE = Path(__file__).resolve().parents[1]
 DEFAULT_TOTAL_SECONDS = 21600.0
@@ -53,12 +55,15 @@ DEFAULT_MAX_MODEL_CONCURRENCY = 4
 ANNOTATION_MAX_TOKENS = 1500
 ANNOTATION_TIMEOUT = 280.0
 INTENT_MAX_TOKENS = 400
+# The analysis key of --reasoning on adds up to about three sentences before the intent.
+INTENT_REASONING_MAX_TOKENS = 700
 INTENT_TIMEOUT = 200.0
 ANNOTATOR_WORKERS = 4
 STAGES = ("ingestion", "annotation", "status", "line_kinds", "value_groups", "build")
 # Decisions for questions that were never attempted: they are not checkpointed, so a rerun answers them.
 NOT_ATTEMPTED = frozenset({"budget", "no_shop"})
 SECRET_ARG_MARKERS = ("token", "secret", "password", "key")
+PROMPT_PROFILES = ("default", "qwen")
 
 # Shared by every model call of the run (builds and question parsing). Set in each build process by
 # _init_build_worker; a fork-context semaphore, so it bounds requests across processes.
@@ -73,6 +78,7 @@ class Outcome:
     line: str
     checkpoint: bool
     finished: float  # time.monotonic() when the answer was complete
+    trace: dict[str, Any] | None = None  # traces.jsonl row; None when --traces is off or nothing was solved
 
 
 @dataclass(frozen=True)
@@ -163,6 +169,122 @@ class Checkpoint:
         self._handle.close()
 
 
+class TraceWriter:
+    """traces.jsonl: one row per solved question, appended and flushed as each answer is recorded.
+
+    On open, rows are kept only for ids already in submission.jsonl (keep_ids), first occurrence only, so a resumed
+    run never duplicates a trace and a question that is answered again gets exactly one fresh row.
+    """
+
+    def __init__(self, path: Path, keep_ids: set[str]):
+        self.path = writable_path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self.ids: set[str] = set()
+        kept: list[str] = []
+        if self.path.exists():
+            for raw in self.path.read_text(encoding="utf-8").splitlines():
+                try:
+                    qid = json.loads(raw)["id"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if isinstance(qid, str) and qid in keep_ids and qid not in self.ids:
+                    self.ids.add(qid)
+                    kept.append(raw)
+        _write_text_atomic(self.path, "".join(line + "\n" for line in kept))
+        self._handle = self.path.open("a", encoding="utf-8", newline="\n")
+
+    def append(self, row: dict[str, Any]) -> None:
+        with self._lock:
+            if row["id"] in self.ids:
+                return
+            self.ids.add(row["id"])
+            self._handle.write(dumps(row) + "\n")
+            self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+class _AttemptRecorder:
+    """Wraps the intent parser, transparently, to remember how many attempts the last parse of this thread took.
+
+    The solver does not report attempts in its trace, so the attempt count is read here.
+    """
+
+    def __init__(self, parser: Any):
+        self._parser = parser
+        self._local = threading.local()
+
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None, **kwargs: Any) -> ParsedIntent:
+        result = self._parser.parse(question, choices=choices, **kwargs)
+        self._local.attempts = getattr(result, "attempts", None)
+        return result
+
+    def reset(self) -> None:
+        self._local.attempts = None
+
+    def attempts(self) -> int | None:
+        return getattr(self._local, "attempts", None)
+
+
+class _QuestionBoundParser:
+    """Gives the intent parser the id and shop of the question being solved, which few-shot retrieval needs.
+
+    The solver calls parse(question, choices) and does not pass ids, so SolverPool binds each question before
+    solving it. The binding is per thread: each thread solves one question at a time with its own solvers.
+    A parse of any other text is refused, so retrieval can never run without the ids its leakage rules need.
+    """
+
+    def __init__(self, parser: Any):
+        self._parser = parser
+        self._local = threading.local()
+
+    def bind(self, question: Question | None) -> None:
+        self._local.question = question
+
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None) -> ParsedIntent:
+        bound = getattr(self._local, "question", None)
+        if bound is None or bound.question != question:
+            raise RuntimeError("intent parse for a question that is not the bound question")
+        return self._parser.parse(question, choices=choices, question_id=bound.id, business_id=bound.business_id)
+
+
+def make_intent_parser(model: Any, profile: str, examples: Callable[..., str] | None = None,
+                       reasoning: bool = False) -> IntentParser:
+    """IntentParser with the prompt profile, optional few-shot examples and optional short reasoning.
+
+    The default profile without examples or reasoning is passed as the old, keyword-free call.
+    """
+    if reasoning:
+        try:
+            return IntentParser(model, profile=profile, examples=examples, reasoning=True)
+        except TypeError as exc:
+            raise ValueError(f"--reasoning on needs an IntentParser that accepts reasoning=; "
+                             f"this IntentParser does not ({exc})") from exc
+    if examples is not None:
+        try:
+            return IntentParser(model, profile=profile, examples=examples)
+        except TypeError as exc:
+            raise ValueError(f"--fewshot-bank needs an IntentParser that accepts examples=; "
+                             f"this IntentParser does not ({exc})") from exc
+    if profile == "default":
+        return IntentParser(model)
+    try:
+        return IntentParser(model, profile=profile)
+    except TypeError as exc:
+        raise ValueError(f"--prompt-profile {profile!r} needs an IntentParser that accepts profile=; "
+                         f"this IntentParser does not ({exc})") from exc
+
+
+def _trace_row(question: Question, trace: Any, attempts: int | None, seconds: float) -> dict[str, Any]:
+    intent = asdict(trace.intent) if trace.intent is not None else None
+    windows = [[window.role, window.start.isoformat(), window.end_exclusive.isoformat()] for window in trace.windows]
+    return {"id": question.id, "business_id": question.business_id, "question": question.question,
+            "decision": trace.decision, "reason": trace.reason, "intent": intent, "windows": windows,
+            "attempts": attempts, "seconds": seconds}
+
+
 class GatedModel:
     """Thin proxy around a model client: generate_json holds one slot of the shared gate for the whole call.
 
@@ -188,8 +310,14 @@ class GatedModel:
 class SolverPool:
     """Answers questions. Each thread keeps its own read-only connection and solver per shop."""
 
-    def __init__(self, parser: IntentParser, temporal: TemporalResolver, paths: dict[str, Path]):
-        self._parser = parser
+    def __init__(self, parser: IntentParser, temporal: TemporalResolver, paths: dict[str, Path], *,
+                 traces: bool = False, bind_questions: bool = False):
+        self._recorder = _AttemptRecorder(parser) if traces else None
+        self._parser = self._recorder if traces else parser
+        self._binder = _QuestionBoundParser(self._parser) if bind_questions else None
+        if self._binder is not None:
+            self._parser = self._binder
+        self._traces = traces
         self._temporal = temporal
         self._paths = paths
         self._local = threading.local()
@@ -203,13 +331,26 @@ class SolverPool:
         path = self._paths.get(question.business_id)
         if path is None:
             return _abstain(question, "shop not built", "no_shop", started, checkpoint=False)
+        if self._recorder is not None:
+            self._recorder.reset()
+        if self._binder is not None:
+            self._binder.bind(question)
         try:
-            prediction, trace = self._solver(question.business_id, path).solve(question)
-            line = submission_line(prediction)
-        except Exception as exc:  # one bad question must never stop the run
-            return _abstain(question, f"error: {type(exc).__name__}", "error", started, checkpoint=True)
-        return Outcome(question.id, trace.decision, _elapsed(started), line, checkpoint=True,
-                       finished=time.monotonic())
+            try:
+                prediction, trace = self._solver(question.business_id, path).solve(question)
+                line = submission_line(prediction)
+            except Exception as exc:  # one bad question must never stop the run
+                return _abstain(question, f"error: {type(exc).__name__}", "error", started, checkpoint=True)
+        finally:
+            if self._binder is not None:
+                self._binder.bind(None)
+        seconds = _elapsed(started)
+        row = None
+        if self._traces:
+            attempts = self._recorder.attempts() if self._recorder is not None else None
+            row = _trace_row(question, trace, attempts, seconds)
+        return Outcome(question.id, trace.decision, seconds, line, checkpoint=True,
+                       finished=time.monotonic(), trace=row)
 
     def _solver(self, biz: str, path: Path) -> SemanticSolver:
         cache = getattr(self._local, "solvers", None)
@@ -230,6 +371,8 @@ class SolverPool:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m bizreason.run_v2", description=__doc__.split("\n")[0])
+    parser.add_argument("--rulebook-params", choices=["on", "off"], default="on",
+                        help="read shifts, walk-in names, fees, debt methods and the Tet window from the rulebook")
     parser.add_argument("--data", required=True, type=Path, help="test root: questions.jsonl, rulebook.md, data/<biz>")
     parser.add_argument("--out", required=True, type=Path, help="output and cache directory")
     parser.add_argument("--business", nargs="+", action="extend", metavar="ID", help="only these business ids")
@@ -246,10 +389,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="wall budget; questions after it (minus a 5 minute margin) abstain, and no new shop starts")
     parser.add_argument("--outage-wait", type=float, default=DEFAULT_OUTAGE_WAIT,
                         help="seconds to wait for the endpoint to come back during an outage")
-    parser.add_argument("--no-alias", action="store_true",
-                        help="ignore the header alias list during ingestion (simulates unseen headers)")
+    parser.add_argument("--aliases", choices=["off", "on"], default="off",
+                        help="use the header alias list during ingestion (default off: it hurts on unseen headers)")
+    parser.add_argument("--no-alias", dest="aliases", action="store_const", const="off",
+                        help="deprecated: same as --aliases off")
     parser.add_argument("--project-shops", type=int, default=DEFAULT_PROJECT_SHOPS)
     parser.add_argument("--project-questions", type=int, default=DEFAULT_PROJECT_QUESTIONS)
+    parser.add_argument("--reasoning", choices=("off", "on"), default="off",
+                        help="ask the intent model for a short analysis (first JSON key) before the intent")
+    parser.add_argument("--prompt-profile", choices=PROMPT_PROFILES, default="default",
+                        help="intent prompt profile passed to every IntentParser built for question solving")
+    parser.add_argument("--traces", action="store_true",
+                        help="also write traces.jsonl: one row per solved question with its intent and windows")
+    parser.add_argument("--questions-file", type=Path, metavar="PATH",
+                        help="questions.jsonl to use instead of <data>/questions.jsonl (same format)")
+    parser.add_argument("--fewshot-bank", type=Path, metavar="PATH",
+                        help="few-shot bank jsonl (solved questions with intents); the k most similar, from other "
+                             "shops, are shown to the intent parser for each question")
+    parser.add_argument("--fewshot-k", type=int, default=4, metavar="N",
+                        help="number of few-shot examples per question when --fewshot-bank is given (default 4)")
     return parser.parse_args(argv)
 
 
@@ -391,7 +549,7 @@ def build_shop_in_worker(job: ShopJob) -> ShopBuild:
     with PathPolicy(mode="competition", allowed_roots=[job.out], forbidden_roots=[job.data]):
         client = make_annotation_client(job.args)
         try:
-            builder, _rules, _temporal = _builder(job.data, job.out / "cache")
+            builder, _rules, _temporal = build_v2_context(job.data, job.out / "cache")
             rows = StageRows()
             annotator = Annotator(GatedModel(client, _MODEL_GATE), workers=ANNOTATOR_WORKERS)
             ctx = RunContext(job.data, job.out, builder, annotator, rows)
@@ -418,7 +576,7 @@ def build_and_answer(args: argparse.Namespace, data: Path, out: Path, questions:
         by_shop.setdefault(question.business_id, []).append(question)
     waiting = deque(build_order(questions))
     paths: dict[str, Path] = {}
-    solvers = SolverPool(parser, temporal, paths)
+    solvers = SolverPool(parser, temporal, paths, traces=args.traces, bind_questions=args.fewshot_bank is not None)
     builds: dict[Future[ShopBuild], str] = {}
     answers: set[Future[Outcome]] = set()
 
@@ -567,7 +725,15 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         raise ValueError("--build-workers must be at least 1")
     if args.max_model_concurrency < 1:
         raise ValueError("--max-model-concurrency must be at least 1")
-    questions = load_questions(data / "questions.jsonl", args.business, args.limit)
+    fewshot: FewShotBank | None = None
+    if args.fewshot_bank is not None:
+        if args.fewshot_k < 1:
+            raise ValueError("--fewshot-k must be at least 1")
+        fewshot = FewShotBank.load(args.fewshot_bank)
+        if len(fewshot) == 0:
+            raise ValueError(f"--fewshot-bank {args.fewshot_bank} has no examples")
+    questions_path = args.questions_file if args.questions_file is not None else data / "questions.jsonl"
+    questions = load_questions(questions_path, args.business, args.limit)
     if not questions:
         raise ValueError("No questions selected")
     out.mkdir(parents=True, exist_ok=True)
@@ -575,6 +741,12 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
     manifest: dict[str, Any] = {
         "git_commit": git_commit(),
         "arguments": {key: _plain(value) for key, value in vars(args).items() if not _is_secret_arg(key)},
+        "prompt_profile": args.prompt_profile,
+        "reasoning": args.reasoning,
+        "fewshot_bank": str(args.fewshot_bank) if fewshot is not None else None,
+        "fewshot_bank_sha256": file_hash(args.fewshot_bank) if fewshot is not None else None,
+        "fewshot_k": args.fewshot_k if fewshot is not None else None,
+        "questions_path": str(questions_path),
         "rulebook_path": str(rulebook),
         "rulebook_sha256": file_hash(rulebook),
         "started_at": _now(),
@@ -584,16 +756,28 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
 
     checkpoint = Checkpoint(out / "submission.jsonl")
     log = RunLog(out / "timing.jsonl")
+    traces = TraceWriter(out / "traces.jsonl", set(checkpoint.lines)) if args.traces else None
     intent_client: TrammayClient | None = None
     saved_roles: dict[str, Any] | None = None
     try:
-        if args.no_alias:
+        if args.aliases == "off":
             saved_roles = dict(schema.ROLE_LOOKUP)
             schema.ROLE_LOOKUP.clear()
         make_client = _client_factory(args)  # validates the connection file and endpoint before any build starts
-        intent_client = make_client(INTENT_MAX_TOKENS, INTENT_TIMEOUT)
-        _, _rules, temporal = _builder(data, out / "cache")
+        intent_client = make_client(
+            INTENT_REASONING_MAX_TOKENS if args.reasoning == "on" else INTENT_MAX_TOKENS, INTENT_TIMEOUT)
+        _, _rules, temporal = build_v2_context(data, out / "cache")
+        if args.rulebook_params == "on" and rulebook.exists():
+            # Business parameters (shifts, walk-in names, fees, debt methods, Tết) come from this test set's own
+            # rulebook. Set before any shop build so forked build workers inherit them; defaults when unstated.
+            params, taken = rulebook_params.load_or_extract(
+                rulebook, make_client(ANNOTATION_MAX_TOKENS, ANNOTATION_TIMEOUT), out / "rulebook_params.json")
+            rulebook_params.set_active(params)
+            print(f"rulebook params taken from the rulebook: {taken or 'none (defaults)'}", flush=True)
         gate = multiprocessing.get_context("fork").BoundedSemaphore(args.max_model_concurrency)
+        examples = fewshot.provider(args.fewshot_k) if fewshot is not None else None
+        intent_parser = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile, examples,
+                                           reasoning=args.reasoning == "on")
         deadline = t0 + args.total_seconds - BUDGET_MARGIN_SECONDS
 
         pending = [question for question in questions if question.id not in checkpoint.lines]
@@ -605,17 +789,21 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
                      "end_at": round(outcome.finished - t0, 3)})
             if outcome.checkpoint:
                 checkpoint.append(outcome.question_id, outcome.line)
+                if traces is not None and outcome.trace is not None:
+                    traces.append(outcome.trace)
             lines[outcome.question_id] = outcome.line
             done[0] += 1
             print(f"[{done[0]}/{len(pending)}] {outcome.question_id}: {outcome.decision} ({outcome.seconds:.2f}s)",
                   flush=True)
 
-        build_and_answer(args, data, out, pending, IntentParser(GatedModel(intent_client, gate)), temporal, gate,
+        build_and_answer(args, data, out, pending, intent_parser, temporal, gate,
                          deadline, t0, log, record)
         write_final(out / "submission.final.jsonl", questions, lines)
     finally:
         checkpoint.close()
         log.close()
+        if traces is not None:
+            traces.close()
         if intent_client is not None:
             try:
                 intent_client.close()

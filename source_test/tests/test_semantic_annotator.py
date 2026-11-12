@@ -20,6 +20,7 @@ from bizreason.semantic.annotator import (
     _sibling_fit,
     relevant_readme,
 )
+from bizreason.semantic.layer import ModelFailure
 from bizreason.semantic.vocabulary import PAYMENT_CANONICAL
 from bizreason.utils import normalize_lookup
 
@@ -359,8 +360,8 @@ def test_group_failing_twice_records_error_after_one_retry() -> None:
 
     assert record["error"] == "RuntimeError: boom"
     # attempt 1: kind call, shorter kind retry. attempt 2: kind call, shorter kind retry (kind falls back to
-    # "other"), role call, one batch call.
-    assert len(model.calls) == 6
+    # "other"), then the role call (3 tries), then its one batch (3 tries).
+    assert len(model.calls) == 10
 
 
 def test_load_status_map_does_not_cache_failure(tmp_path: Path) -> None:
@@ -446,8 +447,9 @@ def test_failing_single_call_triggers_batching() -> None:
 
 def test_partial_batch_failure_keeps_good_roles_and_sets_partial() -> None:
     table = _wide_table(25)
-    # 25 columns go straight to batches: role call 1 covers the first 15 columns, call 2 the last 10.
-    model = RoleScriptModel(fail_role_calls={2})
+    # 25 columns go straight to batches: role call 1 covers the first 15 columns, call 2 the last 10. Call 2 fails
+    # all three of its tries.
+    model = RoleScriptModel(fail_role_calls={2, 3, 4})
 
     record = Annotator(model, workers=1).annotate(_context([table]))[0]
 
@@ -456,6 +458,32 @@ def test_partial_batch_failure_keeps_good_roles_and_sets_partial() -> None:
     assert record["kind"] == "sales"
     assert set(record["roles"]) == {f"col_{i:02d}" for i in range(15)}
     assert set(record["roles"].values()) == {"order_id"}
+
+
+def test_role_call_that_succeeds_on_its_second_try_records_no_failure() -> None:
+    table = _table("t_one", ["ref_no", "amount"])
+    # the first role call fails; its retry with the same prompt answers
+    model = RoleScriptModel(fail_role_calls={1})
+    annotator = Annotator(model, workers=1)
+
+    record = annotator.annotate(_context([table]))[0]
+
+    assert record["roles"] == {"ref_no": "order_id", "amount": "order_id"}
+    assert "partial" not in record
+    assert annotator.take_failures() == []
+    role_prompts = [prompt for system, prompt in model.calls if not system.startswith("Classify")]
+    assert len(role_prompts) == 2 and role_prompts[0] == role_prompts[1]  # the retry sent the same prompt
+
+
+def test_batch_failing_every_try_is_recorded_with_its_table_and_kind() -> None:
+    table = _wide_table(25)
+    model = RoleScriptModel(fail_role_calls={2, 3, 4})
+    annotator = Annotator(model, workers=1)
+
+    record = annotator.annotate(_context([table]))[0]
+
+    assert record["partial"] is True
+    assert annotator.take_failures() == [ModelFailure("roles:" + table.name, table.name, "sales")]
 
 
 def test_all_batches_failing_gives_error_record() -> None:
@@ -926,7 +954,7 @@ def test_failed_line_classification_is_recorded_and_taken_once() -> None:
     result = annotator.annotate_line_kinds(_context([]), [], ["Shirt"], ["Coke", "Voucher 10"])
 
     assert result == {}
-    assert annotator.take_failures() == ["line_kinds"]
+    assert annotator.take_failures() == [ModelFailure("line_kinds")]
     assert annotator.take_failures() == []
 
 
@@ -947,7 +975,7 @@ def test_failed_value_grouping_records_failure_and_writes_no_cache(tmp_path: Pat
     assert load_value_groups(annotator, context, records, cache) == {}
     assert not cache.exists()
     failures = annotator.take_failures()
-    assert failures and all(stage.startswith("value_groups:") for stage in failures)
+    assert failures and all(item.stage.startswith("value_groups:") and item.table_name is None for item in failures)
 
 
 class PartialStatusAnnotator(Annotator):
@@ -1026,7 +1054,7 @@ def test_failed_table_with_no_sibling_stays_an_error_and_is_recorded() -> None:
 
     assert "error" in records[1]
     assert "source" not in records[1]
-    assert annotator.take_failures() == ["annotation:sales_feb"]
+    assert annotator.take_failures() == [ModelFailure("annotation:sales_feb", "sales_feb", "sales")]
 
 
 def test_failed_kind_call_takes_sibling_kind_and_records_no_failure() -> None:
@@ -1051,7 +1079,7 @@ def test_failed_kind_call_without_sibling_is_recorded_as_kind_failure() -> None:
 
     assert records[0]["kind"] == "other"
     assert "source" not in records[0]
-    assert annotator.take_failures() == ["kind:sales_feb"]
+    assert annotator.take_failures() == [ModelFailure("kind:sales_feb", "sales_feb", None)]
 
 
 def test_a_recovered_kind_call_records_no_failure_and_retries_with_a_shorter_prompt() -> None:
@@ -1073,3 +1101,72 @@ def test_sibling_fit_needs_eighty_percent_by_name_or_by_position() -> None:
     assert _sibling_fit(nine, nine[:-1] + ["other"]) == (0.8, True)  # 8/10 by name, 8/9 by position
     assert _sibling_fit(["a", "b", "c", "d"], ["a", "b", "c", "e"]) is None  # 3/5 by name
     assert _sibling_fit(["a", "b", "c", "d", "e"], ["e", "a", "b", "c", "d"]) == (1.0, False)  # same names, shifted
+
+
+def test_booking_table_answered_other_is_promoted_to_sales() -> None:
+    table = _table("t_booking", ["ma_phieu", "ngay_dat", "thanh_tien"], grain="unknown")
+    roles = {"ma_phieu": "order_id", "ngay_dat": "ordered_at", "thanh_tien": "line_amount"}
+    model = FakeModel(kind="other", roles=roles)
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "sales"
+    assert record["kind_source"] == "roles"
+    assert record["roles"] == roles
+    # The role call for an "other" answer lists the sales roles, so the amount can be seen.
+    assert "line_amount:" in model.calls[-1][0]
+
+
+def test_price_list_answered_other_stays_other() -> None:
+    table = _table("t_prices", ["ten_hang", "don_gia"], grain="unknown")
+    model = FakeModel(kind="other", roles={"ten_hang": "product_name", "don_gia": "unit_price"})
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "other"
+    assert record["kind_source"] == "model"
+    # unit_price is a sales role, so outside the "other" scope it becomes "other".
+    assert record["roles"] == {"ten_hang": "product_name", "don_gia": "other"}
+
+
+def test_other_table_with_order_and_date_but_no_amount_stays_other() -> None:
+    table = _table("t_log", ["ma_phieu", "ngay_dat", "ghi_chu"], grain="unknown")
+    model = FakeModel(kind="other", roles={"ma_phieu": "order_id", "ngay_dat": "ordered_at", "ghi_chu": "note"})
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "other"
+    assert record["kind_source"] == "model"
+    assert record["roles"] == {"ma_phieu": "order_id", "ngay_dat": "ordered_at", "ghi_chu": "note"}
+
+
+def test_promotion_and_demotion_are_logged_with_table_name_only(caplog: Any) -> None:
+    booking = _table("t_booking", ["ma_phieu", "ngay_dat", "thanh_tien"], grain="unknown")
+    orphan = _table("t_orphan", ["code"], grain="unknown")
+    roles = {"ma_phieu": "order_id", "ngay_dat": "ordered_at", "thanh_tien": "line_amount"}
+    model = FakeModel(kind="other", roles=roles)
+
+    with caplog.at_level("INFO", logger="bizreason.semantic.annotator"):
+        Annotator(model, workers=1).annotate(_context([booking]))
+    promoted = [r.getMessage() for r in caplog.records if "promoted" in r.getMessage()]
+    assert len(promoted) == 1 and "t_booking" in promoted[0]
+    assert "ma_phieu" not in promoted[0]
+
+    caplog.clear()
+    model = FakeModel(kind="sales", roles={"code": "product_id"})
+    with caplog.at_level("INFO", logger="bizreason.semantic.annotator"):
+        record = Annotator(model, workers=1).annotate(_context([orphan]))[0]
+    demoted = [r.getMessage() for r in caplog.records if "demoted" in r.getMessage()]
+    assert record["kind"] == "other"
+    assert len(demoted) == 1 and "t_orphan" in demoted[0]
+
+
+def test_sales_answer_with_order_roles_keeps_model_source() -> None:
+    table = _table("t_booking", ["ma_phieu", "ngay_dat", "thanh_tien"], grain="unknown")
+    roles = {"ma_phieu": "order_id", "ngay_dat": "ordered_at", "thanh_tien": "line_amount"}
+    model = FakeModel(kind="sales", roles=roles)
+
+    record = Annotator(model, workers=1).annotate(_context([table]))[0]
+
+    assert record["kind"] == "sales"
+    assert record["kind_source"] == "model"

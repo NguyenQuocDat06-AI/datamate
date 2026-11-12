@@ -579,6 +579,123 @@ def test_empty_model_failures_table_leaves_answers_unchanged():
     assert trace.decision == "value"
 
 
+def _record_failure_rows(conn: sqlite3.Connection, *rows: tuple[str, str | None, str | None]) -> None:
+    conn.execute("CREATE TABLE model_failures (stage TEXT, table_name TEXT, kind TEXT)")
+    conn.executemany("INSERT INTO model_failures VALUES (?, ?, ?)", rows)
+
+
+REVENUE = Intent(measure="revenue", shape="scalar")
+PRODUCT_GROUP_REVENUE = Intent(measure="revenue", shape="scalar", filters=[{"dim": "product_group", "value": "thuoc"}])
+PRODUCT_GROUP_TEXT = "revenue of product group thuoc"
+
+
+def test_product_catalog_failure_leaves_a_revenue_scalar_answered():
+    conn = make_db()
+    _record_failure_rows(conn, ("roles:danhsach_sheet1", "danhsach_sheet1", "product_catalog"))
+    prediction, trace = solve(ParseResult(REVENUE), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.NUMBER
+    assert prediction.answer == 150
+    assert trace.decision == "value"
+
+
+def test_product_catalog_failure_abstains_a_product_group_question(reached: list[str]):
+    conn = make_db()
+    _record_failure_rows(conn, ("roles:danhsach_sheet1", "danhsach_sheet1", "product_catalog"))
+    prediction, trace = solve(ParseResult(PRODUCT_GROUP_REVENUE),
+                              FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn, PRODUCT_GROUP_TEXT)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: roles:danhsach_sheet1"
+    assert trace.decision == "abstain"
+    assert reached == []
+
+
+@pytest.mark.parametrize("intent, text", [
+    (PRODUCT_GROUP_REVENUE, PRODUCT_GROUP_TEXT),
+    (Intent(measure="gross_profit", shape="scalar"), "gross profit"),
+    (Intent(measure="revenue", shape="top_k", group_by="product", top_k=3), "top 3 products by revenue"),
+])
+def test_product_catalog_failure_abstains_only_product_dependent_questions(intent: Intent, text: str, reached: list[str]):
+    conn = make_db()
+    _record_failure_rows(conn, ("roles:danhsach_sheet1", "danhsach_sheet1", "product_catalog"))
+    prediction, _ = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn, text)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: roles:danhsach_sheet1"
+
+
+def test_customer_catalog_failure_abstains_a_customer_group_question(reached: list[str]):
+    conn = make_db()
+    _record_failure_rows(conn, ("roles:khach", "khach", "customer_catalog"))
+    intent = Intent(measure="revenue", shape="scalar", group_by="customer_group")
+    prediction, _ = solve(ParseResult(intent), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn,
+                          "revenue by customer group")
+    assert prediction.reason == "model stage failed: roles:khach"
+    assert reached == []
+
+
+def test_employee_catalog_failure_abstains_an_employee_breakdown_and_answers_revenue():
+    conn = make_db()
+    _record_failure_rows(conn, ("roles:nhanvien", "nhanvien", "employee_catalog"))
+    temporal = FakeTemporal(single=[win("2026-01-01", "2026-02-01")])
+    prediction, _ = solve(ParseResult(Intent(measure="revenue", shape="top_k", group_by="employee", top_k=2)),
+                          temporal, conn, "top 2 employees by revenue")
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: roles:nhanvien"
+    prediction, _ = solve(ParseResult(REVENUE), temporal, conn)
+    assert prediction.answer == 150
+
+
+@pytest.mark.parametrize("kind", ["sales", "purchase", "service_ticket", "payment", "delivery", "inventory"])
+def test_failure_on_a_sales_style_table_abstains_every_question(kind: str, reached: list[str]):
+    conn = make_db()
+    _record_failure_rows(conn, (f"roles:{kind}_jan", f"{kind}_jan", kind))
+    temporal = FakeTemporal(single=[win("2026-01-01", "2026-02-01")])
+    for intent, text in [(REVENUE, "q"), (PRODUCT_GROUP_REVENUE, PRODUCT_GROUP_TEXT)]:
+        prediction, _ = solve(ParseResult(intent), temporal, conn, text)
+        assert prediction.type == AnswerType.ABSTAIN
+        assert prediction.reason == f"model stage failed: roles:{kind}_jan"
+    assert reached == []
+
+
+def test_failure_on_a_table_of_unknown_kind_abstains_every_question():
+    conn = make_db()
+    _record_failure_rows(conn, ("kind:danhsach_sheet1", "danhsach_sheet1", None))
+    prediction, _ = solve(ParseResult(REVENUE), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: kind:danhsach_sheet1"
+
+
+def test_failure_on_an_other_table_abstains_every_question():
+    conn = make_db()
+    _record_failure_rows(conn, ("roles:misc", "misc", "other"))
+    prediction, _ = solve(ParseResult(REVENUE), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+
+
+def test_shop_wide_failure_with_a_table_name_still_abstains_every_question(reached: list[str]):
+    conn = make_db()
+    _record_failure_rows(conn, ("status", None, None))
+    prediction, _ = solve(ParseResult(REVENUE), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.reason == "model stage failed: status"
+    assert reached == []
+
+
+def test_catalog_failure_with_unknown_intent_abstains_with_the_model_reason():
+    conn = make_db()
+    _record_failure_rows(conn, ("roles:danhsach_sheet1", "danhsach_sheet1", "product_catalog"))
+    prediction, _ = solve(ParseResult(None, reason="no parse"), FakeTemporal(single=[]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: roles:danhsach_sheet1"
+
+
+def test_old_model_failures_table_with_stage_only_abstains_every_question(reached: list[str]):
+    conn = make_db()
+    _record_model_failures(conn, "roles:danhsach_sheet1")
+    prediction, _ = solve(ParseResult(REVENUE), FakeTemporal(single=[win("2026-01-01", "2026-02-01")]), conn)
+    assert prediction.type == AnswerType.ABSTAIN
+    assert prediction.reason == "model stage failed: roles:danhsach_sheet1"
+    assert reached == []
+
+
 # Table cues: wording that asks for a value beside each entity of a ranked list.
 @pytest.mark.parametrize("text", [
     "Top 3 khách hàng có công nợ lớn nhất và số nợ của từng người?",
@@ -679,3 +796,13 @@ def test_top_k_with_table_cue_returns_the_table_from_the_compiler(monkeypatch: p
     assert prediction.type == AnswerType.TABLE
     assert prediction.answer == table
     assert trace.decision == "value"
+
+
+def test_customer_group_questions_require_complete_groups():
+    by_group = Intent(measure="revenue", shape="breakdown", group_by="customer_group")
+    filtered = Intent(measure="revenue", filters=[{"dim": "customer_group", "value": "x"}])
+    plain = Intent(measure="revenue")
+    assert "customer_group_incomplete" in solver_module._required_flags(by_group)
+    assert "customer_group_incomplete" in solver_module._required_flags(filtered)
+    assert "customer_group_incomplete" not in solver_module._required_flags(plain)
+    assert "customer_group_incomplete" in solver_module.FLAG_NAMES

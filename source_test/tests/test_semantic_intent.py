@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
@@ -725,3 +726,331 @@ def test_system_prompt_has_location_measure2_and_mapping_rules() -> None:
     assert "product_kind" in SYSTEM
     assert "Never put a place into customer_group or customer." in SYSTEM
     assert "time expression is never a filter value" in SYSTEM
+
+
+# ---- prompt profiles -------------------------------------------------------------------------------------------
+
+# Digest of the default system prompt as it was before profiles existed; the default must stay byte-identical.
+DEFAULT_SYSTEM_SHA256 = "e87e6491d704839ae5eea12fefa929156a10fa02aa126f436ed7ddb8c571a544"
+
+
+def test_default_profile_system_prompt_is_unchanged() -> None:
+    import hashlib
+
+    from bizreason.semantic import intent as intent_module
+
+    assert len(SYSTEM) == 9067
+    assert hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest() == DEFAULT_SYSTEM_SHA256
+    assert intent_module.PROFILES == ("default", "qwen")
+
+    model = FakeModel(good(), good())
+    IntentParser(model).parse("question one")
+    IntentParser(model, profile="default").parse("question one")
+
+    assert model.calls[0]["system"] == SYSTEM
+    assert model.calls[1]["system"] == SYSTEM
+    assert model.calls[0]["prompt"] == model.calls[1]["prompt"] == "Question: question one"
+
+
+def test_qwen_profile_sends_qwen_system_prompt() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    model = FakeModel(good())
+    result = IntentParser(model, profile="qwen").parse("question one", choices={"channel": ["Shop A"]})
+
+    assert result.intent is not None
+    assert model.calls[0]["system"] == QWEN_SYSTEM
+    assert model.calls[0]["system"] != SYSTEM
+    assert model.calls[0]["prompt"].startswith("Question: question one\n\n")
+    assert 'channel: ["Shop A"]' in model.calls[0]["prompt"]
+
+
+def test_qwen_contract_comes_first_and_has_all_points() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    contract = QWEN_SYSTEM.index("OUTPUT CONTRACT")
+    assert contract < QWEN_SYSTEM.index("FIELDS") < QWEN_SYSTEM.index("CATALOGUES")
+    # The heading is matched on its own line, because "VIETNAMESE READING RULES" also contains the word RULES.
+    assert QWEN_SYSTEM.index("CATALOGUES") < QWEN_SYSTEM.index("\nRULES\n") < QWEN_SYSTEM.index("EXAMPLES")
+    for phrase in (
+        "one JSON object only",
+        "<think>",
+        "Use only these keys",
+        "copied exactly from the lists below",
+        "filters holds ONLY constraints that the question states",
+        "add no filter for it",
+        "Never invent a dimension name",
+        "copies the product text exactly as the question writes it",
+        "exactly one product filter",
+        "A time expression is never a filter value",
+    ):
+        assert phrase in QWEN_SYSTEM, phrase
+    assert contract < 400, "the contract must come before the long explanations"
+
+
+def test_qwen_profile_keeps_every_measure_shape_and_dimension_of_default() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    for key in MEASURES:
+        assert key in SYSTEM and key in QWEN_SYSTEM, key
+    for key in SHAPES:
+        assert key in SYSTEM and key in QWEN_SYSTEM, key
+    for key in DIMENSIONS:
+        assert key in SYSTEM and key in QWEN_SYSTEM, key
+    for definition in list(MEASURES.values()) + list(SHAPES.values()) + list(DIMENSIONS.values()):
+        assert definition in QWEN_SYSTEM, definition
+
+
+def test_qwen_profile_keeps_disambiguation_and_threshold_rules() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    for rule in (
+        "never revenue",
+        "dim unit",
+        "cancelled_count, never order_count",
+        "Counting customers who still owe money means debtor_count",
+        "Asking how much money is still owed means debt_outstanding, never debtor_count",
+        "morning or afternoon shift is a filter with dim shift",
+        "Shapes threshold_count and ratio_of_counts always need a threshold",
+        "1.3 million becomes 1300000",
+        "gross_profit",
+        "purchase_amount is only for goods bought from suppliers",
+        "Never put a place into customer_group or customer.",
+        "how many days had revenue at least X",
+    ):
+        assert rule in QWEN_SYSTEM, rule
+
+
+def test_qwen_examples_cover_the_observed_failure_classes() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    questions = [line for line in examples.splitlines() if line.startswith("Question: ")]
+    replies = [line for line in examples.splitlines() if line.startswith("{")]
+    assert 4 <= len(questions) <= 8
+    assert len(questions) == len(replies)
+    assert '"filters": []' in examples
+    assert '"shape": "top_k"' in examples
+    assert '"measure2": "order_count"' in examples
+    assert '"shape": "compare_periods"' in examples
+    assert "<product A>" in examples
+    assert "<period A>" in examples
+
+
+def test_qwen_examples_are_parseable_and_valid_intents() -> None:
+    import json
+
+    from bizreason.semantic.intent import QWEN_SYSTEM, _interpret
+
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    replies = [line for line in examples.splitlines() if line.startswith("{")]
+    for line in replies:
+        raw = json.loads(line)
+        assert set(raw) == {
+            "measure", "measure2", "shape", "group_by", "filters", "time", "location",
+            "top_k", "compare_as", "age_days", "threshold",
+        }
+        _interpret(raw, final=True)
+
+
+def test_invalid_profile_raises_value_error() -> None:
+    with pytest.raises(ValueError):
+        IntentParser(FakeModel(), profile="gemma")
+
+
+def test_profiles_tuple_matches_registered_prompts() -> None:
+    from bizreason.semantic import intent as intent_module
+
+    assert set(intent_module.PROFILES) == set(intent_module._SYSTEM_BY_PROFILE)
+
+
+@pytest.mark.parametrize("profile", ["default", "qwen"])
+def test_parse_of_same_reply_is_identical_for_both_profiles(profile: str) -> None:
+    reply = good(
+        measure="order_count",
+        shape="top_k",
+        group_by="product",
+        top_k=3,
+        compare_as="value",
+        filters=[{"dim": "product", "value": "<product A>", "exclude": True}],
+        location="  Main street ",
+    )
+    reference = IntentParser(FakeModel(reply)).parse("question one")
+    result = IntentParser(FakeModel(reply), profile=profile).parse("question one")
+
+    assert result.intent == reference.intent
+    assert result.reason == reference.reason == ""
+    assert result.attempts == reference.attempts == 1
+    assert result.raw == reference.raw
+
+
+@pytest.mark.parametrize("profile", ["default", "qwen"])
+def test_retry_and_unresolved_paths_are_identical_for_both_profiles(profile: str) -> None:
+    script = [good(measure="profit"), good(filters=[{"dim": "planet", "value": "mars", "exclude": False}])]
+
+    reference = IntentParser(FakeModel(*script)).parse("question one")
+    result = IntentParser(FakeModel(*script), profile=profile).parse("question one")
+
+    assert result.intent is None
+    assert result.reason == reference.reason == "unknown filter dimension: planet"
+    assert result.attempts == reference.attempts == 2
+
+
+def test_qwen_vietnamese_reading_rules_sit_after_the_contract_and_name_every_word() -> None:
+    from bizreason.semantic import vocabulary as vocab
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    start = QWEN_SYSTEM.index("VIETNAMESE READING RULES")
+    section = QWEN_SYSTEM[start:QWEN_SYSTEM.index("FIELDS\n")]
+    assert QWEN_SYSTEM.index("OUTPUT CONTRACT") < start
+    for table in (
+        vocab.SHOP_SELF_WORDS, vocab.QUANTITY_UNIT_WORDS, vocab.HOW_MANY_WORDS, vocab.MONEY_ASK_WORDS,
+        vocab.CANCEL_WORDS, vocab.PRODUCT_GROUP_WORDS, vocab.CUSTOMER_GROUP_WORDS,
+    ):
+        for word in table:
+            assert f'"{word}"' in section, word
+    for phrase in (
+        "name the shop itself, the subject of the question",
+        "never a location, a channel, a customer or any other filter",
+        "measure qty_base_sold, never revenue",
+        "measure revenue, never qty_base_sold",
+        "cancelled_count for a count of orders",
+        "cancel_rate for a percent of orders",
+        "add no group filter",
+    ):
+        assert phrase in section, phrase
+
+
+def test_qwen_examples_cover_shop_unit_and_cancel_classes() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+    from bizreason.semantic.vocabulary import CANCEL_WORDS, QUANTITY_UNIT_WORDS, SHOP_SELF_WORDS
+
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    questions = [line for line in examples.splitlines() if line.startswith("Question: ")]
+    assert any(SHOP_SELF_WORDS[0] in line for line in questions)
+    assert any(QUANTITY_UNIT_WORDS[0] in line for line in questions)
+    assert any(CANCEL_WORDS[0] in line for line in questions)
+    assert '"measure": "qty_base_sold"' in examples
+    assert '"measure": "cancelled_count"' in examples
+
+
+def test_default_prompt_has_no_vietnamese_reading_rules() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    assert "VIETNAMESE READING RULES" not in SYSTEM
+    assert "VIETNAMESE READING RULES" in QWEN_SYSTEM
+
+
+def test_qwen_iteration_three_rules_sit_in_the_reading_rules_and_contract_layout() -> None:
+    from bizreason.semantic import vocabulary as vocab
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    start = QWEN_SYSTEM.index("VIETNAMESE READING RULES")
+    section = QWEN_SYSTEM[start:QWEN_SYSTEM.index("FIELDS\n")]
+    for table in (vocab.AVERAGE_WORDS, vocab.PER_ORDER_WORDS, vocab.IMPORT_PRICE_WORDS):
+        for word in table:
+            assert f'"{word}"' in section, word
+    for phrase in (
+        "measure avg_per_order, not revenue",
+        "measure unit_purchase_price, never purchase_amount or purchase_receipt_count",
+        "A product name, drug name, active ingredient or product kind is never a group.",
+        "A shop word is never a location: a question that only names the shop has location null.",
+    ):
+        assert phrase in QWEN_SYSTEM, phrase
+    examples = QWEN_SYSTEM.split("EXAMPLES (question, then the reply)\n", 1)[1]
+    assert '"measure": "avg_per_order"' in examples
+    assert QWEN_SYSTEM.index("OUTPUT CONTRACT") < start < QWEN_SYSTEM.index("FIELDS\n")
+
+
+def test_qwen_prompt_length_grows_by_at_most_fifteen_percent() -> None:
+    from bizreason.semantic.intent import QWEN_SYSTEM
+
+    # The prompt was 13612 characters before the iteration-three rules; the budget is +15 percent.
+    assert len(QWEN_SYSTEM) <= 13612 * 1.15
+
+
+DEFAULT_SYSTEM_SHA256 = "e87e6491d704839ae5eea12fefa929156a10fa02aa126f436ed7ddb8c571a544"
+EXAMPLE_BLOCK = 'Similar solved questions:\nQ: Earlier?\nA: {"measure": "revenue", "shape": "scalar"}'
+
+
+def test_default_system_prompt_is_pinned() -> None:
+    assert hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest() == DEFAULT_SYSTEM_SHA256
+
+
+def test_default_user_prompt_is_unchanged_without_examples() -> None:
+    model = FakeModel(good())
+    IntentParser(model).parse("How many?")
+    assert model.calls[0]["prompt"] == "Question: How many?"
+    assert model.calls[0]["system"] == SYSTEM
+
+
+def test_default_user_prompt_with_choices_is_unchanged_without_examples() -> None:
+    model = FakeModel(good())
+    IntentParser(model).parse("How many?", choices={"product": ["Tea"]})
+    assert model.calls[0]["prompt"] == (
+        'Question: How many?\n\nStored values for filter dimensions:\n- product: ["Tea"]\n'
+        "When a filter refers to one of these values, copy the stored value exactly. "
+        "When the question uses a colloquial word that has the same meaning as a stored value, use that stored value. "
+        "If no stored value matches, keep the question's words."
+    )
+
+
+def test_examples_provider_changes_only_the_user_prompt() -> None:
+    seen: list[tuple[str, str | None, str | None]] = []
+
+    def provider(question: str, question_id: str | None, business_id: str | None) -> str:
+        seen.append((question, question_id, business_id))
+        return EXAMPLE_BLOCK
+
+    model = FakeModel(good())
+    IntentParser(model, examples=provider).parse("How many?", question_id="q-1", business_id="biz_9")
+    assert seen == [("How many?", "q-1", "biz_9")]
+    assert model.calls[0]["system"] == SYSTEM
+    assert model.calls[0]["prompt"] == "Question: How many?\n\n" + EXAMPLE_BLOCK
+
+
+def test_examples_block_goes_before_choices_and_survives_a_retry() -> None:
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def provider(question: str, question_id: str | None, business_id: str | None) -> str:
+        calls.append((question, question_id, business_id))
+        return EXAMPLE_BLOCK
+
+    model = FakeModel(good(measure="not_a_measure"), good())
+    result = IntentParser(model, examples=provider).parse("How many?", choices={"product": ["Tea"]})
+
+    assert result.intent is not None and result.attempts == 2
+    assert calls == [("How many?", None, None)]  # retrieved once per question, not once per attempt
+    first, retry = model.calls[0]["prompt"], model.calls[1]["prompt"]
+    assert first.startswith("Question: How many?\n\n" + EXAMPLE_BLOCK + "\n\nStored values for filter dimensions:")
+    assert retry.startswith("Question: How many?\n\n" + EXAMPLE_BLOCK + " ")
+    assert retry.endswith("If no stored value matches, keep the question's words.")
+    assert model.calls[0]["system"] == model.calls[1]["system"] == SYSTEM
+
+
+def test_empty_examples_block_leaves_the_prompt_as_it_was() -> None:
+    model = FakeModel(good())
+    IntentParser(model, examples=lambda question, question_id, business_id: "").parse("How many?")
+    assert model.calls[0]["prompt"] == "Question: How many?"
+
+
+def test_reasoning_appends_addendum_and_keeps_profile_prompt():
+    from bizreason.semantic.intent import REASONING_ADDENDUM, REASONING_KEY
+
+    model = FakeModel({REASONING_KEY: "Total sales; no filters; one value.", **good()})
+    parsed = IntentParser(model, reasoning=True).parse("q")
+    assert parsed.intent is not None and parsed.intent.measure == "revenue"
+    assert model.calls[0]["system"] == SYSTEM + "\n\n" + REASONING_ADDENDUM
+    assert parsed.raw[REASONING_KEY].startswith("Total sales")
+    assert hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest() == DEFAULT_SYSTEM_SHA256
+
+
+def test_reasoning_off_sends_the_plain_profile_prompt():
+    model = FakeModel(good())
+    IntentParser(model).parse("q")
+    assert model.calls[0]["system"] == SYSTEM
+
+
+def test_reasoning_missing_analysis_still_parses():
+    parsed = IntentParser(FakeModel(good()), reasoning=True).parse("q")
+    assert parsed.intent is not None

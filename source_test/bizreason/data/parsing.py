@@ -7,6 +7,16 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 
+from bizreason.data.vocabulary import (
+    CURRENCY_OR_PERCENT_STRIP_RE,
+    CURRENCY_STRIP_RE,
+    CURRENCY_SUFFIX_RE,
+    MILLION_DECIMAL_RE,
+    MILLION_RE,
+    STATUS_BASE,
+    STATUS_SYNONYMS,
+    VIETNAMESE_DATE_RE,
+)
 from bizreason.utils import normalize_lookup
 
 
@@ -45,8 +55,8 @@ def parse_number(raw: Any, *, locale: str = "unknown", unit: str | None = None) 
         )
     text = str(raw).strip().lower().replace("\u00a0", " ")
     million_decimal = re.fullmatch(
-        r"([+-]?\d+(?:[.,]\d+)?)\s*(?:tr|triệu|trieu)",
-        re.sub(r"\s*(?:vnd|vnđ|đ|₫)$", "", text).strip(),
+        MILLION_DECIMAL_RE,
+        re.sub(CURRENCY_STRIP_RE, "", text).strip(),
     )
     if million_decimal:
         return ParseResult(
@@ -56,16 +66,16 @@ def parse_number(raw: Any, *, locale: str = "unknown", unit: str | None = None) 
             unit or "VND",
         )
     million = re.fullmatch(
-        r"([+-]?\d+)\s*(?:tr|triệu|trieu)\s*(\d{3})?k?",
-        re.sub(r"\s*(?:vnd|vnđ|đ|₫)$", "", text).strip(),
+        MILLION_RE,
+        re.sub(CURRENCY_STRIP_RE, "", text).strip(),
     )
     if million:
         whole, thousands = million.groups()
         sign = -1 if whole.startswith("-") else 1
         number = Decimal(whole) * 1_000_000 + sign * Decimal(thousands or 0) * 1000
         return ParseResult(number, ParseStatus.OK, raw, unit or "VND")
-    money_suffix = re.search(r"(?:vnd|vnđ|đ|₫)$", text)
-    text = re.sub(r"\s*(?:vnd|vnđ|đ|₫|%)$", "", text).strip()
+    money_suffix = re.search(CURRENCY_SUFFIX_RE, text)
+    text = re.sub(CURRENCY_OR_PERCENT_STRIP_RE, "", text).strip()
     scale = Decimal(1)
     if re.search(r"\d\s*k$", text):
         scale = Decimal(1000)
@@ -156,7 +166,7 @@ def parse_date(raw: Any, *, year: int | None = None) -> ParseResult:
             raw,
         )
     vietnamese = re.fullmatch(
-        r"^\s*(?:ngày\s+|ngay\s+)?(\d{1,2})\s*(?:thg|tháng|thang)\.?\s*(\d{1,2})(?:\s*,?\s*(?:năm|nam)?\s*(\d{4}))(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?\s*$",
+        VIETNAMESE_DATE_RE,
         text,
         re.IGNORECASE,
     )
@@ -205,35 +215,11 @@ def parse_date(raw: Any, *, year: int | None = None) -> ParseResult:
     return ParseResult(None, ParseStatus.INVALID, raw, reason="Invalid date")
 
 
-STATUS_ALIASES = {
-    "hoan thanh": "completed",
-    "da hoan thanh": "completed",
-    "completed": "completed",
-    "da giao": "completed",
-    "xong": "completed",
-    "hoan tat": "completed",
-    "huy": "cancelled",
-    "da huy": "cancelled",
-    "cancelled": "cancelled",
-    "canceled": "cancelled",
-    "tra hang": "returned",
-    "da tra": "returned",
-    "returned": "returned",
-    "da hoan hang": "returned",
-    "dang giao": "shipping",
-    "dang giao hang": "shipping",
-    "shipping": "shipping",
-    "dang giao dich": "shipping",
-}
+STATUS_ALIASES = dict(STATUS_BASE)
 STATUS_ALIASES.update(
     {
         normalize_lookup(alias): status
-        for status, aliases in {
-            "completed": "Thành công|đã lấy|đã xong|ok|received|success|done|đã giao hàng",
-            "cancelled": "Huỷ đơn|Đã hủy đơn|khách hủy|Không giao được|cancel|void",
-            "returned": "Đổi trả|Đã trả hàng|Khách trả|Hoàn trả|hàng trả về|trả lại|return|refunded",
-            "shipping": "Đang vận chuyển|đang ship|in transit|đang chuyển|Đang xử lý|đang gửi|Chờ giao",
-        }.items()
+        for status, aliases in STATUS_SYNONYMS.items()
         for alias in aliases.split("|")
     }
 )

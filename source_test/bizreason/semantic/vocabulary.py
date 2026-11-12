@@ -110,6 +110,12 @@ SHIFT_WINDOWS = {"sang": ("06:00:00", "13:59:59"), "chieu": ("14:00:00", "21:59:
 }
 # Rulebook §2: when two shifts are compared, the morning shift is the baseline.
 SHIFT_BASELINE = "sang"
+# Rulebook §2: the afternoon shift, the one compared against the baseline. A key of SHIFT_WINDOWS.
+SHIFT_AFTERNOON = "chieu"
+# Rulebook §2: the Tết window. Start is (lunar month, lunar day, year offset from the Tết lunar year); end is
+# (lunar month, lunar day) in the Tết lunar year, inclusive. Default: 23 of month 12 of the previous year to 10 of month 1.
+TET_START = (12, 23, -1)
+TET_END = (1, 10)
 # Meanings established at ingestion, expressed in the annotation vocabulary.
 INGESTION_ROLES = {
     "order_id": "order_id", "ordered_at": "ordered_at", "ordered_date": "ordered_at", "status": "order_status",
@@ -121,6 +127,25 @@ INGESTION_ROLES = {
 }
 # Rulebook §3: a service charge line is revenue but not a product. Compared after lookup normalization.
 SERVICE_FEE_NAMES = ("phi phuc vu",)
+# Rulebook §1: the canonical order statuses whose orders are sales (revenue, order counts, sold quantities), and the
+# canonical status of a cancelled order (cancelled count, cancel rate, debt). Definition sets: a rulebook that states
+# them replaces these, it does not add to them. Canonical names are the layer's CANONICAL_STATUS.
+VALID_SALE_STATUSES = ("completed", "shipping")
+CANCELLED_STATUSES = ("cancelled",)
+# English names a question may use for the two shifts, mapped to the shift role they stand for. Always present in the
+# shift windows of the active rulebook parameters, so a question in English still finds its shift.
+SHIFT_CANONICAL_NAMES = {"morning": "baseline", "afternoon": "afternoon"}
+# Rulebook cue words. A rulebook row or line carrying one of them is shown to the parameter model
+# (rulebook_params.relevant_rulebook_text). Whole words, compared after lookup normalization.
+RULEBOOK_CUES: dict[str, tuple[str, ...]] = {
+    "shift": ("ca sáng", "ca chiều", "shift", "morning", "afternoon"),
+    "walk_in": ("khách vãng lai", "khách lẻ", "walk-in", "walk in"),
+    "service_fee": ("phí phục vụ", "service charge", "service fee"),
+    "payment_method": ("ghi nợ", "cod", "tmđt", "giao hàng thu tiền", "marketplace", "debt"),
+    "tet": ("tết", "âm lịch", "chạp", "giêng", "mùng"),
+    # Rulebook §1 definitions of a sale, a cancelled order and a return, with the canonical status names.
+    "order_status": ("đơn có trạng thái huỷ", "đơn trả hàng", "đang giao", "cancelled", "returned", "shipping"),
+}
 # Currency spellings that may follow a grouped amount such as 75,000 or 75.000. Compared case-insensitively.
 CURRENCY_SUFFIXES = ("vnd", "vnđ", "đ", "₫")
 
@@ -135,3 +160,30 @@ ADDRESS_HEADER_TOKENS = ("dia chi", "addr", "address", "duong pho")
 # amount", "and the number"). Compared after lookup normalization, as whole words. Used only with a top-k intent
 # that groups by an entity, so a plain list of values is never matched by these words.
 TABLE_ASK_CUES = ("kem", "moi nguoi", "tung nguoi", "va so")
+
+# Shop talk for small shops, written with and without diacritics because questions are often typed without them.
+# A shop word names the shop itself, the subject of the question. It is never a location, channel or customer.
+SHOP_SELF_WORDS = ("cửa hàng", "cua hang", "quán", "quan", "tiệm", "tiem", "shop", "sốp", "sop")
+# Count unit words. After a how-many word they ask for a quantity sold, so the measure is qty_base_sold.
+QUANTITY_UNIT_WORDS = (
+    "đĩa", "dia", "ly", "cốc", "coc", "chai", "hộp", "hop", "cái", "cai", "gói", "goi", "lon", "thùng", "thung",
+    "kg", "bao", "cây", "cay", "viên", "vien", "vỉ", "vi",
+)
+# How-many words that come before a count unit or a money word, such as "how many" or "how much".
+HOW_MANY_WORDS = ("bao nhiêu", "bao nhieu", "bnhiu", "mấy", "may")
+# Money words: after how-many they ask for money (revenue), never for a quantity.
+MONEY_ASK_WORDS = ("tiền", "tien", "doanh thu", "dthu")
+# Cancel wording for prompts. Each form matches CANCEL_TOKENS after lookup normalization, which drops diacritics.
+CANCEL_WORDS = ("huỷ", "hủy", "huy", "cancel")
+# Words for a sale and for an order, used in the prompt examples.
+SALE_WORDS = ("bán", "ban")
+ORDER_WORDS = ("đơn", "don", "đơn hàng", "don hang")
+# Group words. They are the only reason to add a product_group or customer_group filter.
+PRODUCT_GROUP_WORDS = ("nhóm hàng", "nhom hang", "danh mục", "danh muc", "loại hàng", "loai hang")
+CUSTOMER_GROUP_WORDS = ("nhóm khách", "nhom khach", "loại khách", "loai khach", "phân loại khách", "phan loai khach")
+# Average words. With a money word and a per-order phrase they ask for the average revenue of one order.
+AVERAGE_WORDS = ("bình quân", "binh quan", "trung bình", "trung binh")
+# Per-order phrases. They name one order, so an average over them is revenue per order.
+PER_ORDER_WORDS = ("mỗi đơn", "moi don", "một đơn", "mot don")
+# Import price words. With an average word they ask for the average import price of one unit.
+IMPORT_PRICE_WORDS = ("giá nhập", "gia nhap")

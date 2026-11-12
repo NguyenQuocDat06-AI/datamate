@@ -1,0 +1,132 @@
+"""Domain vocabulary of the data layer.
+
+This is the only module in bizreason/data/ that may hold Vietnamese or English domain words: generic header
+synonyms, note and summary labels, status words, currency/date/phone words. Entries are generic. A particular
+dataset's file, sheet, table or shop column names do not belong here; tests/test_no_dataset_literals.py checks
+every other module of the data layer for them.
+"""
+
+from __future__ import annotations
+
+# Canonical role -> "|"-separated header labels (normalized by the consumer).
+ALIASES = {
+    "order_id": "mã đơn hàng|mã đơn|madon|madonhang|order_id|order id|số đơn|mahd",
+    "ordered_at": "ngày đặt hàng|ngày đặt|ngày bán|ngaydat|ngayban|ngày giờ|ngaygio|order_date|ordered_at",
+    "status": "trạng thái đơn hàng|trạng thái đơn|trạng thái|trangthai|trangthaidon|status",
+    "customer_id": "mã khách hàng|mã khách|makh|makhach|makhachhang|customer_id",
+    "customer_name": "tên khách hàng|tên khách|khách hàng|tenkh|tenkhach|tenkhachhang|customer_name",
+    "product_id": "mã sản phẩm|mã hàng|mã sku|masp|mahang|masku|sku|product_id",
+    "product_name": "tên sản phẩm|tên hàng|tên thuốc|tensp|tenhang|tenthuoc|product_name",
+    "qty_sale": "số lượng sản phẩm|số lượng|soluong|sl|qty_sale|quantity",
+    "qty_base": "số lượng cơ bản|số lượng quy đổi|slquydoi|soluongquydoi|qty_base",
+    "unit": "đơn vị tính|đơn vị|dvt|donvi|donvitinh|unit",
+    "line_amount": "thành tiền|thanhtien|trigia|trị giá|line_amount|line_net_vnd",
+    "unit_price": "giá sản phẩm|đơn giá|giá bán|dongia|giaban|giabanle|unit_price",
+    "cost_sale": "giá vốn lúc bán|giá vốn|giavonlucban|giavon|cost_per_sale_unit_vnd|cost_sale",
+    "total_due": "tổng thanh toán|tongthanhtoan|tổng phải trả|total_due",
+    "paid_amount": "số tiền thu|sotienthu|số tiền trả|số tiền thanh toán|paid_amount|amount_paid",
+    "paid_at": "ngày thu|ngày trả|ngày thanh toán|ngaythu|ngaytra|ngaythanhtoan|paid_at",
+    "payment_method": "hình thức thanh toán|phương thức thanh toán|hinhthucthanhtoan|phuongthuctt|payment_method",
+    "conversion_factor": "tỉ lệ quy đổi|tỷ lệ quy đổi|hệ số quy đổi|heso|tylequydoi|tilequydoi|conversion_factor",
+    "conversion_unit": "đơn vị quy đổi|donviquydoi|conversion_unit",
+    "base_unit": "đơn vị cơ bản|donvicoban|base_unit",
+    "product_category": "loại sản phẩm|nhóm hàng|loaisp|nhomhang|product_category",
+    "purchase_id": "mã đơn nhập|mã phiếu nhập|maphieunhap|madonnhap|purchase_id",
+    "purchased_at": "ngày nhập|ngaynhap|purchased_at",
+    "supplier_id": "mã nhà cung cấp|mancc|manhacungcap|supplier_id",
+    "batch_id": "mã lô|số lô|malo|solo|batch_id",
+    "expires_at": "hạn sử dụng|hạn dùng|hansudung|handung|expires_at",
+    "inventory_qty": "tồn cuối|toncuoi|tồn kho|tonkho|inventory_qty",
+    "event_at": "ngày phát sinh|ngayphatsinh|ngày chứng từ|ngaychungtu|event_at",
+    "expense_amount": "tiền chi|expense_amount",
+    "order_revenue": "order_revenue|merchandise_total",
+    "due_at": "ngày phải trả|hạn thanh toán|due_at|due_date",
+    "qty_returned": "số lượng trả|qty_returned",
+}
+
+# Further generic labels seen in common export layouts. Applied after ALIASES, in this order.
+HEADER_SYNONYMS = {
+    "scope": "store_id|scope",
+    "order_id": "Mã chứng từ|Số HĐ",
+    "product_id": "ID SP",
+    "qty_base": "SL quy đổi",
+    "unit_price": "Giá đơn vị",
+    "paid_at": "Thời gian thu",
+    "payment_method": "Phương thức TT",
+    "sales_channel": "Bán qua|sales_channel",
+}
+HEADER_SYNONYMS_EXTRA = {
+    "order_id": "Đơn số|HĐ|Bill",
+    "ordered_at": "Giờ tạo đơn|Giờ bán|Ngày HĐ|Ngày xuất",
+    "status": "Trạng thái giao|Trạng thái xử lý|Tiến độ|TT đơn",
+    "product_id": "Barcode|Mã H.hóa|Mã H.hoá|Mã H.hoa|Mã h.hóa|Ma hang|Mã hàng hóa",
+    "product_name": "Hàng hóa|Hàng hoá|Hàng bán|Mặt hàng|Tên hàng hóa",
+    "qty_sale": "S.L|SL bán|SLg|Sluong",
+    "qty_base": "SL (ĐV cơ bản)|SL lẻ|Số lượng lẻ",
+    "unit": "ĐV|Đơn vị (tính)",
+    "customer_name": "Khách hàng (tên)|Khách|Họ tên khách",
+    "line_amount": "Thành tiền (đ)|Amount",
+    "unit_price": "Đơn giá (đ)|Giá 1 đv",
+    "qty_returned": "Số lượng trả",
+}
+
+# Status words: normalized alias -> canonical status (base), then labelled phrases with Vietnamese marks.
+STATUS_BASE = {
+    "hoan thanh": "completed",
+    "da hoan thanh": "completed",
+    "completed": "completed",
+    "da giao": "completed",
+    "xong": "completed",
+    "hoan tat": "completed",
+    "huy": "cancelled",
+    "da huy": "cancelled",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "tra hang": "returned",
+    "da tra": "returned",
+    "returned": "returned",
+    "da hoan hang": "returned",
+    "dang giao": "shipping",
+    "dang giao hang": "shipping",
+    "shipping": "shipping",
+    "dang giao dich": "shipping",
+}
+STATUS_SYNONYMS = {
+    "completed": "Thành công|đã lấy|đã xong|ok|received|success|done|đã giao hàng",
+    "cancelled": "Huỷ đơn|Đã hủy đơn|khách hủy|Không giao được|cancel|void",
+    "returned": "Đổi trả|Đã trả hàng|Khách trả|Hoàn trả|hàng trả về|trả lại|return|refunded",
+    "shipping": "Đang vận chuyển|đang ship|in transit|đang chuyển|Đang xử lý|đang gửi|Chờ giao",
+}
+
+# Note rows and the header that marks a note column.
+NOTE_PREFIX_RE = r"^\s*(?:ghi chú|ghi chu|note|notes)\s*:"
+NOTE_HEADER = "ghi chu"
+
+# Currency and unit words, as regular expressions over lower-cased text.
+CURRENCY_SUFFIX_RE = r"(?:vnd|vnđ|đ|₫)$"
+CURRENCY_STRIP_RE = r"\s*(?:vnd|vnđ|đ|₫)$"
+CURRENCY_OR_PERCENT_STRIP_RE = r"\s*(?:vnd|vnđ|đ|₫|%)$"
+CURRENCY_ANCHOR_RE = r"(?:k|tr|triệu|trieu|vnd|vnđ|đ|₫)$"
+CURRENCY_PARENTHESIS_RE = r"\s*\((?:đ|₫|vnd|vnđ)\)\s*$"
+MILLION_DECIMAL_RE = r"([+-]?\d+(?:[.,]\d+)?)\s*(?:tr|triệu|trieu)"
+MILLION_RE = r"([+-]?\d+)\s*(?:tr|triệu|trieu)\s*(\d{3})?k?"
+
+# Vietnamese day/month phrases.
+VIETNAMESE_DATE_RE = (
+    r"^\s*(?:ngày\s+|ngay\s+)?(\d{1,2})\s*(?:thg|tháng|thang)\.?\s*(\d{1,2})"
+    r"(?:\s*,?\s*(?:năm|nam)?\s*(\d{4}))(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?\s*$"
+)
+
+# Declared coverage of an export, stated in its readme.
+DECLARED_END_RE = r"(?:đến hết|tới hết|đến ngày)\s+(\d{1,2}/\d{1,2}/\d{4})"
+DECLARED_START_RE = r"dữ liệu có từ\s+(\d{1,2}/\d{1,2}/\d{4})"
+
+# Readme hint that a sheet holds one independent ledger event per row.
+INDEPENDENT_ROW_HINT = "mỗi dòng"
+
+# Cancellation is marked by a tone mark; without one a word is usually a name.
+CANCEL_TONE_MARKS = ("hủy", "huỷ")
+
+# Phone-number labels and walk-in (retail) customer names.
+PHONE_LABEL_RE = r"(?:sdt|sđt|tel|phone)"
+RETAIL_CUSTOMER_NAMES = {"lẻ", "khách lẻ", "khách vãng lai", "vãng lai"}
