@@ -23,8 +23,8 @@ Quy trình: `GOAL_LOOP_A.md`. Kế hoạch: `FABLE_REVIEW.md`.
 - [x] 4. Phép đo 2: nhiễu câu hỏi
 - [x] 5. Phép đo 3: nhiễu dữ liệu, dùng bộ toán tử Auto-Tables làm bộ sinh nhiễu (FABLE_RESEARCH việc 11)
 - [x] 6. Phép đo 4: bỏ một ngành (số nền theo ngành; phép ẩn thật làm sau A3)
-- [ ] 7. So model: bản fine-tune SQL hiện tại với `gemma-4-12B-it` bản QAT chính thức (GGUF Q4_0 / W4A16, Apache-2.0); kết quả quyết định luôn cách phục vụ (FABLE_RESEARCH việc 2)
-- [ ] 8. Chốt số nền (điểm kiểm soát 1)
+- [x] 7. So model: bản fine-tune SQL hiện tại với `gemma-4-12B-it` bản QAT chính thức (GGUF Q4_0 / W4A16, Apache-2.0); kết quả quyết định luôn cách phục vụ (FABLE_RESEARCH việc 2)
+- [x] 8. Chốt số nền (điểm kiểm soát 1)
 
 ## Lần thức 1 (05:35): mục 1, tính tất định
 
@@ -396,3 +396,55 @@ Quy trình: `GOAL_LOOP_A.md`. Kế hoạch: `FABLE_REVIEW.md`.
 - 12/11 04:34: câu hỏi cho người dùng chờ vài giờ mới có trả lời. Trong lúc đó cả phiên bản 1 và 2 đã tự tắt theo đồng hồ 11 giờ 50 phút, cả hai địa chỉ đều chết. `gen_after_v1_stop.py` đang push máy chủ model gốc (`server_base`) lên tài khoản 1, lần này chỉ có một phiên.
 - **Hạn mức tài khoản 1:** ước tính đã dùng khoảng 23–24/30 giờ. Còn khoảng 6 giờ đến lần làm mới 14/11 00:00 UTC. Mục 7 tốn khoảng 1,5 giờ, sau đó chỉ còn khoảng 4,5 giờ cho phần còn lại của tuần. Cần ưu tiên: sau mục 7, chạy lại phép đo 1 một lần với cấu hình chốt rồi dừng.
 - 04:41: máy chủ model gốc (phiên bản 3, tài khoản 1) online, chỉ một phiên. Bắt đầu mục 7: chạy `perturb_q500` (1550 câu) với model gốc, dùng lại bảng và chú thích của `train_full_2`, vào `q500_base/`. Như vậy phép so chỉ đo phần hiểu câu hỏi.
+- 05:05: theo yêu cầu người dùng, đã tạo repo **riêng tư** https://github.com/NguyenQuocDat06-AI/datamate và push 6 nhánh: `main`, `arch/semantic-layer`, `arch/structural-ingestion`, `arch/data-operators`, `arch/rulebook-ir`, `docs/review-notes`.
+  - `docs/review-notes` (commit `900e54a`, worktree `/home/ubuntu/agy-worktrees/docs`): tài liệu review, nhật ký 2 vòng lặp, script đo, máy chủ đã che giá trị bí mật, kèm README.
+  - Kiểm tra trước khi push:
+    - Quét toàn bộ lịch sử git với 11 giá trị bí mật: không có khóa thật. Hai kết quả khớp chỉ là tên model công khai.
+    - Tên người dùng Kaggle trong `kernel-metadata.json` đã thay bằng `<kaggle-username>`.
+  - Không đưa lên: dữ liệu đề, đáp án, bản ghi kết quả, bảng SQLite, `.env`, `connection_config.json`, địa chỉ máy chủ.
+  - Từ nay commit trên nhánh làm việc có thể push lên `origin`, vì người dùng đã yêu cầu.
+
+## Lần thức 20 (06:20): mục 7 (so model) và **mục 8: chốt số nền, điểm kiểm soát 1**
+
+### Mục 7
+
+Chạy `perturb_q500` (1550 câu), dùng lại bảng và chú thích do bản fine-tune tạo ra, nên chỉ so phần hiểu câu hỏi. Cả hai máy chủ đều gom lô, cache prefix, NF4.
+
+| | Bản fine-tune SQL | `google/gemma-4-12B-it` |
+|---|---|---|
+| PA câu gốc (500) | 0,858 | **0,878** |
+| Giữ nguyên chung | 0,917 | **0,930** |
+| Viết tắt: giữ nguyên / PA | 0,912 / 0,792 | **0,942 / 0,830** |
+| Bỏ dấu: giữ nguyên / PA | 0,900 / 0,773 | 0,897 / 0,776 |
+| Đổi chỗ: giữ nguyên / PA | 0,971 / 0,901 | 0,971 / 0,912 |
+
+- Trên 1494 câu đã so cặp: 43 câu tốt lên, 21 câu xấu đi. Số câu sai giảm từ 60 xuống 56.
+- Mức tăng PA là +2,0 điểm, chưa đạt ngưỡng +3 của quy tắc. Độ bất biến có tăng. **Theo quy tắc, chưa đổi model.**
+- Lợi thế khác của model gốc: giấy phép Apache-2.0 rõ ràng (bản fine-tune ghi "TODO"), và có sẵn bản QAT chính thức.
+- Muốn quyết định đầy đủ phải chạy phép đo 1 với model gốc chú thích lại bảng: khoảng 3,2 giờ GPU.
+
+### Bảng số nền (code `7f02100`, máy chủ v2, tắt alias)
+
+| Phép đo | Kết quả |
+|---|---|
+| 1. Train-full chạy mới (3000 câu, 30 shop) | PA **0,842** [0,813; 0,871]. Ước tính khoảng 0,854 nếu tính trả lời dạng bảng. Thời gian thật 3,16 giờ |
+| Tính tất định (277 câu chạy lại, cùng máy chủ) | 0 câu khác |
+| 2. Nhiễu câu hỏi (500 câu gốc và 1050 biến thể) | Giữ nguyên 0,917. Viết tắt và bỏ dấu làm PA giảm 7–8 điểm |
+| 3. Nhiễu dữ liệu (5 phép biến đổi × 2 shop) | Giữ nguyên 0,980. Riêng tách sheet theo tháng: 0,931, có 10 câu thành sai (danh mục khách rải nhiều sheet) |
+| 4. Theo ngành | Cà phê 0,836; Nhà thuốc 0,798; Vật liệu xây dựng 0,882; không có ngành 0,848. Ba ngành chỉ có ở public thì không có shop train nào |
+| Public 102 câu (bộ đo cũ, chỉ theo dõi) | 0,706 có alias, 0,725 tắt alias |
+
+### Commit trên `arch/rulebook-ir` (đã push lên `origin`)
+
+`cdd3a03` (lỗi model không âm thầm thay mặc định), `7979eaf` (`run_v2`), `0227155` (song song và chú thích vững), `7f02100` (trả lời dạng bảng).
+
+### Hạn mức GPU
+
+Tài khoản 1 còn khoảng 4–4,5 giờ đến lần làm mới 14/11 00:00 UTC. Tài khoản 0 và tài khoản trong `~/.kaggle` đã hết.
+
+### Quyết định cần người dùng
+
+1. **Model:** chạy phép đo 1 với model gốc (khoảng 3,2 giờ, gần hết hạn mức còn lại), hay giữ bản fine-tune?
+2. **Thứ tự sau điểm kiểm soát:**
+   - A1, IR tổ hợp, việc lớn;
+   - hoặc trước hết các việc nhanh đã thấy lợi ích: nối giá trị hai bước, hồ sơ cột, tồn kho (43 câu), gom danh mục rải nhiều sheet, giảm thời gian gom giá trị (4823 giây).
