@@ -325,3 +325,23 @@ def test_intraday_shift_does_not_create_spurious_temporal_comparison(
     assert len(w) == 1
     assert w[0].role == "target"
     assert (w[0].start.isoformat(), w[0].end_exclusive.isoformat()) == ("2026-01-01", "2026-02-01")
+
+
+@pytest.mark.parametrize("question", [
+    "doanh thu tet nam nay so voi tet nam truoc thay doi may phan tram",
+    "Doanh thu dịp Tết năm nay thay đổi bao nhiêu % so với dịp Tết năm ngoái?",
+])
+def test_tet_this_year_vs_last_year(resolver: TemporalResolver, question: str):
+    target, comparison = resolver.resolve(question, date(2026, 8, 8))
+    assert (target.start.isoformat(), target.end_exclusive.isoformat()) == ("2026-02-10", "2026-02-27")
+    assert (comparison.start.isoformat(), comparison.end_exclusive.isoformat()) == ("2025-01-22", "2025-02-08")
+
+
+@pytest.mark.parametrize("question", [
+    "Tính từ ngày 1/1 đến hết hôm nay, doanh thu năm nay là bao nhiêu?",
+    "tinh tu ngay 1/1 den het hnay, dthu nam nay la bn",
+    "từ 1/1 tới hôm nay bán được bao nhiêu",
+])
+def test_from_day_month_through_today(resolver: TemporalResolver, question: str):
+    (window,) = resolver.resolve(question, date(2026, 6, 18))
+    assert (window.start.isoformat(), window.end_exclusive.isoformat()) == ("2026-01-01", "2026-06-19")

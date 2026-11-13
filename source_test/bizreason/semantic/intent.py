@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from bizreason.data.vocabulary import QUESTION_NUMBER_SCALES
 from bizreason.llm import LanguageModel, ModelError
 from bizreason.semantic.compiler import Intent
 from bizreason.semantic.vocabulary import (
@@ -472,6 +473,45 @@ def _threshold(value: Any) -> dict[str, Any] | None:
     return {"subject": subject, "metric": metric, "op": op, "value": number}
 
 
+_QUESTION_NUMBER = re.compile(r"\d[\d.,]*")
+_SCALE_WORD = re.compile(r"\s*([^\W\d_]+)")
+_THRESHOLD_VALUE_HINT = (
+    'Your previous reply had a "threshold" value that is not a number written in the question; copy the number '
+    "exactly as the question states it (with its thousands, millions or billions)."
+)
+
+
+def question_numbers(question: str) -> set[float]:
+    """Every number the question writes, read with "." or "," as a thousands or a decimal separator, and also
+    scaled by a scale word written right after it ("8tr", "7,5 triệu", "500k")."""
+    found: set[float] = set()
+    for match in _QUESTION_NUMBER.finditer(question):
+        token = match.group().rstrip(".,")
+        readings = {token.replace(".", "").replace(",", ""), token.replace(".", "").replace(",", "."),
+                    token.replace(",", "")}
+        word = _SCALE_WORD.match(question, match.end())
+        scale = QUESTION_NUMBER_SCALES.get(word.group(1).lower()) if word else None
+        for reading in readings:
+            try:
+                value = float(reading)
+            except ValueError:
+                continue
+            found.add(value)
+            if scale:
+                found.add(round(value * scale, 6))
+    return found
+
+
+def threshold_grounded(intent: Intent, question: str) -> bool:
+    """False when the intent has a threshold whose value is not a number the question writes in digits.
+
+    A question with no digits at all may state its number in words, so it is not checked."""
+    value = (intent.threshold or {}).get("value")
+    if value is None or not any(ch.isdigit() for ch in question):
+        return True
+    return float(value) in question_numbers(question)
+
+
 def _top_k(value: Any) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
@@ -558,6 +598,7 @@ class IntentParser:
         profile: str = "default",
         examples: Callable[[str, str | None, str | None], str] | None = None,
         reasoning: bool = False,
+        definitions: Callable[[str], str] | None = None,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -573,6 +614,8 @@ class IntentParser:
             self.system = self.system + "\n\n" + REASONING_ADDENDUM
         # examples(question, question_id, business_id) returns a block of worked examples, or "" for none.
         self.examples = examples
+        # definitions(question) returns the rulebook definitions of terms the question uses, or "" for none.
+        self.definitions = definitions
 
     def parse(self, question: str, choices: dict[str, list[str]] | None = None, *,
               question_id: str | None = None, business_id: str | None = None) -> ParsedIntent:
@@ -581,6 +624,10 @@ class IntentParser:
             block = self.examples(question, question_id, business_id)
             if block:
                 base_prompt = base_prompt + "\n\n" + block
+        if self.definitions is not None:
+            defined = self.definitions(question)
+            if defined:
+                base_prompt = base_prompt + "\n\n" + defined
         section = _choices_section(choices)
         suffix = "\n\n" + section if section else ""
         prompt = base_prompt + suffix
@@ -605,6 +652,43 @@ class IntentParser:
                     reason = exc.reason
                     hint = exc.hint
                 else:
-                    return ParsedIntent(intent=intent, reason="", attempts=attempts, raw=raw)
+                    if threshold_grounded(intent, question):
+                        return ParsedIntent(intent=intent, reason="", attempts=attempts, raw=raw)
+                    # A threshold the question does not state would count a different population: retry, then
+                    # give up rather than answer with it.
+                    reason = "threshold value not stated in the question"
+                    hint = _THRESHOLD_VALUE_HINT
             prompt = base_prompt + " " + hint + suffix
         return ParsedIntent(intent=None, reason=reason, attempts=attempts, raw=raw)
+
+
+def intent_key(intent: Intent) -> tuple:
+    """What an intent asks, for comparing two parses: every field, filters as a set of normalized values."""
+    from bizreason.utils import normalize_lookup
+    filters = tuple(sorted(
+        (str(item.get("dim")), normalize_lookup(str(item.get("value", ""))), bool(item.get("exclude")))
+        for item in intent.filters
+    ))
+    threshold = tuple(sorted((intent.threshold or {}).items()))
+    return (intent.measure, intent.measure2, intent.shape, intent.group_by, filters, intent.top_k,
+            intent.compare_as, threshold, intent.age_days, intent.location)
+
+
+class ConsensusParser:
+    """Two parsers that read the question with different examples; when they disagree the question is not
+    understood with confidence, so no intent is returned and the solver abstains (a wrong answer costs a point)."""
+
+    def __init__(self, first: "IntentParser", second: "IntentParser"):
+        self.first, self.second = first, second
+
+    def parse(self, question: str, choices: dict[str, list[str]] | None = None, **kwargs) -> ParsedIntent:
+        a = self.first.parse(question, choices, **kwargs)
+        if a.intent is None:
+            return a
+        b = self.second.parse(question, choices, **kwargs)
+        attempts = a.attempts + b.attempts
+        if b.intent is None:
+            return ParsedIntent(intent=None, reason=f"second parse failed: {b.reason}", attempts=attempts, raw=a.raw)
+        if intent_key(a.intent) != intent_key(b.intent):
+            return ParsedIntent(intent=None, reason="parses disagree", attempts=attempts, raw=a.raw)
+        return a

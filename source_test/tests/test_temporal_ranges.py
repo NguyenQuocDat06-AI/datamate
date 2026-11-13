@@ -161,3 +161,63 @@ def test_month_with_last_year_word_is_previous_calendar_year_without_comparison(
     assert _spans(resolver.resolve("Doanh thu tháng 3 năm ngoái bao nhiêu?", date(2026, 11, 10))) == [
         ("target", "2025-03-01", "2025-04-01")
     ]
+
+
+def test_telex_leftovers_are_read_as_plain_words():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver, _untelex
+    assert _untelex("thang 9 nawm 2025") == "thang 9 nam 2025"
+    assert _untelex("thangs 6 quys 3 gaanf") == "thang 6 quy 3 gan"
+    assert _untelex("tuan nay vs tuan truoc ss") == "tuan nay vs tuan truoc ss"
+    (window,) = _Resolver().resolve("lời gộp tháng 9 nawm 2025", _date(2026, 6, 1))
+    assert (window.start.isoformat(), window.end_exclusive.isoformat()) == ("2025-09-01", "2025-10-01")
+
+
+def test_counted_days_from_an_event_use_the_single_date_named():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver
+    target, comparison = _Resolver().resolve(
+        "X lên giá từ ngày 28/07/2025; so 7 ngày kể từ ngày tăng giá với 7 ngày ngay trước", _date(2026, 6, 1))
+    assert (target.start.isoformat(), target.end_exclusive.isoformat()) == ("2025-07-28", "2025-08-04")
+    assert (comparison.start.isoformat(), comparison.end_exclusive.isoformat()) == ("2025-07-21", "2025-07-28")
+
+
+def test_counted_days_from_an_event_without_a_date_do_not_invent_one():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver
+    assert _Resolver().resolve("X tăng giá: so 7 ngày kể từ ngày tăng với 7 ngày ngay trước", _date(2026, 6, 1)) == []
+
+
+def test_hoom_qua_is_yesterday():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver
+    (window,) = _Resolver().resolve("hoom qua bán được bao nhiêu", _date(2026, 6, 1))
+    assert window.start.isoformat() == "2026-05-31"
+
+
+def test_short_month_prefix_in_a_span_of_months():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver
+    starts = [w.start.isoformat() for w in _Resolver().resolve_periods("dthu 3 tháng liền từ T4/2025 tới T6/2025",
+                                                                         _date(2026, 6, 1))]
+    assert starts == ["2025-04-01", "2025-05-01", "2025-06-01"]
+
+
+def test_q_prefix_is_a_quarter():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver
+    (window,) = _Resolver().resolve("Q1/2026 tiệm có bao nhiêu đơn", _date(2026, 6, 15))
+    assert (window.start.isoformat(), window.end_exclusive.isoformat()) == ("2026-01-01", "2026-04-01")
+
+
+def test_dialect_month_words_and_days_ahead():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver
+    r = _Resolver()
+    as_of = _date(2026, 6, 15)
+    span = lambda q: [(w.start.isoformat(), w.end_exclusive.isoformat()) for w in r.resolve(q, as_of)]
+    assert span("Bữa ni tiệm bán được bao nhiêu") == [("2026-06-15", "2026-06-16")]
+    assert span("Tháng ba quán có bao nhiêu đơn huỷ") == [("2026-03-01", "2026-04-01")]
+    assert span("tháng năm 2025 doanh thu") == [("2025-05-01", "2025-06-01")]
+    assert span("lô hết hạn trong 90 ngày tới") == [("2026-06-15", "2026-09-14")]
+    assert ("2026-05-01", "2026-06-01") not in span("so với cùng tháng năm trước, doanh thu tháng 4/2026")

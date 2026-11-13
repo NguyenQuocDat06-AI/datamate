@@ -126,3 +126,19 @@ These are assumptions, not facts. Each one needs confirming before the exam.
   `connection.json` (mode 600, deleted at the end). The server never prints it.
 - **Proxy.** The run sets `NO_PROXY=127.0.0.1,localhost` for its children. If the exam machine has an HTTP proxy
   configured for other purposes, this is needed for the loopback calls to work.
+
+## Final configuration (13/11)
+
+`run_submission.py` with `--fewshot-bank <fewshot_bank_v5.jsonl>` and the defaults of `run_v2`:
+
+| Option | Value | Why |
+|---|---|---|
+| `--rule-terms` | on | ranking terms are translated from the test set's own rulebook at start (one model call, cached) |
+| `--rulebook-definitions` | on | rulebook rows for ranking and industry terms the question uses are shown to the parser |
+| `--fewshot-k` | 4 | retrieved examples; held-out public +4 points over none |
+| `--consensus` | off | measured: fewer wrong answers but more lost correct ones, and 1.5x slower |
+| `--sql-fallback` | off | measured: two SQL readings agreed on wrong answers |
+| `--reasoning` | off | measured: slower and lower |
+
+Measured with code 0ad37de: train 3000 PA 0.959 (c23d215), public 1000 PA 0.752
+(dev shops 0.809, held-out shops 0.619). Offline package on Kaggle T4x2: 3000 questions in 4.4 h, 1000 in 1.6 h.

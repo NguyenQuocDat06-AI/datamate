@@ -92,7 +92,7 @@ def test_defaults_are_todays_constants_written_out() -> None:
     }
     assert DEFAULTS.shift_baseline == "sang"
     assert DEFAULTS.shift_afternoon == "chieu"
-    assert DEFAULTS.walk_in_names == ("khach le", "khach vang lai")
+    assert DEFAULTS.walk_in_names == ("khach le", "khach vang lai", "le", "kl", "khachle", "vang lai")
     assert DEFAULTS.service_fee_names == ("phi phuc vu",)
     assert DEFAULTS.debt_method_tokens == ("ghi no", "debt")
     assert DEFAULTS.non_debt_method_tokens == ("cod", "giao hang thu tien", "san", "marketplace", "tmdt")
@@ -159,7 +159,7 @@ def test_null_field_falls_back_to_default_and_is_not_taken() -> None:
 
 def test_extra_walk_in_name_is_normalized_and_quotes_are_removed() -> None:
     params, _ = rp.extract_rulebook_params(RULEBOOK_TEXT, FakeModel(reply(walk_in_names=["Khách' lẻ", "Khách vãng lai"])))
-    assert params.walk_in_names == ("khach le", "khach vang lai")
+    assert params.walk_in_names == DEFAULTS.walk_in_names  # both stated names are defaults already
 
 
 @pytest.mark.parametrize(

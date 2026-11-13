@@ -130,3 +130,18 @@ CANCEL_TONE_MARKS = ("hủy", "huỷ")
 # Phone-number labels and walk-in (retail) customer names.
 PHONE_LABEL_RE = r"(?:sdt|sđt|tel|phone)"
 RETAIL_CUSTOMER_NAMES = {"lẻ", "khách lẻ", "khách vãng lai", "vãng lai"}
+
+# Words written right after a number in a question that scale it ("8tr", "7,5 triệu", "500k", "2 tỷ").
+QUESTION_NUMBER_SCALES = {
+    "tr": 1_000_000, "triệu": 1_000_000, "trieu": 1_000_000, "củ": 1_000_000,
+    "k": 1_000, "nghìn": 1_000, "nghin": 1_000, "ngàn": 1_000, "ngan": 1_000,
+    "tỷ": 1_000_000_000, "tỉ": 1_000_000_000, "ty": 1_000_000_000,
+}
+
+# Debt age buckets written in a question ("0–7 ngày, 8–15 ngày, trên 15 ngày"), after normalize_lookup.
+AGE_BUCKET_WORD = r"tuoi no"
+AGE_OPEN_BUCKET_WORDS = r"(?:tren|hon|qua|sau)"
+
+# A price rise named by its new price ("lên giá 97.500đ", "tăng giá lên 3.200đ"), after normalize_lookup keeps the
+# digits; and the words around the counted days of a price-rise comparison.
+PRICE_RISE_RE = r"(?:len gia|gia len|tang gia len|tang gia|len)\s+(\d[\d ]*?)\s*(?:d|dong|vnd)\b"

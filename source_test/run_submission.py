@@ -204,7 +204,8 @@ def write_connection_file(path: Path, model_name: str, token: str) -> None:
 
 
 def build_run_v2_argv(*, data: Path, out: Path, connection: Path, base_url: str, budget_seconds: float,
-                      workers: int, fewshot_bank: Path | None, reasoning: str = "off") -> list[str]:
+                      workers: int, fewshot_bank: Path | None, reasoning: str = "off",
+                      traces: bool = False) -> list[str]:
     argv = [
         "--data", str(data),
         "--out", str(out),
@@ -220,6 +221,8 @@ def build_run_v2_argv(*, data: Path, out: Path, connection: Path, base_url: str,
         argv += ["--fewshot-bank", str(fewshot_bank)]
     if reasoning == "on":
         argv += ["--reasoning", "on"]
+    if traces:
+        argv += ["--traces"]
     return argv
 
 
@@ -287,7 +290,7 @@ def run_model_and_pipeline(args: argparse.Namespace, data: Path, out: Path, t_st
         argv = build_run_v2_argv(
             data=data, out=out, connection=connection, base_url=f"http://127.0.0.1:{args.port}/v1",
             budget_seconds=budget, workers=args.workers, fewshot_bank=args.fewshot_bank,
-            reasoning=args.reasoning,
+            reasoning=args.reasoning, traces=args.traces,
         )
         hard_timeout = (t_start + args.total_seconds - EXIT_MARGIN_SECONDS) - time.monotonic()
         log(f"running the pipeline: budget {budget:.0f}s, {args.workers} question threads")
@@ -328,6 +331,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--model-dir", required=True, type=Path, help="local checkpoint directory (no download)")
     p.add_argument("--out", required=True, type=Path, help="working directory for caches, checkpoints and logs")
     p.add_argument("--submission", required=True, type=Path, help="where the submission file is written")
+    p.add_argument("--traces", action="store_true", help="pass --traces to run_v2 (per-question intents in traces.jsonl)")
     p.add_argument("--reasoning", choices=("off", "on"), default="off",
                    help="pass --reasoning on to run_v2 (short analysis before each intent)")
     p.add_argument("--fewshot-bank", type=Path, default=None, help="few-shot bank jsonl (optional)")

@@ -154,8 +154,11 @@ class FewShotBank:
                 chosen.append(position)
         return [dict(self._rows[position]) for position in chosen]
 
-    def provider(self, k: int = 4) -> Callable[[str, str | None, str | None], str]:
-        """An examples provider for IntentParser: (question, question_id, business_id) -> formatted block."""
+    def provider(self, k: int = 4, alternate: bool = False) -> Callable[[str, str | None, str | None], str]:
+        """An examples provider for IntentParser: (question, question_id, business_id) -> formatted block.
+
+        alternate: the next k examples after the k most similar ones (a second, independent view of the question
+        for a consensus check); when fewer than k more exist, the first k in reverse order."""
         if k < 1:
             raise ValueError("k must be at least 1")
 
@@ -163,7 +166,11 @@ class FewShotBank:
             if business_id is None:
                 raise ValueError("few-shot retrieval needs the question's business_id")
             exclude = (question_id,) if question_id else ()
-            return format_examples(self.select(question, business_id, k=k, exclude_ids=exclude))
+            if not alternate:
+                return format_examples(self.select(question, business_id, k=k, exclude_ids=exclude))
+            wider = self.select(question, business_id, k=2 * k, exclude_ids=exclude)
+            chosen = wider[k:] if len(wider) >= 2 * k else list(reversed(wider[:k]))
+            return format_examples(chosen)
 
         return examples
 

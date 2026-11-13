@@ -14,6 +14,34 @@ from bizreason.semantic import rulebook_params
 from bizreason.utils import normalize_lookup
 
 
+# Month names written in words, accent-free; "muoi mot" and "muoi hai" come before "muoi".
+_MONTH_WORDS = {
+    "gieng": 1, "muoi mot": 11, "muoi hai": 12, "chap": 12, "hai": 2, "ba": 3, "tu": 4, "bon": 4, "nam": 5,
+    "sau": 6, "bay": 7, "tam": 8, "chin": 9, "muoi": 10,
+}
+_TELEX_TOKEN = re.compile(r"[a-z]+")
+_VOWELS = set("aeiouy")
+
+
+def _untelex_word(word: str) -> str:
+    """Undo Telex keystrokes left in an accent-free word ("nawm" -> "nam", "xuaats" -> "xuat").
+
+    Accent-free Vietnamese syllables never contain "w", never end in s/f/r/x/j, and never double a/e/d, so those
+    can only be Telex marks. Words without a vowel ("vs", "ss") are abbreviations and are kept."""
+    if not _VOWELS & set(word):
+        return word
+    stripped = word
+    if len(stripped) > 2 and stripped[-1] in "sfrxj" and stripped[-2] in _VOWELS | set("cmnpthg"):
+        stripped = stripped[:-1]
+    stripped = stripped.replace("w", "")
+    stripped = re.sub(r"([aed])\1", r"\1", stripped)
+    return stripped or word
+
+
+def _untelex(text: str) -> str:
+    return _TELEX_TOKEN.sub(lambda m: _untelex_word(m.group()), text)
+
+
 def next_month(day: date) -> date:
     return date(day.year + (day.month == 12), 1 if day.month == 12 else day.month + 1, 1)
 
@@ -183,14 +211,23 @@ class TemporalResolver:
         self.lunar = lunar
 
     def resolve(self, question: str, as_of: date) -> list[TimeWindow]:
-        raw_text = normalize_lookup(question)
+        raw_text = _untelex(normalize_lookup(question))
         text = re.sub(r"\btrc\b", "truoc", raw_text)
         text = re.sub(r"\bvs\b", "voi", text)
         text = re.sub(r"\b(?:hqua|hom\s+qa|bua\s+qua)\b", "hom qua", text)
         # Informal spellings of "hôm nay" (hnay, hoom nay, bữa nay) and "tháng này" (th nay, thangs nay, tháng ni).
+        text = re.sub(r"\bq([1-4])\b", r"quy \1", text)  # "Q1/2026" is the first quarter
+        text = re.sub(r"\bhoom\s+qua\b", "hom qua", text)
         text = re.sub(r"\b(?:hnay|hoom\s+nay|hum\s+nay|bua\s+nay)\b", "hom nay", text)
         text = re.sub(r"\b(?:thangs?|th)\s+(?:nay|ni)\b", "thang nay", text)
         text = re.sub(r"\bnam\s+ni\b", "nam nay", text)
+        # Central-dialect "ni" for "nay": hôm ni, bữa ni, tuần ni.
+        text = re.sub(r"\b(?:hom|bua)\s+ni\b", "hom nay", text)
+        text = re.sub(r"\btuan\s+ni\b", "tuan nay", text)
+        # A month written in words ("tháng ba", "tháng giêng", "tháng chạp") is that month number.
+        # "tháng năm trước / năm nay" is a month of a year, not May.
+        text = re.sub(rf"\bthang ({"|".join(_MONTH_WORDS)})\b(?! \d{{1,2}}\b)(?! (?:truoc|ngoai|nay|ni|roi|sau|kia|qua|toi)\b)",
+                      lambda m: f"thang {_MONTH_WORDS[m.group(1)]}", text)
         today_end = as_of + timedelta(days=1)
         evidence = ["question", "as_of_date"]
 
@@ -204,7 +241,7 @@ class TemporalResolver:
             return [window(date(as_of.year, 1, 1), today_end)]
 
         # Rulebook §2: "từ D/M tới (hết) hôm nay" = from D/M of as_of's year through today.
-        span = re.search(r"\btu (\d{1,2}) (\d{1,2}) (?:toi|den) (?:het )?hom nay\b", text)
+        span = re.search(r"\btu (?:ngay )?(\d{1,2}) (\d{1,2}) (?:toi|den) (?:het )?(?:ngay )?hom nay\b", text)
         if span:
             return [window(date(as_of.year, int(span.group(2)), int(span.group(1))), today_end)]
 
@@ -227,7 +264,9 @@ class TemporalResolver:
 
     def resolve_periods(self, question: str, as_of: date) -> list[TimeWindow]:
         """Several whole months named or implied by one question, in the order asked."""
-        text = normalize_lookup(question)
+        text = _untelex(normalize_lookup(question))
+        # "T4/2025", "th5/2025": a month written with a short prefix right before its year.
+        text = re.sub(r"\b(?:th|t)(\d{1,2}) (?=\d{4}\b)", r"thang \1 ", text)
         months: list[tuple[int, int]] = []
         for month, year in re.findall(r"(?<![\d/-])(\d{1,2})[/-](\d{4}|\d{2})(?![\d/-])", question):
             value = (int(year) if len(year) == 4 else 2000 + int(year), int(month))
@@ -275,17 +314,22 @@ class TemporalResolver:
     ) -> AnchorPeriod | None:
         # Rulebook §2: "N ngày kể từ ngày D" = D through D+N-1; "so với N ngày ngày trước đó" = the N days before D.
         # The start day is either written in the same phrase, or ("ngày đó") the single full date named elsewhere.
+        # "kể từ ngày <event>" (e.g. the day a price changed) also refers to the single full date named elsewhere.
         counted = re.search(
-            r"\b(\d{1,2}) ngay ke tu (?:ngay )?(?:(\d{1,2}) (\d{1,2}) (20\d{2})|do|nay)\b", text
+            r"\b(\d{1,2}) ngay ke tu (?:ngay )?(?:(\d{1,2}) (\d{1,2}) (20\d{2})|do|nay|[a-z]+)\b", text
         )
+        day_parts: list[tuple[str, str, str]] = []
+        if counted and int(counted.group(1)) > 0 and not counted.group(2):
+            day_parts = list(set(re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})/(20\d{2})(?!\d)", question)))
+            if len(day_parts) != 1:
+                if re.search(r"\bke tu (?:ngay )?(?:do|nay)\b", text):
+                    return None
+                # "kể từ ngày <event>" with no single date to stand for it: other patterns may still apply.
+                counted = None
         if counted and int(counted.group(1)) > 0:
             n = int(counted.group(1))
             if counted.group(2):
                 day_parts = [(counted.group(2), counted.group(3), counted.group(4))]
-            else:
-                day_parts = list(set(re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})/(20\d{2})(?!\d)", question)))
-                if len(day_parts) != 1:
-                    return None
             try:
                 start = date(int(day_parts[0][2]), int(day_parts[0][1]), int(day_parts[0][0]))
             except ValueError:
@@ -310,6 +354,9 @@ class TemporalResolver:
             years = [int(y) for y in re.findall(r"\b(20\d{2})\b", text)]
             if years:
                 lunar_year = years[0]
+            elif "nam nay" in text:
+                # "Tết năm nay so với Tết năm trước": this year's Tết is the target; "năm trước" names the comparison.
+                lunar_year = as_of.year
             elif any(k in text for k in ["nam ngoai", "nam truoc", "nam roi"]):
                 lunar_year = as_of.year - 1
             else:
@@ -527,6 +574,11 @@ class TemporalResolver:
                 Granularity.MONTH,
                 {"month": last.month, "year": last.year},
             )
+
+        # Rulebook §6: "trong N ngày tới" = from today through today + N, both included.
+        ahead = re.search(r"\b(\d{1,4}) ngay toi\b", text)
+        if ahead and int(ahead.group(1)) > 0:
+            return AnchorPeriod(window(as_of, as_of + timedelta(days=int(ahead.group(1)) + 1)), Granularity.RANGE)
 
         # Recent days
         days = re.search(r"(\d+) ngay (?:gan nhat|qua|vua qua)", text)

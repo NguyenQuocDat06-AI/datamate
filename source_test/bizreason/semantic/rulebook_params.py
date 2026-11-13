@@ -141,6 +141,21 @@ def active() -> RulebookParams:
     return _active
 
 
+# The test set's rulebook text after normalize_lookup, or None when no rulebook was given (then no rule that reads it
+# applies). Set with set_rulebook_text before shops are built or questions solved.
+_rulebook_text: str | None = None
+
+
+def set_rulebook_text(text: str | None) -> None:
+    global _rulebook_text
+    from bizreason.utils import normalize_lookup
+    _rulebook_text = None if text is None else f" {normalize_lookup(text)} "
+
+
+def rulebook_text() -> str | None:
+    return _rulebook_text
+
+
 def relevant_rulebook_text(rulebook_text: str) -> str:
     """The rulebook lines that carry a cue word, each under its heading.
 

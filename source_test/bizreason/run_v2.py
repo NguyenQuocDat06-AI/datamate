@@ -35,11 +35,13 @@ from bizreason.formatting import validate_answer
 from bizreason.llm import TrammayClient, endpoint_file_resolver
 from bizreason.semantic.annotator import Annotator, load_or_annotate, load_status_map, load_value_groups
 from bizreason.semantic.fewshot import FewShotBank
-from bizreason.semantic.intent import IntentParser, ParsedIntent
+from bizreason.semantic.intent import ConsensusParser, IntentParser, ParsedIntent
 from bizreason.semantic.layer import annotations_by_signature, build, effective_roles, to_date, to_number
 from bizreason.semantic.solver import SemanticSolver
 from bizreason.temporal import TemporalResolver
 from bizreason.utils import PathPolicy, atomic_json, dumps, file_hash, normalize_lookup, quote_identifier, writable_path
+from bizreason.semantic import definitions as rulebook_definitions
+from bizreason.semantic import rule_terms
 from bizreason.semantic import rulebook_params
 from bizreason.v2_setup import build_v2_context
 
@@ -251,11 +253,13 @@ class _QuestionBoundParser:
 
 
 def make_intent_parser(model: Any, profile: str, examples: Callable[..., str] | None = None,
-                       reasoning: bool = False) -> IntentParser:
+                       reasoning: bool = False, definitions: Callable[[str], str] | None = None) -> IntentParser:
     """IntentParser with the prompt profile, optional few-shot examples and optional short reasoning.
 
     The default profile without examples or reasoning is passed as the old, keyword-free call.
     """
+    if definitions is not None:
+        return IntentParser(model, profile=profile, examples=examples, reasoning=reasoning, definitions=definitions)
     if reasoning:
         try:
             return IntentParser(model, profile=profile, examples=examples, reasoning=True)
@@ -395,6 +399,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="deprecated: same as --aliases off")
     parser.add_argument("--project-shops", type=int, default=DEFAULT_PROJECT_SHOPS)
     parser.add_argument("--project-questions", type=int, default=DEFAULT_PROJECT_QUESTIONS)
+    parser.add_argument("--sql-fallback", choices=("off", "on"), default="off",
+                        help="when the typed intent cannot express a question, answer from two agreeing SQL queries")
+    parser.add_argument("--rule-terms", choices=("off", "on"), default="on",
+                        help="translate the rulebook's ranking terms once and apply them to ranking questions")
+    parser.add_argument("--consensus", choices=("off", "on"), default="off",
+                        help="parse each question twice with different few-shot examples; abstain when they disagree")
+    parser.add_argument("--rulebook-definitions", choices=("off", "on"), default="on",
+                        help="show the intent parser the rulebook definitions of ranking terms the question uses")
     parser.add_argument("--reasoning", choices=("off", "on"), default="off",
                         help="ask the intent model for a short analysis (first JSON key) before the intent")
     parser.add_argument("--prompt-profile", choices=PROMPT_PROFILES, default="default",
@@ -743,6 +755,10 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         "arguments": {key: _plain(value) for key, value in vars(args).items() if not _is_secret_arg(key)},
         "prompt_profile": args.prompt_profile,
         "reasoning": args.reasoning,
+        "rulebook_definitions": args.rulebook_definitions,
+        "consensus": args.consensus,
+        "rule_terms": args.rule_terms,
+        "sql_fallback": args.sql_fallback,
         "fewshot_bank": str(args.fewshot_bank) if fewshot is not None else None,
         "fewshot_bank_sha256": file_hash(args.fewshot_bank) if fewshot is not None else None,
         "fewshot_k": args.fewshot_k if fewshot is not None else None,
@@ -767,6 +783,7 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         intent_client = make_client(
             INTENT_REASONING_MAX_TOKENS if args.reasoning == "on" else INTENT_MAX_TOKENS, INTENT_TIMEOUT)
         _, _rules, temporal = build_v2_context(data, out / "cache")
+        rulebook_params.set_rulebook_text(rulebook.read_text(encoding="utf-8") if rulebook.exists() else None)
         if args.rulebook_params == "on" and rulebook.exists():
             # Business parameters (shifts, walk-in names, fees, debt methods, Tết) come from this test set's own
             # rulebook. Set before any shop build so forked build workers inherit them; defaults when unstated.
@@ -774,10 +791,30 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
                 rulebook, make_client(ANNOTATION_MAX_TOKENS, ANNOTATION_TIMEOUT), out / "rulebook_params.json")
             rulebook_params.set_active(params)
             print(f"rulebook params taken from the rulebook: {taken or 'none (defaults)'}", flush=True)
+        if args.rule_terms == "on" and rulebook.exists():
+            # Ranking terms the rulebook defines, translated once into measure / grouping / minimum orders.
+            terms = rule_terms.load_or_extract(
+                rulebook, make_client(ANNOTATION_MAX_TOKENS, ANNOTATION_TIMEOUT), out / "rule_terms.json")
+            rule_terms.set_active(terms)
+            print(f"rulebook ranking terms translated: {len(terms)}", flush=True)
         gate = multiprocessing.get_context("fork").BoundedSemaphore(args.max_model_concurrency)
         examples = fewshot.provider(args.fewshot_k) if fewshot is not None else None
+        alternate = fewshot.provider(args.fewshot_k, alternate=True) if fewshot is not None else None
+        definitions = (rulebook_definitions.provider(rulebook.read_text(encoding="utf-8"))
+                       if args.rulebook_definitions == "on" and rulebook.exists() else None)
         intent_parser = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile, examples,
-                                           reasoning=args.reasoning == "on")
+                                           reasoning=args.reasoning == "on", definitions=definitions)
+        if args.sql_fallback == "on":
+            from bizreason.semantic.sql_fallback import SqlFallback
+            from bizreason.semantic.solver import set_fallback
+            set_fallback(SqlFallback(GatedModel(make_client(ANNOTATION_MAX_TOKENS, INTENT_TIMEOUT), gate),
+                                     rulebook.read_text(encoding="utf-8") if rulebook.exists() else None))
+        if args.consensus == "on":
+            if alternate is None:
+                raise ValueError("--consensus on needs --fewshot-bank (the second parse reads other examples)")
+            second = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile, alternate,
+                                        reasoning=args.reasoning == "on", definitions=definitions)
+            intent_parser = ConsensusParser(intent_parser, second)
         deadline = t0 + args.total_seconds - BUDGET_MARGIN_SECONDS
 
         pending = [question for question in questions if question.id not in checkpoint.lines]

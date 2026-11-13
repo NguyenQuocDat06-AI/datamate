@@ -1054,3 +1054,66 @@ def test_reasoning_off_sends_the_plain_profile_prompt():
 def test_reasoning_missing_analysis_still_parses():
     parsed = IntentParser(FakeModel(good()), reasoning=True).parse("q")
     assert parsed.intent is not None
+
+
+def _threshold_reply(value):
+    return good(measure="distinct_customers", shape="threshold_count",
+                threshold={"subject": "customer", "metric": "order_count", "op": "gte", "value": value})
+
+
+def test_threshold_value_not_in_question_is_retried_then_kept_when_fixed():
+    model = FakeModel(_threshold_reply(6), _threshold_reply(61))
+    parsed = IntentParser(model).parse("bao nhieu khach mua 61 don tro len")
+    assert parsed.intent is not None and parsed.intent.threshold["value"] == 61
+    assert len(model.calls) == 2 and "threshold" in model.calls[1]["prompt"]
+
+
+def test_threshold_value_never_grounded_gives_no_intent():
+    parsed = IntentParser(FakeModel(_threshold_reply(7000000), _threshold_reply(7000000))).parse(
+        "so ngay doanh thu tu 7.900.000 dong tro len")
+    assert parsed.intent is None and "threshold" in parsed.reason
+
+
+@pytest.mark.parametrize("question, value", [
+    ("doanh thu tren 8tr", 8_000_000), ("tren 7,5 triệu", 7_500_000), ("từ 7.900.000 đồng", 7_900_000),
+    ("trên 500k", 500_000), ("ít nhất 202 đơn", 202),
+])
+def test_question_numbers_reads_separators_and_scales(question, value):
+    from bizreason.semantic.intent import question_numbers
+    assert value in question_numbers(question)
+
+
+def test_definitions_block_is_added_only_when_one_applies():
+    from bizreason.semantic.definitions import provider
+    rulebook = "| Luật | Mặc định |\n|---|---|\n| Khách trung thành nhất | khách có nhiều ngày có mua nhất |\n"
+    model = FakeModel(good(), good())
+    parser = IntentParser(model, definitions=provider(rulebook))
+    parser.parse("ai trung thành nhất tháng 3")
+    parser.parse("doanh thu tháng 3")
+    assert "nhiều ngày có mua nhất" in model.calls[0]["prompt"]
+    assert "rulebook" not in model.calls[1]["prompt"]
+
+
+def test_consensus_keeps_agreeing_parses_and_drops_disagreeing_ones():
+    from bizreason.semantic.intent import ConsensusParser
+    same = ConsensusParser(IntentParser(FakeModel(good())), IntentParser(FakeModel(good())))
+    assert same.parse("q").intent is not None
+    differ = ConsensusParser(IntentParser(FakeModel(good())), IntentParser(FakeModel(good(measure="order_count"))))
+    parsed = differ.parse("q")
+    assert parsed.intent is None and parsed.reason == "parses disagree"
+
+
+def test_consensus_ignores_filter_spelling_and_order():
+    from bizreason.semantic.intent import ConsensusParser
+    a = good(filters=[{"dim": "product", "value": "Cà phê", "exclude": False}, {"dim": "unit", "value": "ly", "exclude": False}])
+    b = good(filters=[{"dim": "unit", "value": "ly", "exclude": False}, {"dim": "product", "value": "ca phe", "exclude": False}])
+    assert ConsensusParser(IntentParser(FakeModel(a)), IntentParser(FakeModel(b))).parse("q").intent is not None
+
+
+def test_industry_rules_are_offered_when_their_term_is_asked():
+    from bizreason.semantic.definitions import provider
+    rulebook = ("## 6. Theo ngành\n### Ngành A\n| Luật | Mặc định |\n|---|---|\n"
+                "| Thu máy cũ | tiền thu máy cũ không trừ vào doanh thu |\n## 7. Khác\n| Doanh thu ngày | tổng tiền |\n")
+    block = provider(rulebook)
+    assert "không trừ vào doanh thu" in block("tháng này tiền thu máy cũ là bao nhiêu")
+    assert block("doanh thu ngày hôm qua") == ""

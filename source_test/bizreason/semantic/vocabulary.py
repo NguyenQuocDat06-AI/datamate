@@ -86,7 +86,8 @@ QUOTED_DIMENSIONS = frozenset({
 })
 
 # Rulebook §3: an order without a customer identity is a walk-in and is not a customer.
-WALK_IN_NAMES = ("khach le", "khach vang lai")
+# Spellings of a walk-in customer seen in shop files ("lẻ", "kl" for khách lẻ) are the same walk-in.
+WALK_IN_NAMES = ("khach le", "khach vang lai", "le", "kl", "khachle", "vang lai")
 # Rulebook §1 and §5: wording of a cancelled document, compared after lookup normalization.
 CANCEL_TOKENS = ("huy", "cancel")
 # Rulebook §4: payment-method wording that marks a debt order, and wording of orders that are not customer debt
@@ -146,6 +147,14 @@ RULEBOOK_CUES: dict[str, tuple[str, ...]] = {
     # Rulebook §1 definitions of a sale, a cancelled order and a return, with the canonical status names.
     "order_status": ("đơn có trạng thái huỷ", "đơn trả hàng", "đang giao", "cancelled", "returned", "shipping"),
 }
+# Rulebook §5 stock in large units: a question that asks for whole large units and loose base units gets the list
+# [whole large units, loose base units]. Whole-word cues after normalize_lookup: one for "whole" and one for "loose".
+LARGE_UNIT_WHOLE_CUES = ("chan", "nguyen")
+LARGE_UNIT_LOOSE_CUE = "le"
+# Rulebook §2 and §5: stock measures read the position at the end of a day from the stock report, and lot measures
+# read the lots that carry expiry dates.
+STOCK_MEASURES = frozenset({"inventory_qty", "inventory_value", "out_of_stock_count"})
+LOT_MEASURES = frozenset({"expiry_lot", "expiring_lot_value"})
 # Currency spellings that may follow a grouped amount such as 75,000 or 75.000. Compared case-insensitively.
 CURRENCY_SUFFIXES = ("vnd", "vnđ", "đ", "₫")
 
@@ -159,7 +168,7 @@ ADDRESS_HEADER_TOKENS = ("dia chi", "addr", "address", "duong pho")
 # Question wording that asks for a value beside each entity of a ranked list ("with the amount", "each person's
 # amount", "and the number"). Compared after lookup normalization, as whole words. Used only with a top-k intent
 # that groups by an entity, so a plain list of values is never matched by these words.
-TABLE_ASK_CUES = ("kem", "moi nguoi", "tung nguoi", "va so")
+TABLE_ASK_CUES = ("kem", "moi nguoi", "tung nguoi", "tung ngui", "tug nguoi", "tug ngui", "va so", "tung tho", "moi tho")
 
 # Shop talk for small shops, written with and without diacritics because questions are often typed without them.
 # A shop word names the shop itself, the subject of the question. It is never a location, channel or customer.
@@ -187,3 +196,31 @@ AVERAGE_WORDS = ("bình quân", "binh quan", "trung bình", "trung binh")
 PER_ORDER_WORDS = ("mỗi đơn", "moi don", "một đơn", "mot don")
 # Import price words. With an average word they ask for the average import price of one unit.
 IMPORT_PRICE_WORDS = ("giá nhập", "gia nhap")
+
+
+# Judgements a question may ask about ("thợ nhiệt tình nhất", "nhà cung cấp uy tín") that no shop file records. When
+# the rulebook does not define one, the question is unanswerable (rulebook §7). Accent-free, after normalize_lookup.
+# Words that also name goods or a sales ranking ("ngon", "tốt nhất") are left out.
+UNDEFINED_JUDGEMENT_WORDS = (
+    "trung thuc", "nhiet tinh", "chat luong", "uy tin", "lanh nghe", "tay nghe", "khen", "quy men", "tan tam",
+    "chu dao", "than thien", "de thuong", "hai long", "vui ve", "lich su", "tin cay", "dang tin", "chuyen nghiep",
+    "ngon nhat",
+)
+
+# Words of a rulebook term that only say what kind of entity it is about; a definition applies when the other words
+# of its term appear in the question. Accent-free, after normalize_lookup.
+DEFINITION_GENERIC_WORDS = frozenset({
+    "khach", "khach hang", "nhan", "vien", "tho", "mat", "hang", "san", "pham", "cua", "cac", "mot", "trong", "ky",
+    "nguoi", "nao", "la", "va", "hoac",
+})
+# A rulebook term that names a ranking carries one of these words.
+DEFINITION_RANKING_WORDS = frozenset({"nhat", "chinh", "diem"})
+
+# "vì" introduces the cause of an event ("huỷ vì giao trễ"); and the words that ask for a percent.
+CAUSE_WORD = "vi"
+PERCENT_CUES = ("phan tram", "ti le", "ty le")
+# Delivery wording and the words that count deliveries rather than orders.
+DELIVERY_WORDS = ("giao", "cho di", "cho hang")
+TRIP_WORDS = ("dot", "chuyen", "luot")
+# A ranking "nhiều đơn nhất" ranks by the number of orders.
+MOST_ORDERS_CUE = "nhieu don nhat"
