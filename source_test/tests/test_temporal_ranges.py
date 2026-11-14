@@ -221,3 +221,14 @@ def test_dialect_month_words_and_days_ahead():
     assert span("tháng năm 2025 doanh thu") == [("2025-05-01", "2025-06-01")]
     assert span("lô hết hạn trong 90 ngày tới") == [("2026-06-15", "2026-09-14")]
     assert ("2026-05-01", "2026-06-01") not in span("so với cùng tháng năm trước, doanh thu tháng 4/2026")
+
+
+def test_month_list_with_one_year():
+    from datetime import date as _date
+    from bizreason.temporal import TemporalResolver as _Resolver
+    r = _Resolver()
+    starts = lambda q: [w.start.isoformat()[:7] for w in r.resolve_periods(q, _date(2026, 6, 15))]
+    assert starts("Dthu th7, th8, th9/2025 lần lượt mỗi tháng") == ["2025-07", "2025-08", "2025-09"]
+    assert starts("doanh thu lần lượt các tháng 10, 11, 12 năm 2025") == ["2025-10", "2025-11", "2025-12"]
+    assert starts("th11, th12, th1/2026 tháng nào cao nhất") == ["2025-11", "2025-12", "2026-01"]
+    assert starts("top 10 sản phẩm tháng 5 2025") == []

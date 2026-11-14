@@ -42,6 +42,37 @@ def _untelex(text: str) -> str:
     return _TELEX_TOKEN.sub(lambda m: _untelex_word(m.group()), text)
 
 
+_MONTH_LIST = re.compile(
+    r"\b(?:thang|th|t)\s?(\d{1,2})((?:\s+(?:va\s+)?(?:thang\s?|th|t)?\d{1,2}\b)+)(?:\s+(?:nam\s+)?(20\d{2}))?"
+)
+
+
+def _month_list(text: str, as_of: date) -> list[tuple[int, int]]:
+    """Months listed with one year for all ("th7, th8, th9/2025", "các tháng 10, 11, 12 năm 2025"), in order.
+
+    Without a year, the question must speak of months ("mỗi tháng", "tháng nào") and each month is its latest
+    occurrence up to today. [] when the list is not a run of valid months."""
+    match = _MONTH_LIST.search(text)
+    if not match:
+        return []
+    numbers = [int(match.group(1))] + [int(n) for n in re.findall(r"\d{1,2}", match.group(2))]
+    if len(numbers) < 2 or not all(1 <= n <= 12 for n in numbers) or len(set(numbers)) != len(numbers):
+        return []
+    if match.group(3):
+        year = int(match.group(3))
+        # a list that runs past December ends in the stated year ("th11, th12, th1/2026")
+        out, y = [], year
+        for n in reversed(numbers):
+            out.append((y, n))
+            if n == 1 and len(out) < len(numbers):
+                y -= 1
+        out.reverse()
+        return out if all(a <= b for a, b in zip(out, out[1:])) else []
+    if not re.search(r"\b(?:moi thang|cac thang|thang nao|tung thang)\b", text):
+        return []
+    return [(as_of.year if n <= as_of.month else as_of.year - 1, n) for n in numbers]
+
+
 def next_month(day: date) -> date:
     return date(day.year + (day.month == 12), 1 if day.month == 12 else day.month + 1, 1)
 
@@ -294,6 +325,8 @@ class TemporalResolver:
                     expanded.append((index // 12, index % 12 + 1))
                     index += 1
                 months = expanded + [value for value in months if value not in expanded]
+        if len(months) < 2:
+            months = _month_list(text, as_of) or months
         if len(months) < 2:
             return []
         return [

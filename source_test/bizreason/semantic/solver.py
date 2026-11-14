@@ -11,12 +11,13 @@ from typing import Any, Protocol
 
 from bizreason.contracts import AnswerType, Prediction, Question, TimeWindow
 from bizreason.data.vocabulary import AGE_BUCKET_WORD, AGE_OPEN_BUCKET_WORDS, PRICE_RISE_RE
-from bizreason.semantic.compiler import DEBT_MEASURES, Compiler, Intent, NotRecorded, Unsupported
+from bizreason.semantic.compiler import DEBT_MEASURES, Answer, Compiler, Intent, NotRecorded, Unsupported
 from bizreason.semantic import rule_terms, rulebook_params
 from bizreason.semantic.quality import QualityFlags, assess
+from bizreason.semantic.vocabulary import DIMENSIONS
 from bizreason.semantic.vocabulary import (
     LARGE_UNIT_LOOSE_CUE, LARGE_UNIT_WHOLE_CUES, LOT_MEASURES, QUOTED_DIMENSIONS, STOCK_MEASURES, TABLE_ASK_CUES,
-    CAUSE_WORD, DELIVERY_WORDS, MOST_ORDERS_CUE, PERCENT_CUES, TRIP_WORDS, UNDEFINED_JUDGEMENT_WORDS,
+    CAUSE_WORD, DELIVERY_WORDS, MOST_ORDERS_CUE, PURCHASE_MINUS_SOLD_RE, RULE_DELIVERY_TRIPS, RULE_TICKET_VISITS, PERCENT_CUES, TRIP_WORDS, UNDEFINED_JUDGEMENT_WORDS,
 )
 from bizreason.temporal import TemporalResolver
 from bizreason.utils import normalize_lookup
@@ -91,6 +92,9 @@ FALLBACK_REASONS = (
     "debt measure with filter", "breakdown names", "invalid measure",
 )
 _FALLBACK: Any = None
+# Phrase-triggered repairs learned from seen questions (most-orders ranking, cancellation share and cause, delivery
+# trips for an order count). Switched off by run_v2 --phrase-rules off for ablation.
+PHRASE_RULES = True
 
 
 def set_fallback(fallback: Any) -> None:
@@ -113,6 +117,40 @@ def _implausible(kind: str, value: Any) -> str | None:
         if isinstance(name, str) and not any(ch.isdigit() for ch in name) and len(normalize_lookup(name)) < MIN_NAME_CHARS:
             return f"name too short: {name!r}"
     return None
+
+
+def _weekday_from_question(question: str, intent: Intent) -> dict[str, Any] | None:
+    """A weekday filter for an 'average per weekday' intent that has none, when the question names one weekday."""
+    from bizreason.semantic.compiler import WEEKDAY_TOKENS, _asks_weekday_average
+    if not _asks_weekday_average(intent) or any(f.get("dim") == "weekday" for f in intent.filters):
+        return None
+    padded = f" {normalize_lookup(question)} "
+    found = {day: token for token, day in WEEKDAY_TOKENS.items() if f" {token} " in padded}
+    if len(found) != 1:
+        return None
+    return {"dim": "weekday", "value": next(iter(found.values())), "exclude": False}
+
+
+def _trim_added_words(question: str, intent: Intent) -> Intent | None:
+    """When a product filter carries words the question does not have, but starts with a phrase of two or more
+    words that the question does write, use that phrase. None when nothing changes."""
+    asked = set(normalize_lookup(question).split())
+    changed, filters = False, []
+    for item in intent.filters:
+        value = normalize_lookup(str(item.get("value", "")))
+        words = value.split()
+        if item.get("dim") == "product" and words and not set(words) <= asked:
+            prefix = []
+            for word in words:
+                if word not in asked:
+                    break
+                prefix.append(word)
+            if len(prefix) >= 2:
+                filters.append({**item, "value": " ".join(prefix)})
+                changed = True
+                continue
+        filters.append(item)
+    return replace(intent, filters=filters) if changed else None
 
 
 def undefined_judgement(question: str) -> str | None:
@@ -328,28 +366,62 @@ class SemanticSolver:
         intent, _term = rule_terms.apply(intent, question.question)
         trace.intent = intent
         asked = f" {normalize_lookup(question.question)} "
-        if intent.measure == "cancelled_count" and any(f" {cue} " in asked for cue in PERCENT_CUES) or (
+        if PHRASE_RULES and intent.measure == "cancelled_count" and any(f" {cue} " in asked for cue in PERCENT_CUES) or (PHRASE_RULES and
                 intent.measure == "cancelled_count" and "%" in question.question):
             # "đơn huỷ chiếm mấy %" asks the cancellation rate, not the count.
             intent = replace(intent, measure="cancel_rate")
             trace.intent = intent
-        if (intent.shape in ("argmax_entity", "top_k") and f" {MOST_ORDERS_CUE} " in asked
+        if (PHRASE_RULES and intent.shape in ("argmax_entity", "top_k") and f" {MOST_ORDERS_CUE} " in asked
                 and intent.measure in ("revenue", "qty_base_sold")):
             # "ai mua nhiều đơn nhất" ranks by orders, whatever money or quantity the parse chose.
             intent = replace(intent, measure="order_count")
             trace.intent = intent
-        if intent.measure == "order_count" and any(f" {w} " in asked for w in DELIVERY_WORDS) and any(
-                f" {w} " in asked for w in TRIP_WORDS):
+        threshold = intent.threshold or {}
+        if (intent.shape in ("threshold_count", "ratio_of_counts") and threshold.get("subject") in ("order", None)
+                and any(f" {w} " in asked for w in DELIVERY_WORDS) and any(f" {w} " in asked for w in TRIP_WORDS)
+                and rulebook_params.mentions(*RULE_DELIVERY_TRIPS)):
+            # "mấy đơn đã được giao từ 2 đợt trở lên": a threshold on each order's delivery trips.
+            intent = replace(intent, threshold={**threshold, "subject": "order", "metric": "delivery_trips"})
+            trace.intent = intent
+        if PHRASE_RULES and intent.measure == "order_count" and any(f" {w} " in asked for w in DELIVERY_WORDS) and any(
+                f" {w} " in asked for w in TRIP_WORDS) and rulebook_params.mentions(*RULE_DELIVERY_TRIPS):
             # "xe đã giao mấy đợt hàng" counts delivery trips, not orders (rulebook: giao nhiều đợt).
             intent = replace(intent, measure="delivery_trip_count")
             trace.intent = intent
+        if re.search(PURCHASE_MINUS_SOLD_RE, asked) and any(f.get("dim") == "product" for f in intent.filters):
+            # "số nhập trừ số bán" / "chênh lệch nhập trừ bán" (rulebook §5): received minus sold, one product.
+            intent = replace(intent, measure="purchase_minus_sold", measure2=None, shape="scalar", group_by=None)
+            trace.intent = intent
+        if (intent.measure == "delivery_trip_count" and not self._has_rows("deliveries")
+                and rulebook_params.mentions(*RULE_TICKET_VISITS)):
+            # No delivery book: "lượt xe" in a repair book is one ticket per visit (rulebook, sửa xe).
+            intent = replace(intent, measure="service_ticket_count")
+            trace.intent = intent
         cause_at = re.search(rf" {CAUSE_WORD} (?!x |\d)(\S+(?: \S+){{0,2}})", asked)  # not "vỉ x 4", "vỉ 10"
-        if intent.measure in ("cancelled_count", "cancel_rate") and cause_at:
+        if PHRASE_RULES and intent.measure in ("cancelled_count", "cancel_rate") and cause_at:
             cause = cause_at.group(1).split()
             if cause and not self._notes_mention(cause):
                 # A cancellation or return "vì <reason>": no file records the reason (rulebook §7).
                 return self._finish(question, trace, "unanswerable", "reason for cancellation not recorded")
             return self._finish(question, trace, "abstain", "reason for cancellation")
+        moved = self._columns_from_filters(intent)
+        if moved is not None:
+            intent = moved
+            trace.intent = intent
+        weekday = _weekday_from_question(question.question, intent)
+        if weekday is not None:
+            intent = replace(intent, filters=[*intent.filters, weekday])
+            trace.intent = intent
+        trimmed = _trim_added_words(question.question, intent)
+        if trimmed is not None:
+            # The parse added words the asker did not write (a stored variant copied from the value list): keep the
+            # asker's own phrase so every product it names is counted.
+            intent = trimmed
+            trace.intent = intent
+        grounded = None if intent.column_measure else self._closed_value_named(question.question, intent)
+        if grounded is not None:
+            intent = replace(intent, filters=[*intent.filters, grounded])
+            trace.intent = intent
         named = self._named_person(question.question, intent)
         if named is not None:
             # The question names one stored employee or customer in full that the parse left out (names typed without
@@ -359,7 +431,7 @@ class SemanticSolver:
         ungrounded = _ungrounded_dim(question.question, intent.filters)
         if ungrounded is not None:
             return self._finish(question, trace, "abstain", f"filter not in question: {ungrounded}")
-        if intent.measure == "outside":
+        if intent.measure == "outside" and not intent.column_measure:
             return self._finish(question, trace, "abstain", "outside known measures")
 
         facts = self._shop_facts()
@@ -384,6 +456,14 @@ class SemanticSolver:
             windows = self.temporal.resolve(question.question, question.as_of_date)
         if not windows and intent.shape == "compare_periods":
             windows = self._price_rise_windows(question.question, intent)
+        relative = {"after_today", "before_today", "on_or_before_today", "on_or_after_today"}
+        if intent.column_measure and any(f.get("op") in relative for f in intent.column_filters):
+            # A condition measured against today ("ngày phải trả sau hôm nay") reads everything up to today.
+            windows = []
+        if not windows and intent.column_measure:
+            # "tới hôm nay ..." on a kept column: everything recorded up to the end of today.
+            windows = [TimeWindow(role="target", start=date(1900, 1, 1),
+                                  end_exclusive=question.as_of_date + timedelta(days=1), evidence=["as_of_date"])]
         if not windows and intent.measure in POINT_IN_TIME:
             # Rulebook §2: a balance with no stated day is the position at the end of today.
             windows = [
@@ -428,7 +508,15 @@ class SemanticSolver:
         wants_table = intent.group_by is not None and asks_entity_values(question.question)
         try:
             compiler = Compiler(self.connection)
-            if wants_table and intent.shape == "top_k" and (intent.top_k or 0) >= 2:
+            compiler.as_of = question.as_of_date
+            if intent.measure == "purchase_minus_sold":
+                target = [w for w in windows if w.role != "comparison"]
+                if len(target) != 1:
+                    raise Unsupported("purchase minus sold needs one window")
+                diff = compiler.purchase_minus_sold(intent, target[0])
+                answer = Answer("number", int(round(diff)) if diff is not None and abs(diff - round(diff)) < 1e-9
+                                else diff)
+            elif wants_table and intent.shape == "top_k" and (intent.top_k or 0) >= 2:
                 answer = compiler.table(intent, windows)
             elif (buckets := age_buckets(question.question)) and intent.measure == "debt_outstanding" \
                     and intent.shape == "breakdown" and intent.group_by is None:
@@ -541,6 +629,66 @@ class SemanticSolver:
             previous = new_price if new_price is not None else previous
         return []
 
+    def _catalog(self) -> dict[str, dict[str, Any]]:
+        try:
+            rows = self.connection.execute(
+                "SELECT table_name, column_name, source_header, value_type FROM column_catalog").fetchall()
+        except sqlite3.Error:
+            return {}
+        return {c: {"table": t, "header": h, "type": k} for t, c, h, k in rows}
+
+    def _columns_from_filters(self, intent: Intent) -> Intent | None:
+        """Filters the parse put on a kept column name (not a dimension) become column conditions: a date column is
+        'in the question's period', anything else 'contains'. A date condition with an order count and no column
+        measure counts the rows of that column's table. Filters that only repeat words of the measured column's
+        header ('máy cũ' in 'thu máy cũ') are dropped."""
+        catalog = self._catalog()
+        if not catalog:
+            return None
+        keep, moved = [], []
+        for item in intent.filters:
+            dim = item.get("dim")
+            if dim not in DIMENSIONS and dim in catalog:
+                op = "in_period" if catalog[dim]["type"] == "date" else "contains"
+                moved.append({"column": dim, "op": op, "value": item.get("value")})
+            else:
+                keep.append(item)
+        measured = (intent.column_measure or {}).get("column")
+        if measured in catalog:
+            header = f" {normalize_lookup(str(catalog[measured]['header'] or ''))} "
+            keep = [f for f in keep if f" {normalize_lookup(str(f.get('value', '')))} " not in header]
+        if not moved and len(keep) == len(intent.filters):
+            return None
+        column_measure = intent.column_measure
+        if column_measure is None and moved and intent.measure in ("order_count", "outside"):
+            column_measure = {"op": "count", "column": moved[0]["column"]}
+        if column_measure is None and moved:
+            return None
+        return replace(intent, filters=keep, column_filters=[*intent.column_filters, *moved],
+                       column_measure=column_measure, shape="scalar" if column_measure else intent.shape)
+
+    def _closed_value_named(self, text: str, intent: Intent) -> dict[str, Any] | None:
+        """A filter for the one stored value of a short closed list (channel, payment method, customer group, product
+        kind, a rulebook shift) that the question writes verbatim but the intent neither filters nor groups by."""
+        asked = f" {normalize_lookup(text)} "
+        lists = {"shift": list(rulebook_params.active().shift_windows)}
+        for dim, table, column in (("channel", "orders", "channel"), ("payment_method", "orders", "payment_method"),
+                                   ("customer_group", "orders", "customer_group"),
+                                   ("product_kind", "lines", "product_kind")):
+            try:
+                lists[dim] = [r[0] for r in self.connection.execute(
+                    f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL LIMIT 50")]
+            except sqlite3.Error:
+                continue
+        for dim, values in lists.items():
+            if intent.group_by == dim or any(item.get("dim") == dim for item in intent.filters):
+                continue
+            hits = {normalize_lookup(v) for v in values if v is not None and len(normalize_lookup(v)) >= 4
+                    and len(normalize_lookup(v).split()) >= 2 and f" {normalize_lookup(v)} " in asked}
+            if len(hits) == 1:
+                return {"dim": dim, "value": hits.pop(), "exclude": False}
+        return None
+
     def _named_person(self, text: str, intent: Intent) -> dict[str, Any] | None:
         """A filter for the one employee or customer whose full stored name (two words or more) the question writes
         and the intent neither filters nor groups by; None otherwise."""
@@ -558,6 +706,12 @@ class SemanticSolver:
             if len(hits) == 1:
                 return {"dim": dim, "value": hits.pop(), "exclude": False}
         return None
+
+    def _has_rows(self, table: str) -> bool:
+        try:
+            return self.connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+        except sqlite3.Error:
+            return False
 
     def _notes_mention(self, words: list[str]) -> bool:
         """True when some order note contains all these words (the shop may record why an order was cancelled)."""
@@ -613,7 +767,8 @@ class SemanticSolver:
     def _finish(
         self, question: Question, trace: SolveTrace, decision: str, reason: str
     ) -> tuple[Prediction, SolveTrace]:
-        if decision == "abstain" and _FALLBACK is not None and reason.startswith(FALLBACK_REASONS):
+        if decision == "abstain" and _FALLBACK is not None and reason.startswith(
+                getattr(_FALLBACK, "reasons", FALLBACK_REASONS)):
             # The typed intent cannot express the question; let two independent SQL readings try (they must agree).
             result = None
             try:

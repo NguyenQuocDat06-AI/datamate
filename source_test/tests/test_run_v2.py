@@ -117,7 +117,7 @@ def setup(tmp_path: Path) -> dict[str, Path]:
 
 def command(setup: dict[str, Path], *extra: str) -> list[str]:
     return ["--data", str(setup["root"]), "--out", str(setup["out"]), "--connection", str(setup["connection"]),
-            "--endpoint-file", str(setup["endpoint"]), "--workers", "2", *extra]
+            "--endpoint-file", str(setup["endpoint"]), "--workers", "2", "--value-linking", "off", "--column-measures", "off", *extra]
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:

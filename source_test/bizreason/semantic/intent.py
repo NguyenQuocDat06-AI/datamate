@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from bizreason.data.vocabulary import QUESTION_NUMBER_SCALES
+from bizreason.data.vocabulary import MILLION_SHORT_RE, QUESTION_NUMBER_SCALES
 from bizreason.llm import LanguageModel, ModelError
 from bizreason.semantic.compiler import Intent
 from bizreason.semantic.vocabulary import (
@@ -485,6 +485,9 @@ def question_numbers(question: str) -> set[float]:
     """Every number the question writes, read with "." or "," as a thousands or a decimal separator, and also
     scaled by a scale word written right after it ("8tr", "7,5 triệu", "500k")."""
     found: set[float] = set()
+    for whole, part in re.findall(MILLION_SHORT_RE, question.lower()):
+        # "3tr7" = 3.7 million, "1tr250" = 1.25 million
+        found.add(round((int(whole) + int(part) / 10 ** len(part)) * 1_000_000, 6))
     for match in _QUESTION_NUMBER.finditer(question):
         token = match.group().rstrip(".,")
         readings = {token.replace(".", "").replace(",", ""), token.replace(".", "").replace(",", "."),
@@ -531,10 +534,29 @@ def _age_days(value: Any) -> int | None:
     raise _Invalid("invalid age_days", _AGE_DAYS_HINT)
 
 
+def _column_measure(value: Any) -> dict[str, Any] | None:
+    from bizreason.semantic.compiler import COLUMN_MEASURE_OPS
+    if not isinstance(value, dict) or value.get("op") not in COLUMN_MEASURE_OPS or not _is_text(value.get("column")):
+        return None
+    return {"op": value["op"], "column": value["column"].strip()}
+
+
+def _column_filters(value: Any) -> list[dict[str, Any]]:
+    from bizreason.semantic.compiler import COLUMN_OPS
+    out = []
+    for item in value if isinstance(value, list) else []:
+        if isinstance(item, dict) and item.get("op") in COLUMN_OPS and _is_text(item.get("column")):
+            out.append({"column": item["column"].strip(), "op": item["op"], "value": item.get("value")})
+    return out
+
+
 def _interpret(raw: Any, *, final: bool) -> Intent:
     if not isinstance(raw, dict):
         raise _Invalid("invalid reply", "Your previous reply was not a JSON object; reply with one JSON object only.")
     measure = raw.get("measure")
+    column_measure = _column_measure(raw.get("column_measure"))
+    if column_measure is not None and (not _is_text(measure) or measure not in MEASURES):
+        measure = "outside"
     if not _is_text(measure) or measure not in MEASURES:
         raise _Invalid("invalid measure", _choice_hint("measure", MEASURES))
     group_by = raw.get("group_by")
@@ -568,6 +590,8 @@ def _interpret(raw: Any, *, final: bool) -> Intent:
         age_days=age_days,
         measure2=_measure2(raw.get("measure2")),
         location=_location(raw.get("location")),
+        column_measure=column_measure,
+        column_filters=_column_filters(raw.get("column_filters")),
     )
 
 
@@ -599,6 +623,8 @@ class IntentParser:
         examples: Callable[[str, str | None, str | None], str] | None = None,
         reasoning: bool = False,
         definitions: Callable[[str], str] | None = None,
+        value_links: Callable[[str, str | None], str] | None = None,
+        column_links: Callable[[str, str | None], str] | None = None,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -616,6 +642,10 @@ class IntentParser:
         self.examples = examples
         # definitions(question) returns the rulebook definitions of terms the question uses, or "" for none.
         self.definitions = definitions
+        # value_links(question, business_id) lists the stored values the question likely means, or "".
+        self.value_links = value_links
+        # column_links(question, business_id) lists kept columns the question may need, with how to use them.
+        self.column_links = column_links
 
     def parse(self, question: str, choices: dict[str, list[str]] | None = None, *,
               question_id: str | None = None, business_id: str | None = None) -> ParsedIntent:
@@ -628,6 +658,20 @@ class IntentParser:
             defined = self.definitions(question)
             if defined:
                 base_prompt = base_prompt + "\n\n" + defined
+        if self.column_links is not None:
+            try:
+                offered = self.column_links(question, business_id)
+            except Exception:
+                offered = ""
+            if offered:
+                base_prompt = base_prompt + "\n\n" + offered
+        if self.value_links is not None:
+            try:
+                linked = self.value_links(question, business_id)
+            except Exception:
+                linked = ""
+            if linked:
+                base_prompt = base_prompt + "\n\n" + linked
         section = _choices_section(choices)
         suffix = "\n\n" + section if section else ""
         prompt = base_prompt + suffix

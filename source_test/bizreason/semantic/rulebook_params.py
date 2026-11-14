@@ -156,6 +156,15 @@ def rulebook_text() -> str | None:
     return _rulebook_text
 
 
+def mentions(*phrases: str) -> bool:
+    """True when the active rulebook writes every phrase (accent-free, whole words). Without a rulebook text
+    (unit tests, no rulebook given) the answer is True, so behaviour stays as before."""
+    if _rulebook_text is None:
+        return True
+    from bizreason.utils import normalize_lookup
+    return all(f" {normalize_lookup(p)} " in _rulebook_text for p in phrases)
+
+
 def relevant_rulebook_text(rulebook_text: str) -> str:
     """The rulebook lines that carry a cue word, each under its heading.
 

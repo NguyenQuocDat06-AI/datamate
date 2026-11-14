@@ -145,3 +145,6 @@ AGE_OPEN_BUCKET_WORDS = r"(?:tren|hon|qua|sau)"
 # A price rise named by its new price ("lên giá 97.500đ", "tăng giá lên 3.200đ"), after normalize_lookup keeps the
 # digits; and the words around the counted days of a price-rise comparison.
 PRICE_RISE_RE = r"(?:len gia|gia len|tang gia len|tang gia|len)\s+(\d[\d ]*?)\s*(?:d|dong|vnd)\b"
+
+# A million written with its decimals after the word: "3tr7" = 3.7 million, "1tr250" = 1.25 million.
+MILLION_SHORT_RE = r"(?<![\d.,])(\d+)\s*(?:tr|trieu|triệu|củ)\s*(\d{1,3})(?![\d.,])"

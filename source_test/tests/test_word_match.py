@@ -47,5 +47,16 @@ def test_exact_product_match_keeps_every_spelling():
 
 
 def test_device_line_covers_every_capacity():
+    from bizreason.semantic import rulebook_params
+    rulebook_params.set_rulebook_text("| Dòng máy, hãng | phần tên trước dung lượng GB |")
     values = ["iPhone 16 Pro Max 256GB", "iPhone 16 Pro Max 512GB", "iPhone 16 Pro 128GB", "Ốp lưng iPhone 16 Pro Max"]
     assert sorted(_word_match(values, "iphone 16 pro max")) == ["iPhone 16 Pro Max 256GB", "iPhone 16 Pro Max 512GB"]
+
+
+def test_device_line_needs_the_rulebook_to_define_it():
+    from bizreason.semantic import rulebook_params
+    try:
+        rulebook_params.set_rulebook_text("| Doanh thu | tổng tiền |")
+        assert _word_match(["Phone A 256GB", "Phone A 512GB"], "phone a") == []
+    finally:
+        rulebook_params.set_rulebook_text(None)

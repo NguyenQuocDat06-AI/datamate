@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 import re
 import sqlite3
 import unicodedata
@@ -47,7 +48,7 @@ LINE_NUMBERS = {
 PURCHASE_FIELDS = {
     "purchase_id": "purchase_id", "date": "purchased_at", "supplier_id": "supplier_id",
     "supplier_name": "supplier_name", "status": "purchase_status", "product_id": "product_id",
-    "product_name": "product_name",
+    "product_name": "product_name", "unit": "unit",
 }
 PURCHASE_NUMBERS = {
     "qty": "qty_purchased", "unit_cost": "purchase_unit_cost", "amount": "purchase_line_amount",
@@ -109,6 +110,30 @@ VALUE_GROUP_FIELDS = {
     "base_unit": (("lines", "base_unit"),),
 }
 VALUE_GROUP_KEEPS_RAW = ("payment_method", "channel", "customer_group", "category")
+# Source columns that no canonical field reads are kept (see _carry_plan): x_<name> text, xn_<name> number and
+# xd_<name> date twins. A table's unmapped columns are carried only for these kinds; every other annotated table
+# whose kind the layer does not carry from is copied whole as src_<table> (see _copy_unloaded).
+EXTRA_PREFIXES = ("x_", "xn_", "xd_")
+CARRIED_KINDS = ("sales", "service_ticket", "purchase", "payment", "delivery")
+LAYER_KINDS = (*CARRIED_KINDS, "sales_return", "customer_catalog", "product_catalog", "unit_conversion", "alias",
+               "employee_catalog", "expense", "price_history")
+CARRY_MIN_SHARE = 0.8  # share of non-blank values that must parse as a number or a date, or read as a code
+CODE_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")  # letters and digits, no spaces: a plate or an id
+CODE_MAX_LENGTH = 24
+CODE_MIN_DIGITS = 10  # a digit string this long is an identifier, not an amount
+JOIN_MIN_SHARE = 0.5  # share of a column's distinct values that must be order ids for it to join orders
+CATALOG_SAMPLES = 8
+CATALOG_TARGETS = ("raw_lines", "lines", "orders", "purchases", "payments", "deliveries")
+# The roles each loader reads, so that every other column of its table is carried
+LINE_READ_ROLES = tuple(dict.fromkeys([
+    *LINE_FIELDS.values(), *LINE_NUMBERS.values(), *ORDER_ROLES, "order_time",
+    "product_name", "product_id", "line_amount",
+]))
+SERVICE_READ_ROLES = ("ticket_id", "ticket_amount", "service_item")
+PURCHASE_READ_ROLES = (*PURCHASE_FIELDS.values(), *PURCHASE_NUMBERS.values(), "lot_id", "expires_at",
+                       "qty_purchased_base")
+PAYMENT_READ_ROLES = (*PAYMENT_FIELDS.values(), *PAYMENT_NUMBERS.values())
+DELIVERY_READ_ROLES = (*DELIVERY_FIELDS.values(), *DELIVERY_NUMBERS.values())
 
 _CURRENCY = "(?:" + "|".join(re.escape(suffix) for suffix in CURRENCY_SUFFIXES) + ")?"
 COMMA_GROUPED = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+\s*" + _CURRENCY, re.IGNORECASE)
@@ -543,13 +568,120 @@ def _subtotal_rows(rows: list[dict[str, Any]], product: list[str], amount_column
     return found
 
 
+class Carried(NamedTuple):
+    """A source column that no canonical field reads. It is kept under its ingestion name (a safe identifier)."""
+
+    table: str  # source table name
+    source: str  # ingestion column name
+    header: str  # the header the source file shows for the column
+    role: str | None  # the annotated role; None when the table has no annotation
+    value_type: str  # text, number, date or code
+    numeric: bool  # an xn_ twin is kept
+    dated: bool  # an xd_ twin is kept
+    locale: str | None  # the amount separators read for the numeric twin
+
+
+def _role_of(column: str, given: dict[str, Any] | None) -> str | None:
+    if given is None:
+        return None
+    role = given.get(column)
+    return role if isinstance(role, str) else "other"
+
+
+def _carry_plan(dst: sqlite3.Connection, table: TableMeta, consumed: set[str],
+                given: dict[str, Any] | None) -> list[Carried]:
+    """Every column of table not in consumed, typed from its values. Each column is grouped by value once and every
+    distinct value is read once, weighted by its count.
+
+    A column has a numeric twin (dated twin) when CARRY_MIN_SHARE of its non-blank values parse with the number
+    (date) reader; its value type is date, number, code (letters and digits, no spaces) or text, in that order.
+    A value the number reader takes is not counted as a date: the date reader reads a bare five-digit amount as a
+    spreadsheet serial day, which would give every trade-in or debt amount a date twin.
+    """
+    carried: list[Carried] = []
+    for c in table.columns:
+        if c.name in consumed or c.name.startswith("__"):
+            continue
+        grouped = dst.execute(f"SELECT src.{q(c.name)}, COUNT(*) FROM source.{q(table.name)} AS src "
+                              "GROUP BY 1").fetchall()
+        values = [(value, count) for value, count in grouped if not blank(value)]
+        locale = infer_locale(value for value, _ in values)
+        nonblank = numbers = dates = codes = long_numbers = 0
+        for value, count in values:
+            text = str(value).strip()
+            nonblank += count
+            if _number(value, locale or "unknown") is not None:
+                numbers += count
+                long_numbers += count if len(text) >= CODE_MIN_DIGITS else 0
+            elif to_date(value) is not None:
+                dates += count
+            codes += count if is_code_text(text) else 0
+        numeric = nonblank > 0 and numbers >= CARRY_MIN_SHARE * nonblank
+        dated = nonblank > 0 and dates >= CARRY_MIN_SHARE * nonblank
+        code = nonblank > 0 and codes >= CARRY_MIN_SHARE * nonblank
+        # a column of long digit strings is an identifier (an IMEI, a phone number), not an amount
+        identifier = nonblank > 0 and long_numbers >= CARRY_MIN_SHARE * nonblank
+        value_type = ("date" if dated else ("code" if identifier else "number") if numeric
+                      else "code" if code else "text")
+        carried.append(Carried(table.name, c.name, c.original_name, _role_of(c.name, given), value_type,
+                               numeric, dated, locale))
+    return carried
+
+
+def _carry_columns(c: Carried, plain: bool = False) -> list[tuple[str, str, str]]:
+    """(column name, value expression over src, SQL type) of a carried column: x_<name> text, then the twins.
+    A plain copy (plain=True, for src_ tables) keeps the source name for the text column."""
+    raw = f"src.{q(c.source)}"
+    out = [(c.source if plain else f"x_{c.source}", _text(c.source), "TEXT")]
+    if c.numeric:
+        out.append((f"xn_{c.source}", f"{_parse_fn('xn', c.locale)}({raw})", "REAL"))
+    if c.dated:
+        out.append((f"xd_{c.source}", f"to_date({raw})", "TEXT"))
+    return out
+
+
+def _extra_columns(dst: sqlite3.Connection, target: str) -> list[tuple[str, str]]:
+    """(name, type) of the carried columns a layer table holds."""
+    return [(row[1], row[2]) for row in dst.execute(f"PRAGMA table_info({q(target)})")
+            if row[1].startswith(EXTRA_PREFIXES)]
+
+
+def _consumed(mapping: dict[str, str], read_roles: Iterable[str]) -> set[str]:
+    """The source columns that a loader reads: the column each role it reads maps to."""
+    return {mapping[role] for role in read_roles if mapping.get(role)}
+
+
+def _ensure_columns(dst: sqlite3.Connection, target: str, carried: list[Carried]) -> None:
+    existing = {row[1] for row in dst.execute(f"PRAGMA table_info({q(target)})")}
+    for c in carried:
+        for name, _, sql_type in _carry_columns(c):
+            if name not in existing:
+                dst.execute(f"ALTER TABLE {q(target)} ADD COLUMN {q(name)} {sql_type}")
+                existing.add(name)
+
+
+def _extras_for(dst: sqlite3.Connection, table: TableMeta, given: dict[str, Any], consumed: set[str], target: str,
+                scale: int, report: dict[str, Any], carry_log: list[tuple[str, list[Carried]]]) -> list[Carried]:
+    """Plan the columns of table that target keeps, add them to target, and log them for the column catalog.
+    A table's money scale is not applied to its numeric twins (no canonical field reads them); they are listed."""
+    carried = _carry_plan(dst, table, consumed, given)
+    _ensure_columns(dst, target, carried)
+    if carried:
+        carry_log.append((target, carried))
+    if scale != 1:
+        report["extra_numbers_not_scaled"] += [f"{table.name}.xn_{c.source}" for c in carried if c.numeric]
+    return carried
+
+
 def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[str, str],
             texts: dict[str, str], numbers: dict[str, str], synthetic_prefix: str | None = None, *,
             origin: str | None = None, report: dict[str, Any] | None = None,
-            defaults: dict[str, str] | None = None, stats: Counter | None = None, scale: int = 1) -> int:
+            defaults: dict[str, str] | None = None, stats: Counter | None = None, scale: int = 1,
+            carried: list[Carried] | None = None) -> int:
     """Insert rows of a source table (or of origin, a prepared copy of it) into target.
 
-    scale multiplies the table's money fields (every numeric field that is not a quantity)."""
+    scale multiplies the table's money fields (every numeric field that is not a quantity). carried adds the
+    table's unmapped columns (see _carry_plan), unscaled."""
     source = origin or f"source.{q(table.name)}"
     names, exprs = [], []
     counted: set[tuple[str, str]] = set()
@@ -590,6 +722,10 @@ def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[
         exprs.append(expr)
         if stats is not None:
             _count_cells(dst, source, field, column, locale, stats, counted)
+    for c in carried or ():
+        for name, expr, _ in _carry_columns(c):
+            names.append(name)
+            exprs.append(expr)
     cursor = dst.execute(
         f"INSERT INTO {target} ({','.join(names)}) SELECT {','.join(exprs)} FROM {source} AS src"
     )
@@ -614,21 +750,23 @@ def _count_cells(dst: sqlite3.Connection, source: str, field: str, column: str, 
 
 def _load_lines(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str],
                 synthetic_prefix: str, has_product: int, report: dict[str, Any], stats: Counter, *,
-                origin: str | None = None, defaults: dict[str, str] | None = None, scale: int = 1) -> int:
+                origin: str | None = None, defaults: dict[str, str] | None = None, scale: int = 1,
+                carried: list[Carried] | None = None) -> int:
     rows = _insert(dst, "raw_lines", table, roles, LINE_FIELDS, LINE_NUMBERS, synthetic_prefix,
-                   origin=origin, report=report, defaults=defaults, stats=stats, scale=scale)
+                   origin=origin, report=report, defaults=defaults, stats=stats, scale=scale, carried=carried)
     dst.execute("UPDATE raw_lines SET has_product=? WHERE has_product IS NULL", (has_product,))
     return rows
 
 
 def _load_sales(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], synthetic: str,
                 has_product: int, report: dict[str, Any], stats: Counter, *, scale: int = 1,
-                combined: bool = False) -> None:
+                combined: bool = False, carried: list[Carried] | None = None) -> None:
     """A sales table's lines. Rows are first copied and cleaned when needed (see _sales_source). With combined,
     a line whose product cell joins an item and its toppings is split (see _split_combined)."""
     start = dst.execute("SELECT COALESCE(MAX(rowid), 0) FROM raw_lines").fetchone()[0]
     origin = _sales_source(dst, table, roles, report, stats)
-    _load_lines(dst, table, roles, synthetic, has_product, report, stats, origin=origin, scale=scale)
+    _load_lines(dst, table, roles, synthetic, has_product, report, stats, origin=origin, scale=scale,
+                carried=carried)
     if origin:
         dst.execute("DROP TABLE temp.order_source")
     if combined:
@@ -1338,7 +1476,14 @@ def _regroup_values(dst: sqlite3.Connection, value_groups: dict[str, dict[str, s
     return changed
 
 
+def is_code_text(value: Any) -> bool:
+    """Letters and digits with no spaces, at least one digit: a plate, an id or a document number."""
+    return (value is not None and len(value) <= CODE_MAX_LENGTH and CODE_VALUE.fullmatch(value) is not None
+            and any(char.isdigit() for char in value))
+
+
 def _register(con: sqlite3.Connection) -> None:
+    con.create_function("is_code_text", 1, is_code_text)
     con.create_function("to_number", 1, to_number)
     con.create_function("to_number_en", 1, lambda v: _number(v, "en"))
     con.create_function("to_number_vi", 1, lambda v: _number(v, "vi"))
@@ -1354,7 +1499,8 @@ def _register(con: sqlite3.Connection) -> None:
 def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
           status_map: dict[str, str] | None = None, line_kinds: dict[str, str] | None = None,
           value_groups: dict[str, dict[str, str]] | None = None,
-          model_failures: list[ModelFailure | str] | None = None) -> dict[str, Any]:
+          model_failures: list[ModelFailure | str] | None = None,
+          conventions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """line_kinds maps a product name (normalized by normalize_lookup) to a LINE_ITEM_KINDS value.
 
     value_groups maps a role (a key of VALUE_GROUP_FIELDS) to {raw value: canonical value}.
@@ -1411,7 +1557,8 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report: dict[str, Any] = {
         "sales_tables": 0, "service_tables": 0, "purchase_tables": 0, "return_tables": 0, "unannotated": [],
         "duplicate_lines_removed": 0, "columns_with_locale_inferred": 0, "tickets_defaulted_completed": 0,
-        "qty_base_derived": 0,
+        "qty_base_derived": 0, "extra_columns": 0, "extra_numbers_not_scaled": [], "src_tables": [],
+        "join_keys": [], "catalog_rows": 0,
     }
     # A table takes the annotation of its columns, else that of a catalog sibling; the catalog sheets that share one
     # annotation form a pool, and their roles are chosen from the pooled values (see effective_roles).
@@ -1442,8 +1589,10 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
                   for table, note in annotated]
     for table, kind, roles in first_pass:
         _load_catalog_keys(dst, table, kind, roles)
+    carry_log: list[tuple[str, list[Carried]]] = []  # (layer table, columns carried into it), for the catalog
+    layer_loaded: set[str] = set()  # tables whose kind the layer loads; every other table is copied as src_
     for table, note in annotated:
-        unresolved = _given_by_column(table, note.get("roles") or {})[1]
+        given, unresolved = _given_by_column(table, note.get("roles") or {})
         roles = effective_roles(table, note, dst, pool_of(table, note))
         # Only a role that stayed missing after every fallback can break the table.
         stats["annotation_keys_unresolved"] += sum(role in COUNTED_ROLES and not roles.get(role) for role in unresolved)
@@ -1457,13 +1606,17 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
         if lost_order:
             stats["tables_skipped_missing_order_id"] += 1
             continue
+        if _layer_loads(note["kind"], roles):
+            layer_loaded.add(table.name)
         scale = _amount_scale(context, table)
         if scale != 1:
             stats["scaled_tables"] += 1
         if note["kind"] == "sales":
             product = roles.get("product_name") or roles.get("product_id")
+            carried = _extras_for(dst, table, given, _consumed(roles, LINE_READ_ROLES), "raw_lines", scale, report,
+                                  carry_log)
             _load_sales(dst, table, roles, synthetic, 1 if product else 0, report, stats, scale=scale,
-                        combined=combined)
+                        combined=combined, carried=carried)
             report["sales_tables"] += 1
         elif note["kind"] == "service_ticket":
             # one row per visit: the ticket is the order, its amount is the line, the work done is the product
@@ -1477,20 +1630,30 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             # a ledger with no status column records it in its notes, and a note with no status means completed;
             # only a ledger with neither a status nor a note column is completed by default
             status_defaulted = "order_status" not in ticket and not (ticket.get("order_note") or ticket.get("note"))
+            carried = _extras_for(dst, table, given, _consumed(ticket, LINE_READ_ROLES) | _consumed(roles,
+                                  SERVICE_READ_ROLES), "raw_lines", scale, report, carry_log)
             rows = _load_lines(dst, table, ticket, synthetic, 1, report, stats,
-                               defaults={"status": "completed"} if status_defaulted else None, scale=scale)
+                               defaults={"status": "completed"} if status_defaulted else None, scale=scale,
+                               carried=carried)
             if status_defaulted:
                 report["tickets_defaulted_completed"] += rows
             report["service_tables"] += 1
         elif note["kind"] == "purchase" and (roles.get("purchase_id") or roles.get("purchased_at")):
+            carried = _extras_for(dst, table, given, _consumed(roles, PURCHASE_READ_ROLES), "purchases", scale,
+                                  report, carry_log)
             _insert(dst, "purchases", table, roles, PURCHASE_FIELDS, PURCHASE_NUMBERS, report=report, stats=stats,
-                    scale=scale)
+                    scale=scale, carried=carried)
             report["purchase_tables"] += 1
         elif note["kind"] == "payment" and (roles.get("order_id") or roles.get("paid_at")):
+            carried = _extras_for(dst, table, given, _consumed(roles, PAYMENT_READ_ROLES), "payments", scale,
+                                  report, carry_log)
             _insert(dst, "payments", table, roles, PAYMENT_FIELDS, PAYMENT_NUMBERS, report=report, stats=stats,
-                    scale=scale)
+                    scale=scale, carried=carried)
         elif note["kind"] == "delivery" and (roles.get("order_id") or roles.get("delivered_at")):
-            _insert(dst, "deliveries", table, roles, DELIVERY_FIELDS, DELIVERY_NUMBERS, report=report, stats=stats)
+            carried = _extras_for(dst, table, given, _consumed(roles, DELIVERY_READ_ROLES), "deliveries", scale,
+                                  report, carry_log)
+            _insert(dst, "deliveries", table, roles, DELIVERY_FIELDS, DELIVERY_NUMBERS, report=report, stats=stats,
+                    carried=carried)
         elif note["kind"] == "sales_return":
             _load_returns(dst, table, roles)
             report["return_tables"] += 1
@@ -1521,6 +1684,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["non_product_lines"] = _classify_lines(dst, pairs)
     report["status_mapped"] = _map_status(dst, status_map or {}, stats)
     report["readme_unit_factors"] = _load_readme_unit_factors(dst, context.readme)
+    report["convention_unit_factors"] = _apply_unit_conventions(dst, conventions or [])
     report["qty_base_derived"] = _derive_qty_base(dst)
     _derive(dst)
     report["stock_rows"] = _build_stock(dst)
@@ -1533,7 +1697,20 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["employee_spellings_mapped"] = _map_employees(dst)
     stats["values_regrouped"] = _regroup_values(dst, value_groups or {})
     report["orders_marked_returned"] = _mark_returned(dst)
+    notes_of = {table.name: note for table, note in annotated}
+    for table in context.tables:
+        if table.name not in layer_loaded:
+            copied = _copy_unloaded(dst, table, notes_of.get(table.name), carry_log)
+            if copied:
+                report["src_tables"].append(copied)
+    report["extra_columns"] = sum(len(carried) for target, carried in carry_log if not target.startswith("src_"))
+    report["join_keys"], report["catalog_rows"] = _write_column_catalog(dst, carry_log)
+    report["catalog_attributes"] = _attach_catalog_attributes(dst, annotated)
     _write_shop_facts(dst, context)
+    report["conventions_applied"] = _apply_data_conventions(dst, conventions or [])
+    # The shop's own documentation, kept for the question stage (column descriptions, conventions).
+    dst.execute("CREATE TABLE shop_docs (key TEXT, text TEXT)")
+    dst.execute("INSERT INTO shop_docs VALUES ('readme', ?)", (context.readme or "",))
     dst.executemany("INSERT INTO build_stats VALUES (?,?)", [(key, stats[key]) for key in BUILD_STAT_KEYS])
     report["status_null_orders"] = dst.execute("SELECT COUNT(*) FROM orders WHERE status IS NULL").fetchone()[0]
     report["orders"] = dst.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
@@ -1547,6 +1724,119 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.commit()
     dst.close()
     return report
+
+
+def _layer_loads(kind: str, roles: dict[str, str]) -> bool:
+    """True when the layer reads the table: its kind has a loader and, for a purchase, payment or delivery table,
+    the roles that loader needs are present (the same guards as build)."""
+    if kind == "purchase":
+        return bool(roles.get("purchase_id") or roles.get("purchased_at"))
+    if kind == "payment":
+        return bool(roles.get("order_id") or roles.get("paid_at"))
+    if kind == "delivery":
+        return bool(roles.get("order_id") or roles.get("delivered_at"))
+    return kind in LAYER_KINDS
+
+
+def _carry_order_columns(dst: sqlite3.Connection) -> None:
+    """Order-level extras: the first non-empty value of the order's lines, in line order. A blank cell in a later
+    row of a group repeats the first row (rulebook), so the order takes the first value its lines give."""
+    for name, sql_type in _extra_columns(dst, "raw_lines"):
+        dst.execute(f"ALTER TABLE orders ADD COLUMN {q(name)} {sql_type}")
+        dst.execute(
+            f"UPDATE orders SET {q(name)}=(SELECT r.{q(name)} FROM raw_lines AS r "
+            f"WHERE r.order_id=orders.order_id AND r.{q(name)} IS NOT NULL ORDER BY r.rowid LIMIT 1)"
+        )
+
+
+def _copy_unloaded(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any] | None,
+                   carry_log: list[tuple[str, list[Carried]]]) -> str | None:
+    """A table the layer does not read, copied whole as src_<table name>: every column as text, with the numeric and
+    date twins. Returns the copy's name, or None when the table has no column."""
+    given = _given_by_column(table, note.get("roles") or {})[0] if note is not None else None
+    carried = _carry_plan(dst, table, set(), given)
+    if not carried:
+        return None
+    columns: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for c in carried:  # a twin whose name a plain column already has is left out
+        for entry in _carry_columns(c, plain=True):
+            if entry[0] not in seen:
+                seen.add(entry[0])
+                columns.append(entry)
+    name = f"src_{table.name}"
+    definitions = ", ".join(f"{q(column)} {sql_type}" for column, _, sql_type in columns)
+    names = ", ".join(q(column) for column, _, _ in columns)
+    values = ", ".join(expr for _, expr, _ in columns)
+    dst.execute(f"CREATE TABLE {q(name)} ({definitions})")
+    dst.execute(f"INSERT INTO {q(name)} ({names}) SELECT {values} FROM source.{q(table.name)} AS src")
+    carry_log.append((name, carried))
+    return name
+
+
+def _join_key(dst: sqlite3.Connection, target: str, column: str) -> str | None:
+    """orders.order_id when at least JOIN_MIN_SHARE of the column's distinct values are order ids."""
+    total, hits = dst.execute(
+        f"SELECT COUNT(__value), SUM(CASE WHEN __value IN (SELECT order_id FROM orders) THEN 1 ELSE 0 END) "
+        f"FROM (SELECT DISTINCT {q(column)} AS __value FROM {q(target)})"
+    ).fetchone()
+    return "orders.order_id" if total and (hits or 0) >= JOIN_MIN_SHARE * total else None
+
+
+def _catalog_row(dst: sqlite3.Connection, target: str, column: str, c: Carried, value_type: str,
+                 join_key: str | None) -> tuple[Any, ...]:
+    table, name = q(target), q(column)
+    distinct = dst.execute(f"SELECT COUNT(DISTINCT {name}) FROM {table}").fetchone()[0]
+    samples = [value for (value,) in dst.execute(
+        f"SELECT __value FROM (SELECT {name} AS __value, MIN(rowid) AS __first FROM {table} "
+        f"WHERE {name} IS NOT NULL GROUP BY __value ORDER BY __first LIMIT {CATALOG_SAMPLES})")]
+    return (target, column, c.table, c.header, c.role, value_type, distinct,
+            json.dumps(samples, ensure_ascii=False), join_key)
+
+
+def _write_column_catalog(dst: sqlite3.Connection, carry_log: list[tuple[str, list[Carried]]]) -> tuple[list[str], int]:
+    """column_catalog: a row for each carried column of a layer table and each column of a src_ table, with its
+    original header, annotated role, value type, distinct count, sample values and join key (a src_ column whose
+    values are order ids). Returns the join keys found and the number of rows."""
+    dst.execute(
+        "CREATE TABLE column_catalog (table_name TEXT, column_name TEXT, source_table TEXT, source_header TEXT, "
+        "role TEXT, value_type TEXT, distinct_count INTEGER, sample_values TEXT, join_key_to TEXT)"
+    )
+    origins: dict[str, Carried] = {}  # a carried column's name is its source column; the first table to carry it
+    for target, carried in carry_log:
+        if not target.startswith("src_"):
+            for c in carried:
+                origins.setdefault(c.source, c)
+    rows: list[tuple[Any, ...]] = []
+    for target in CATALOG_TARGETS:
+        for name, _ in _extra_columns(dst, target):
+            prefix = next(p for p in EXTRA_PREFIXES if name.startswith(p))
+            c = origins.get(name[len(prefix):])
+            if c is not None:
+                value_type = {"x_": c.value_type, "xn_": "number", "xd_": "date"}[prefix]
+                rows.append(_catalog_row(dst, target, name, c, value_type, None))
+    joins: list[str] = []
+    for target, carried in carry_log:
+        if not target.startswith("src_"):
+            continue
+        existing = {row[1] for row in dst.execute(f"PRAGMA table_info({q(target)})")}
+        seen: set[str] = set()
+        for c in carried:
+            for name, _, _ in _carry_columns(c, plain=True):
+                if name in seen or name not in existing:
+                    continue
+                seen.add(name)
+                join_key = None
+                if name == c.source:
+                    value_type = c.value_type
+                    join_key = _join_key(dst, target, name)
+                else:
+                    value_type = "number" if name.startswith("xn_") else "date"
+                if join_key:
+                    joins.append(f"{target}.{name}")
+                rows.append(_catalog_row(dst, target, name, c, value_type, join_key))
+    dst.executemany("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    return joins, len(rows)
 
 
 def _failure_row(item: ModelFailure | str) -> tuple[str, str | None, str | None]:
@@ -1574,6 +1864,152 @@ def _mark_returned(dst: sqlite3.Connection) -> int:
     return marked
 
 
+CATALOG_ATTR_MAX_DISTINCT = 100
+CATALOG_ATTR_KINDS = ("product_catalog", "unit_conversion", "alias")
+# Roles the catalog loaders read (product facts, unit factors, aliases, attributes); any other column is attached.
+CATALOG_READ_ROLES = ("product_id", "product_name", "product_category", "base_unit", "catalog_cost", "catalog_price",
+                      "unit", "conversion_factor", "large_unit", "product_alias", "alias_key", "prescription",
+                      "active_ingredient", "product_kind")
+
+
+def _attach_catalog_attributes(dst: sqlite3.Connection, annotated: list[tuple[TableMeta, dict[str, Any]]]) -> list[str]:
+    """Columns of a product list that no canonical field reads and that hold few distinct values (a size, a brand,
+    a kind) are attached to each sale line of that product as x_cat_<column>, matched by product id when both
+    sides have one, else by normalized name, and described in column_catalog. Returns the columns attached."""
+    if not _has_table(dst, "lines") or not _has_table(dst, "column_catalog"):
+        return []
+    line_cols = {r[1] for r in dst.execute("PRAGMA table_info(lines)")}
+    attached: list[str] = []
+    for table, note in annotated:
+        if note.get("kind") not in CATALOG_ATTR_KINDS:
+            continue
+        roles = {v: k for k, v in (note.get("roles") or {}).items() if isinstance(v, str)}
+        by_column = note.get("roles") or {}
+        pid, name = roles.get("product_id"), roles.get("product_name")
+        if not (pid or name):
+            continue
+        use_id = bool(pid) and "product_id" in line_cols and dst.execute(
+            "SELECT 1 FROM lines WHERE product_id IS NOT NULL LIMIT 1").fetchone() is not None
+        for column in table.columns:
+            if by_column.get(column.name) in CATALOG_READ_ROLES or column.name.startswith("__"):
+                continue
+            target = f"x_cat_{column.name}"
+            if target in line_cols:
+                continue
+            distinct = dst.execute(f"SELECT COUNT(DISTINCT {_text(column.name)}) FROM source.{q(table.name)} AS src"
+                                   ).fetchone()[0]
+            if not distinct or distinct > CATALOG_ATTR_MAX_DISTINCT:
+                continue
+            key_src, key_line = ((_text(pid), "lines.product_id") if use_id
+                                 else (f"lookup({_text(name)})", "lookup(lines.product_name)"))
+            dst.execute(f"ALTER TABLE lines ADD COLUMN {q(target)} TEXT")
+            dst.execute(
+                f"UPDATE lines SET {q(target)} = (SELECT {_text(column.name)} FROM source.{q(table.name)} AS src "
+                f"WHERE {key_src} = {key_line} AND {_text(column.name)} IS NOT NULL LIMIT 1)")
+            filled = dst.execute(f"SELECT COUNT({q(target)}) FROM lines").fetchone()[0]
+            if not filled:
+                continue
+            samples = [r[0] for r in dst.execute(
+                f"SELECT DISTINCT {q(target)} FROM lines WHERE {q(target)} IS NOT NULL LIMIT {CATALOG_SAMPLES}")]
+            dst.execute("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)",
+                        ("lines", target, table.name, column.original_name, "other", "text", distinct,
+                         json.dumps(samples, ensure_ascii=False), None))
+            line_cols.add(target)
+            attached.append(target)
+    return attached
+
+
+def _apply_unit_conventions(dst: sqlite3.Connection, directives: list[dict[str, Any]]) -> int:
+    """README unit conversions extracted by the model, applied only for products whose sale lines use that large
+    unit (checked on the data). Returns the number of products given a factor."""
+    sold = {}
+    for name, unit in dst.execute("SELECT DISTINCT product_name, unit FROM raw_lines WHERE product_name IS NOT NULL"):
+        sold.setdefault(normalize_lookup(name), set()).add(normalize_lookup(unit) if unit else "")
+    added = 0
+    for item in directives:
+        if item.get("type") != "unit_factor":
+            continue
+        large, base = normalize_lookup(item["large_unit"]), item["base_unit"]
+        named = [normalize_lookup(p) for p in item.get("products") or [] if isinstance(p, str)]
+        if named:
+            keys = [k for k in sold if any(n and (k == n or n in k) for n in named)]
+        else:
+            keys = list(sold)
+        keys = [k for k in keys if large in sold[k]]  # the product is really sold by that large unit
+        for key in keys:
+            dst.executemany(
+                "INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) VALUES (NULL,?,?,?)",
+                [(key, large, float(item["factor"])), (key, normalize_lookup(base), 1.0)])
+            dst.execute("INSERT INTO temp.product_facts (product_id, name_key, category, base_unit, unit_cost) "
+                        "VALUES (NULL,?,NULL,?,NULL)", (key, base))
+            added += 1
+    return added
+
+
+def _apply_data_conventions(dst: sqlite3.Connection, directives: list[dict[str, Any]]) -> list[str]:
+    """Conventions about meaning, each checked on the data before it is recorded or applied:
+    - zero_amount_meaning: recorded as a shop fact only when the shop has orders with zero money;
+    - return_marker: orders whose kept column (matched by its original header) holds one of the words are marked
+      returned, only when that column exists and some values hold the words;
+    - negative_qty_is_return: recorded as a shop fact when negative quantities exist."""
+    applied: list[str] = []
+    for item in directives:
+        kind = item.get("type")
+        if kind == "zero_amount_meaning":
+            zero = dst.execute("SELECT COUNT(*) FROM orders WHERE COALESCE(revenue, 0) = 0").fetchone()[0]
+            if zero:
+                dst.execute("INSERT INTO shop_facts VALUES (?, 1)", (f"zero_amount_is_{item['meaning']}",))
+                applied.append(f"zero_amount_is_{item['meaning']}")
+        elif kind == "debt_state_column" and isinstance(item.get("values"), dict):
+            header = normalize_lookup(item.get("column", ""))
+            row = dst.execute(
+                "SELECT column_name FROM column_catalog WHERE table_name='orders' AND lookup(source_header)=?",
+                (header,)).fetchone() if _has_table(dst, "column_catalog") else None
+            if row is None or "outstanding" not in {r[1] for r in dst.execute("PRAGMA table_info(orders)")}:
+                continue
+            states = {normalize_lookup(k): v for k, v in item["values"].items() if isinstance(v, list) and len(v) == 2}
+            updates = []
+            for order_id, text in dst.execute(f"SELECT order_id, {row[0]} FROM orders WHERE {row[0]} IS NOT NULL"):
+                state = states.get(normalize_lookup(str(text)))
+                if state and state[0]:
+                    updates.append((float(state[1] or 0), order_id))
+            if updates:
+                dst.executemany("UPDATE orders SET outstanding=? WHERE order_id=?", updates)
+                dst.execute("INSERT INTO shop_facts VALUES ('debt_state_at_data_end', 1)")
+                applied.append(f"debt_state_column:{row[0]}:{len(updates)}")
+        elif kind == "negative_qty_is_return":
+            if dst.execute("SELECT 1 FROM raw_lines WHERE qty < 0 LIMIT 1").fetchone():
+                dst.execute("INSERT INTO shop_facts VALUES ('negative_qty_is_return', 1)")
+                applied.append("negative_qty_is_return")
+        elif kind == "return_marker":
+            header = normalize_lookup(item["column"])
+            row = dst.execute(
+                "SELECT column_name FROM column_catalog WHERE table_name='orders' AND column_name LIKE 'x\\_%' "
+                "ESCAPE '\\' AND lookup(source_header)=?", (header,)).fetchone() if _has_table(dst, "column_catalog") else None
+            if row is None:
+                continue
+            words = [normalize_lookup(w) for w in item["words"] if isinstance(w, str) and normalize_lookup(w)]
+            cond = " OR ".join("lookup({c}) LIKE ?".format(c=row[0]) for _ in words)
+            if not cond:
+                continue
+            args = [f"%{w}%" for w in words]
+            hits = dst.execute(f"SELECT order_id FROM orders WHERE {cond}", args).fetchall()
+            if not hits:
+                continue
+            ids = [h[0] for h in hits]
+            marks = ",".join("?" for _ in ids)
+            cancelled = ",".join(_sql_text(v) for v in rulebook_params.active().cancelled_statuses) or "''"
+            for table in ("orders", "lines"):
+                dst.execute(f"UPDATE {table} SET status='returned' WHERE order_id IN ({marks}) "
+                            f"AND COALESCE(status,'') NOT IN ({cancelled})", ids)
+            applied.append(f"return_marker:{row[0]}:{len(ids)}")
+    return applied
+
+
+def _has_table(dst: sqlite3.Connection, name: str) -> bool:
+    return dst.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
 def _write_shop_facts(dst: sqlite3.Connection, context: BusinessContext) -> None:
     """Yes-or-no facts about the shop, read by the question layer: an address column, a customer group, any orders."""
     address = any(_has_address_header(column.original_name) for table in context.tables for column in table.columns)
@@ -1591,6 +2027,7 @@ def _has_address_header(original_name: str) -> bool:
 
 def _derive(dst: sqlite3.Connection) -> None:
     _derive_orders(dst)
+    _carry_order_columns(dst)
     _fill_customer_names(dst)
     _fill_customer_groups(dst)
     _derive_lines(dst)
@@ -1674,6 +2111,7 @@ def _derive_lines(dst: sqlite3.Connection) -> None:
     not_revenue = ",".join(_sql_text(kind) for kind in NOT_REVENUE_LINE_KINDS)
     status = "','".join(CANONICAL_STATUS)
     service_fees = ",".join(_sql_text(name) for name in rulebook_params.active().service_fee_names)
+    extra = "".join(f", l.{q(name)}" for name, _ in _extra_columns(dst, "raw_lines"))  # each line's own values
     dst.executescript(
         f"""
         CREATE TABLE lines AS
@@ -1689,7 +2127,7 @@ def _derive_lines(dst: sqlite3.Connection) -> None:
                {_product_fact('base_unit')} AS base_unit,
                {_product_fact('prescription', 'temp.product_attrs')} AS prescription,
                {_product_fact('active_ingredient', 'temp.product_attrs')} AS active_ingredient,
-               {_product_fact('product_kind', 'temp.product_attrs')} AS product_kind
+               {_product_fact('product_kind', 'temp.product_attrs')} AS product_kind{extra}
         FROM raw_lines l JOIN orders o USING(order_id)
         WHERE l.has_product=1 AND l.line_kind NOT IN ({not_revenue})
           AND (l.product_name IS NOT NULL OR l.product_id IS NOT NULL);

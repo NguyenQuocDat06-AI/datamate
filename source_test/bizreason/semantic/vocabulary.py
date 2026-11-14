@@ -224,3 +224,10 @@ DELIVERY_WORDS = ("giao", "cho di", "cho hang")
 TRIP_WORDS = ("dot", "chuyen", "luot")
 # A ranking "nhiều đơn nhất" ranks by the number of orders.
 MOST_ORDERS_CUE = "nhieu don nhat"
+# "số nhập trừ số bán", "chênh lệch nhập trừ bán", "nhập trừ bán": received minus sold (rulebook §5).
+PURCHASE_MINUS_SOLD_RE = r"\bnhap(?: vao| ve| zia)? (?:\S+ ){0,6}?tru (?:\S+ ){0,3}?ban\b"
+# Rulebook phrases that must be present for an industry rule to apply (rule gating): repair visits counted as
+# tickets, device lines across capacities, multi-trip deliveries.
+RULE_TICKET_VISITS = ("luot xe",)
+RULE_DEVICE_LINE = ("dong may",)
+RULE_DELIVERY_TRIPS = ("dot", "giao")

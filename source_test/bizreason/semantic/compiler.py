@@ -15,6 +15,7 @@ from typing import Any
 from bizreason.contracts import TimeWindow
 from bizreason.semantic import rulebook_params
 from bizreason.semantic.vocabulary import GENERIC_FILTER_WORDS, LOT_MEASURES, STOCK_MEASURES
+from bizreason.semantic.vocabulary import RULE_DEVICE_LINE
 from bizreason.utils import normalize_lookup
 
 
@@ -131,13 +132,30 @@ def _word_match(values: list[Any], needle: str) -> list[Any]:
         return _all_spellings(values, covering)
     # A device line names every capacity of it ("dòng máy" = the name before "…GB"): the stored names that are the
     # filter text followed only by a capacity are one line.
-    line = [v for v in values if re.fullmatch(rf"{re.escape(needle)} \d+ ?(?:gb|tb)", normalize_lookup(v))]
+    if not rulebook_params.mentions(*RULE_DEVICE_LINE):
+        return []
+    line = [v for v in values if re.fullmatch(rf"{re.escape(needle)} \d+ ?(?:gb|tb)(?: .*)?", normalize_lookup(v))]
     return line
 
 
 def _name_key(value: Any) -> str:
     """A stored name compared without spaces, so "30ml" and "30 ml" are one spelling."""
     return normalize_lookup(value).replace(" ", "")
+
+
+LIST_CELL_SHARE = 0.3
+
+
+def _list_cell_match(values: list[Any], needle: str) -> list[Any]:
+    """Cells that list several items ("a, b + c"): when such cells are common in the column, a filter names every
+    cell that has one item containing the filter text as whole words."""
+    if not values or not needle:
+        return []
+    listed = [v for v in values if re.search(r"[,;+]", str(v))]
+    if len(listed) / len(values) < LIST_CELL_SHARE:
+        return []
+    padded = f" {needle} "
+    return [v for v in values if any(padded in f" {normalize_lookup(part)} " for part in re.split(r"[,;+]", str(v)))]
 
 
 def _one_name(values: list[Any]) -> bool:
@@ -159,6 +177,11 @@ def _uses_customers(intent: Intent) -> bool:
         or (intent.threshold or {}).get("subject") == "customer"
         or any(item.get("dim") == "customer" for item in intent.filters)
     )
+
+COLUMN_OPS = ("contains", "not_contains", "eq", "nonempty", "after_today", "before_today", "on_or_before_today",
+              "on_or_after_today", "in_period")
+COLUMN_MEASURE_OPS = ("sum", "count", "count_distinct")
+
 
 class Unsupported(Exception):
     """The system cannot establish an answer; the caller abstains."""
@@ -218,6 +241,10 @@ class Intent:
     location: str | None = None
     # Rankings only: an entity needs at least this many valid orders in the window to be ranked (a rulebook term).
     min_orders: int | None = None
+    # A measure on any kept column: {"op": "sum|count|count_distinct", "column": name} (see column_catalog).
+    column_measure: dict[str, Any] | None = None
+    # Conditions on any kept column: [{"column": name, "op": COLUMN_OPS, "value": ...}].
+    column_filters: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -381,7 +408,7 @@ def _as_scalar_pair(intent: Intent, windows: list[TimeWindow]) -> Intent:
 
 def _same_measure_pair(intent: Intent, windows: list[TimeWindow]) -> tuple[TimeWindow, list[Intent]] | None:
     """The parser mislabels two members of one dimension as a compare; each member is answered as its own scalar."""
-    if intent.measure2 != intent.measure:
+    if intent.measure2 != intent.measure and not (intent.measure2 is None and intent.shape == "breakdown"):
         return None
     repeated = _repeated_dims(intent.filters)
     if intent.group_by is not None and list(repeated) == [intent.group_by]:
@@ -411,6 +438,9 @@ class Compiler:
     def __init__(self, connection: sqlite3.Connection):
         self.db = connection
         self.db.create_function("clock_of", 1, _clock_of)
+        self.db.create_function("lookup", 1, lambda v: None if v is None else normalize_lookup(str(v)))
+        self.as_of: date | None = None
+        self._period: tuple[str, str] | None = None
         self.db.create_function("name_head", 1, _name_head)
         self.db.create_aggregate("best_spelling", 1, _BestSpelling)
         self.has_lines = self.db.execute("SELECT 1 FROM lines LIMIT 1").fetchone() is not None
@@ -489,6 +519,11 @@ class Compiler:
         """
         if not needle:
             return []
+        if partial and dim in WORD_MATCH_DIMS:
+            cells = _list_cell_match(values, needle)
+            if cells:
+                # A column of item lists: a filter names every cell that lists the item.
+                return cells
         exact = [v for v in values if normalize_lookup(v) == needle]
         if exact and dim in WORD_MATCH_DIMS:
             # Every spelling of the same name ("100ml" and "100 ml") is the same product or group.
@@ -505,7 +540,10 @@ class Compiler:
             if _one_name(loose):
                 return _all_spellings(values, loose)
         if partial and dim in WORD_MATCH_DIMS:
-            return _word_match(values, needle)
+            found = _word_match(values, needle)
+            if found:
+                return found
+            return _list_cell_match(values, needle)
         return []
 
     def _stored_matches(
@@ -634,13 +672,30 @@ class Compiler:
 
     def _predicates(self, intent: Intent, skip: bool = False) -> tuple[list[str], list[Any], bool]:
         sql, args, needs_lines = [], [], False
+        included: dict[str, int] = {}
         if not skip:
             for item in intent.filters:
-                piece, values, line = self.resolve_filter(item["dim"], item["value"])
+                try:
+                    piece, values, line = self.resolve_filter(item["dim"], item["value"])
+                except Unsupported as original:
+                    # A group the shop does not have may be one of its product kinds (new / used / accessory).
+                    if item["dim"] != "product_group" or "product_kind" not in self.line_columns:
+                        raise
+                    try:
+                        piece, values, line = self.resolve_filter("product_kind", item["value"])
+                    except Unsupported:
+                        raise original from None
                 if item.get("exclude") is True:
                     column = "base_unit" if item["dim"] == "unit" and self.base_unit else _filter_column(item["dim"])
                     piece = f"({column} IS NULL OR NOT ({piece}))"
-                sql.append(piece)
+                    sql.append(piece)
+                elif item["dim"] != "product" and included.get(item["dim"]) == len(sql) - 1:
+                    # Two members of one dimension in a single value ("máy mới và máy cũ"): either one, not both.
+                    at = included[item["dim"]]
+                    sql[at] = f"({sql[at]} OR {piece})"
+                else:
+                    included[item["dim"]] = len(sql)
+                    sql.append(piece)
                 args.extend(values)
                 needs_lines = needs_lines or line
         return sql, args, needs_lines
@@ -670,6 +725,14 @@ class Compiler:
         if subject not in THRESHOLD_SUBJECTS:
             raise Unsupported(f"threshold subject {subject}")
         table, key, metrics = THRESHOLD_SUBJECTS[subject]
+        if subject == "order" and metric == "delivery_trips":
+            # Rulebook (giao nhiều đợt): delivery trips of the order made up to the end of today.
+            if self.as_of is None or "trip" not in self._table_columns("deliveries"):
+                raise Unsupported("delivery trips unavailable")
+            today = self.as_of.isoformat()
+            metrics = {**metrics, "delivery_trips": (
+                "MAX((SELECT COUNT(DISTINCT COALESCE(d.trip, d.date)) FROM deliveries d "
+                f"WHERE d.order_id = orders.order_id AND (d.date IS NULL OR d.date <= '{today}')))")}
         if metric not in metrics:
             raise Unsupported(f"threshold metric {metric} on {subject}")
         if op_name not in THRESHOLD_OPS:
@@ -744,12 +807,23 @@ class Compiler:
             if not _mentions(method, params.non_debt_method_tokens)
         ]
 
-    def _payment_index(self) -> dict[Any, list[tuple[Any, Any]]]:
-        """Payments grouped by order as (paid_on, amount). Raises when the shop has no payment record."""
+    def _payment_index(self, window: TimeWindow | None = None) -> dict[Any, list[tuple[Any, Any]]]:
+        """Payments grouped by order as (paid_on, amount). Raises when the shop has no payment record.
+
+        A shop whose README says a column states what is still owed at the end of the data (read into
+        orders.outstanding) gets one settled amount per order, valid only for a cutoff at or after the data's last
+        day; an earlier cutoff raises."""
         try:
             payment_rows = self.db.execute("SELECT order_id, date, amount FROM payments").fetchall()
         except sqlite3.OperationalError as exc:
             raise Unsupported("no payments table") from exc
+        if not payment_rows and self._fact("debt_state_at_data_end"):
+            last = self.db.execute("SELECT MAX(date) FROM orders").fetchone()[0]
+            if window is None or last is None or (window.end_exclusive - timedelta(days=1)).isoformat() < last:
+                raise Unsupported("debt known only at the end of the data")
+            return {order_id: [(day, max(float(due or 0) - float(owed or 0), 0.0))]
+                    for order_id, day, due, owed in self.db.execute(
+                        "SELECT order_id, date, COALESCE(total_due, revenue), COALESCE(outstanding, 0) FROM orders")}
         if not payment_rows:
             raise Unsupported("no payments")
         paid: dict[Any, list[tuple[Any, Any]]] = {}
@@ -777,7 +851,7 @@ class Compiler:
 
     def _debt(self, intent: Intent, window: TimeWindow, skip_filters: bool) -> float | None:
         """Rulebook §4. The unpaid part of an order is its total_due less payments dated up to the cutoff, never below 0."""
-        paid = self._payment_index()
+        paid = self._payment_index(window if intent.measure in ("debt_outstanding", "debtor_count") else None)
         orders = self._debt_orders(intent, skip_filters)
         if orders and all(due is None for _, _, _, due, _ in orders):
             raise Unsupported("no total_due")
@@ -815,7 +889,7 @@ class Compiler:
         None = no upper bound). Age counts days from the order date to the last day of the window."""
         if intent.measure != "debt_outstanding" or not buckets:
             raise Unsupported("debt aging needs debt_outstanding and buckets")
-        paid = self._payment_index()
+        paid = self._payment_index(window)
         orders = self._debt_orders(intent, False)
         if orders and all(due is None for _, _, _, due, _ in orders):
             raise Unsupported("no total_due")
@@ -848,7 +922,7 @@ class Compiler:
 
     def _ranked_debtors(self, intent: Intent, window: TimeWindow) -> list[tuple[Any, float]]:
         """Rulebook §4 and §3: customers by the debt still owed at the window's last day, largest first."""
-        paid = self._payment_index()
+        paid = self._payment_index(window)
         orders = self._debt_orders(intent, skip_filters=False)
         if orders and all(due is None for _, _, _, due, _ in orders):
             raise Unsupported("no total_due")
@@ -894,6 +968,38 @@ class Compiler:
             values + [window.start.isoformat(), window.end_exclusive.isoformat()],
         ).fetchone()
         return row[0]
+
+    def purchase_minus_sold(self, intent: Intent, window: TimeWindow) -> float | None:
+        """Rulebook §5 'nhập trừ bán': quantity received (non-cancelled receipts dated in the window) minus quantity
+        sold on valid sales (§1), both in base units, for one product."""
+        product = self._sole_product(intent, False)
+        piece, values, _ = self.resolve_filter("product", product, on="purchases")
+        span = [window.start.isoformat(), window.end_exclusive.isoformat()]
+        has_unit = "unit" in self._table_columns("purchases")
+        unit_expr = "unit" if has_unit else "NULL"
+        rows = self.db.execute(
+            f"SELECT {unit_expr}, SUM(qty) FROM purchases WHERE cancelled=0 AND qty IS NOT NULL AND {piece} "
+            "AND date>=? AND date<? GROUP BY 1", values + span).fetchall()
+        received = None
+        line_piece, line_values, _ = self.resolve_filter("product", product)
+        for unit, qty in rows:
+            factor = 1.0
+            if unit is not None:
+                # the product's own base units per purchase unit, as its sale lines in that unit record it
+                found = self.db.execute(
+                    f"SELECT qty_base*1.0/qty FROM lines WHERE {line_piece} AND qty>0 AND qty_base IS NOT NULL "
+                    "AND lookup(unit)=lookup(?) LIMIT 1", line_values + [unit]).fetchone()
+                base = self.db.execute(f"SELECT 1 FROM lines WHERE {line_piece} AND qty_base=qty AND "
+                                       "lookup(unit)=lookup(?) LIMIT 1", line_values + [unit]).fetchone()
+                if found is not None:
+                    factor = float(found[0])
+                elif base is None:
+                    raise Unsupported(f"purchase unit {unit} has no conversion")
+            received = (received or 0.0) + float(qty) * factor
+        sold = self.value(replace(intent, measure="qty_base_sold", measure2=None, shape="scalar"), window)
+        if received is None:
+            raise NotRecorded("no purchase recorded")
+        return float(received) - float(sold or 0)
 
     def _unit_sale_price(self, intent: Intent, window: TimeWindow, skip_filters: bool) -> float | None:
         """Unit price charged for one product on the window's single day, from sale lines of every status.
@@ -1114,6 +1220,9 @@ class Compiler:
             return self._unit_sale_price(intent, window, skip_filters)
         if m == "delivery_trip_count":
             return self._delivery_trips(intent, window, skip_filters)
+        if m in ("warranty_count", "warranty_rate") and not self._fact("zero_amount_is_warranty"):
+            # Only a shop whose README says zero-money tickets are warranty visits has warranty tickets we can count.
+            raise Unsupported("warranty tickets not identified by the shop's conventions")
         if m == "net_profit":
             return self._net_profit(intent, window, skip_filters)
         span = [window.start.isoformat(), window.end_exclusive.isoformat()]
@@ -1153,6 +1262,14 @@ class Compiler:
             "qty_base_sold": f"SELECT SUM(COALESCE(qty_base, qty)) FROM lines WHERE {_valid_sale_sql()} AND {self.items_only} AND {clause}",
             "distinct_customers": f"SELECT COUNT(DISTINCT customer_key) FROM {source} WHERE {_valid_sale_sql()} AND {clause}",
             "active_days": f"SELECT COUNT(DISTINCT date) FROM {source} WHERE {_valid_sale_sql()} AND {clause}",
+            # Rulebook (sửa xe): every ticket is one visit, warranty tickets included; a warranty ticket collects no
+            # money, and the warranty rate divides warranty tickets by tickets that collected money.
+            "service_ticket_count": f"SELECT COUNT(DISTINCT order_id) FROM {source} WHERE {_valid_sale_sql()} AND {clause}",
+            "warranty_count": (f"SELECT COUNT(DISTINCT CASE WHEN COALESCE({amount},0)=0 THEN order_id END) FROM {source} "
+                               f"WHERE {_valid_sale_sql()} AND {clause}"),
+            "warranty_rate": (f"SELECT 100.0*COUNT(DISTINCT CASE WHEN COALESCE({amount},0)=0 THEN order_id END)"
+                              f"/NULLIF(COUNT(DISTINCT CASE WHEN {amount}>0 THEN order_id END),0) FROM {source} "
+                              f"WHERE {_valid_sale_sql()} AND {clause}"),
             "gross_profit": f"SELECT SUM(amount)-SUM(qty*line_cost) FROM lines WHERE {_valid_sale_sql()} AND {clause}",
             "cancel_rate": (
                 f"SELECT 100.0*COUNT(DISTINCT CASE WHEN {_cancelled_sql()} THEN order_id END)"
@@ -1170,7 +1287,7 @@ class Compiler:
             if measure in PURCHASE_MEASURES:
                 raise NotRecorded("no purchase recorded")
             raise Unsupported("empty result")
-        if measure == "cancel_rate":
+        if measure in ("cancel_rate", "warranty_rate"):
             return Answer("percent", _round2(value))
         if measure in MONEY:
             return Answer("number", _round_money(value))
@@ -1218,6 +1335,7 @@ class Compiler:
             "cancelled_count": "COUNT(DISTINCT order_id)", "orders_containing_product": "COUNT(DISTINCT order_id)",
             "active_days": "COUNT(DISTINCT date)",
             "avg_per_order": f"SUM({amount})*1.0/NULLIF(COUNT(DISTINCT order_id),0)",
+            "service_ticket_count": "COUNT(DISTINCT order_id)",
         }.get(m)
         if score is None:
             raise Unsupported(f"ranking of {m}")
@@ -1366,7 +1484,137 @@ class Compiler:
         except sqlite3.OperationalError:
             return False
 
+    def _fact(self, key: str) -> bool:
+        try:
+            row = self.db.execute("SELECT value FROM shop_facts WHERE key=?", (key,)).fetchone()
+        except sqlite3.Error:
+            return False
+        return bool(row and row[0])
+
+    def _table_columns(self, table: str) -> set[str]:
+        try:
+            return {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            return set()
+
+    def _column_home(self, column: str) -> str | None:
+        """The canonical or src_ table holding a kept column (orders first, then lines, then the others)."""
+        tables = ["orders", "lines", "deliveries", "purchases", "payments"] + [
+            r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'src_%'")]
+        for table in tables:
+            if column in self._table_columns(table):
+                return table
+        return None
+
+    @staticmethod
+    def _twin(columns: set[str], column: str, kind: str) -> str | None:
+        base = column[2:] if column.startswith("x_") else column
+        name = f"{kind}_{base}"
+        return name if name in columns else None
+
+    def _column_condition(self, alias: str, columns: set[str], item: dict[str, Any]) -> tuple[str, list[Any]]:
+        column, op, value = item.get("column"), item.get("op"), item.get("value")
+        if column not in columns or op not in COLUMN_OPS:
+            raise Unsupported(f"column filter {column} {op}")
+        ref = f"{alias}.{column}"
+        if op in ("contains", "not_contains", "eq"):
+            needle = normalize_lookup(str(value or ""))
+            if not needle:
+                raise Unsupported("empty column filter value")
+            if op == "eq":
+                return f"lookup({ref}) = ?", [needle]
+            neg = "NOT " if op == "not_contains" else ""
+            return f"COALESCE(lookup({ref}), '') {neg}LIKE ?", [f"%{needle}%"]
+        if op == "nonempty":
+            return f"NULLIF(TRIM(CAST({ref} AS TEXT)), '') IS NOT NULL", []
+        dated = self._twin(columns, column, "xd") or (column if column.startswith("xd_") else None)
+        if dated is None or (self.as_of is None and op != "in_period"):
+            raise Unsupported(f"date condition on {column}")
+        if op == "in_period":
+            if self._period is None:
+                raise Unsupported("in_period needs a window")
+            return f"{alias}.{dated} >= ? AND {alias}.{dated} < ?", list(self._period)
+        sql = {"after_today": ">", "before_today": "<", "on_or_before_today": "<=", "on_or_after_today": ">="}[op]
+        return f"{alias}.{dated} {sql} ?", [self.as_of.isoformat()]
+
+    def column_value(self, intent: Intent, window: TimeWindow) -> float | None:
+        """A sum, count or distinct count on any kept column, over valid sales in the window (rulebook §1)."""
+        spec = intent.column_measure or {}
+        column, op = spec.get("column"), spec.get("op")
+        if op not in COLUMN_MEASURE_OPS or not isinstance(column, str):
+            raise Unsupported("column measure")
+        home = self._column_home(column)
+        if home is None:
+            raise Unsupported(f"unknown column {column}")
+        cols = self._table_columns(home)
+        span = [window.start.isoformat(), window.end_exclusive.isoformat()]
+        self._period = None
+        if any(f.get("op") == "in_period" for f in intent.column_filters):
+            # The question's period applies to that date column; orders count up to the end of today.
+            self._period = tuple(span)
+            if self.as_of is None:
+                raise Unsupported("in_period needs today")
+            span = [date.min.isoformat(), (self.as_of + timedelta(days=1)).isoformat()]
+        where: list[str] = []
+        args: list[Any] = []
+        joined = False
+        if home in ("orders", "lines"):
+            source = f"{home} t"
+            where += [_valid_sale_sql().replace("status", "t.status"), "t.date >= ? AND t.date < ?"]
+            args += span
+            if intent.filters:
+                piece, extra, needs_lines = self._predicates(intent)
+                if needs_lines and home == "orders":
+                    raise Unsupported("line filter on an order column")
+                where += [w.replace("product_key", "t.product_key") if False else w for w in piece]
+                args += extra
+        else:
+            if "order_id" in cols:
+                key = "order_id"
+            else:
+                row = self.db.execute("SELECT column_name FROM column_catalog WHERE table_name=? AND join_key_to LIKE "
+                                      "'orders.%' LIMIT 1", (home,)).fetchone()
+                if row is None:
+                    raise Unsupported(f"no order link for {home}")
+                key = row[0]
+            source = f"{home} t JOIN orders o ON o.order_id = t.{key}"
+            joined = True
+            where += [_valid_sale_sql().replace("status", "o.status"), "o.date >= ? AND o.date < ?"]
+            args += span
+            if intent.filters:
+                raise Unsupported("filter on a joined table")
+        for item in intent.column_filters:
+            target = item.get("column")
+            if target in cols:
+                piece, extra = self._column_condition("t", cols, item)
+            elif joined and target in self.order_columns:
+                piece, extra = self._column_condition("o", self.order_columns, item)
+            else:
+                raise Unsupported(f"column filter on {target} outside {home}")
+            where.append(piece)
+            args += extra
+        if op == "sum":
+            number = self._twin(cols, column, "xn") or column
+            expr = f"SUM(CAST(t.{number} AS REAL))"
+        elif op == "count_distinct":
+            expr = f"COUNT(DISTINCT lookup(t.{column}))"
+        else:
+            expr = "COUNT(DISTINCT t.order_id)" if home == "lines" else "COUNT(*)"
+        return self.db.execute(f"SELECT {expr} FROM {source} WHERE {' AND '.join(where)}", args).fetchone()[0]
+
     def answer(self, intent: Intent, windows: list[TimeWindow]) -> Answer:
+        if intent.column_measure:
+            target = [w for w in windows if w.role != "comparison"]
+            if len(target) != 1 or intent.shape != "scalar" or intent.group_by:
+                raise Unsupported("column measure needs one window and a single value")
+            value = self.column_value(intent, target[0])
+            if value is None:
+                raise Unsupported("empty result")
+            if (intent.column_measure or {}).get("op") == "sum" and abs(value - round(value)) > 1e-9:
+                return Answer("number", _round2(value))
+            return Answer("number", int(round(value)))
+        if intent.column_filters:
+            raise Unsupported("column filters need a column measure")
         if intent.measure in LOT_MEASURES:
             # Lot and expiry questions: the layer keeps no lot balances yet, so an answer is never given here.
             self._require_stock_source(intent.measure)

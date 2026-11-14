@@ -252,14 +252,61 @@ class _QuestionBoundParser:
         return self._parser.parse(question, choices=choices, question_id=bound.id, business_id=bound.business_id)
 
 
+def _shop_index_provider(out: Path, build: Callable[[Any], Any]) -> Callable[[str, str | None], str]:
+    """(question, business_id) -> build(connection).block(question), one index per shop built on first use."""
+    import threading
+    lock, indexes = threading.Lock(), {}
+
+    def provider(question: str, business_id: str | None) -> str:
+        if not business_id:
+            return ""
+        with lock:
+            index = indexes.get(business_id)
+            if index is None:
+                path = out / "sem" / f"{business_id}.sqlite"
+                if not path.exists():
+                    return ""
+                index = build(connect_read_only(path))
+                indexes[business_id] = index
+        return index.block(question)
+
+    return provider
+
+
+def _value_link_provider(out: Path) -> Callable[[str, str | None], str]:
+    """(question, business_id) -> the stored values the question likely names, from that shop's built layer.
+    One index per shop, built on first use from a read-only connection."""
+    import threading
+    from bizreason.semantic.value_linking import ValueIndex
+    lock, indexes = threading.Lock(), {}
+
+    def provider(question: str, business_id: str | None) -> str:
+        if not business_id:
+            return ""
+        with lock:
+            index = indexes.get(business_id)
+            if index is None:
+                path = out / "sem" / f"{business_id}.sqlite"
+                if not path.exists():
+                    return ""
+                index = ValueIndex.from_connection(connect_read_only(path))
+                indexes[business_id] = index
+        return index.block(question)
+
+    return provider
+
+
 def make_intent_parser(model: Any, profile: str, examples: Callable[..., str] | None = None,
-                       reasoning: bool = False, definitions: Callable[[str], str] | None = None) -> IntentParser:
+                       reasoning: bool = False, definitions: Callable[[str], str] | None = None,
+                       value_links: Callable[[str, str | None], str] | None = None,
+                       column_links: Callable[[str, str | None], str] | None = None) -> IntentParser:
     """IntentParser with the prompt profile, optional few-shot examples and optional short reasoning.
 
     The default profile without examples or reasoning is passed as the old, keyword-free call.
     """
-    if definitions is not None:
-        return IntentParser(model, profile=profile, examples=examples, reasoning=reasoning, definitions=definitions)
+    if definitions is not None or value_links is not None or column_links is not None:
+        return IntentParser(model, profile=profile, examples=examples, reasoning=reasoning, definitions=definitions,
+                            value_links=value_links, column_links=column_links)
     if reasoning:
         try:
             return IntentParser(model, profile=profile, examples=examples, reasoning=True)
@@ -399,6 +446,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="deprecated: same as --aliases off")
     parser.add_argument("--project-shops", type=int, default=DEFAULT_PROJECT_SHOPS)
     parser.add_argument("--project-questions", type=int, default=DEFAULT_PROJECT_QUESTIONS)
+    parser.add_argument("--conventions", choices=("off", "on"), default="on",
+                        help="read shop README conventions with the model (checked on the data) when building")
+    parser.add_argument("--phrase-rules", choices=("off", "on"), default="on",
+                        help="phrase-triggered repairs learned from seen questions (for ablation)")
+    parser.add_argument("--column-measures", choices=("off", "on"), default="on",
+                        help="offer the parser the shop's kept columns (column_catalog) as measures and filters")
+    parser.add_argument("--value-linking", choices=("off", "on"), default="on",
+                        help="show the parser the stored values each question likely names (per-shop value index)")
+    parser.add_argument("--plan-fallback", choices=("off", "on"), default="off",
+                        help="when the typed intent cannot express a question, answer from a typed query plan")
     parser.add_argument("--sql-fallback", choices=("off", "on"), default="off",
                         help="when the typed intent cannot express a question, answer from two agreeing SQL queries")
     parser.add_argument("--rule-terms", choices=("off", "on"), default="on",
@@ -541,11 +598,16 @@ def build_shop(biz: str, ctx: RunContext) -> Path:
         line_kinds = load_or_annotate_line_kinds(annotator, context, records, ctx.out / "line_kinds" / f"{biz}.json")
     with timed(ctx.log, biz, "value_groups"):
         value_groups = load_value_groups(annotator, context, records, ctx.out / "groups" / f"{biz}.json")
+    with timed(ctx.log, biz, "conventions"):
+        from bizreason.semantic import conventions
+        directives = conventions.load_or_extract(annotator.model, context, ctx.out / "conventions" / f"{biz}.json")
+        directives = conventions.attach_value_readings(annotator.model, context, directives,
+                                                       ctx.out / "conventions" / f"{biz}_values.json")
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(".building")
     with timed(ctx.log, biz, "build"):
         build(context, records, partial, status_map=status_map, line_kinds=line_kinds,
-              value_groups=value_groups, model_failures=annotator.take_failures())
+              value_groups=value_groups, model_failures=annotator.take_failures(), conventions=directives)
         partial.replace(target)
     return target
 
@@ -759,6 +821,11 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         "consensus": args.consensus,
         "rule_terms": args.rule_terms,
         "sql_fallback": args.sql_fallback,
+        "plan_fallback": args.plan_fallback,
+        "value_linking": args.value_linking,
+        "column_measures": args.column_measures,
+        "conventions": args.conventions,
+        "phrase_rules": args.phrase_rules,
         "fewshot_bank": str(args.fewshot_bank) if fewshot is not None else None,
         "fewshot_bank_sha256": file_hash(args.fewshot_bank) if fewshot is not None else None,
         "fewshot_k": args.fewshot_k if fewshot is not None else None,
@@ -779,6 +846,9 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         if args.aliases == "off":
             saved_roles = dict(schema.ROLE_LOOKUP)
             schema.ROLE_LOOKUP.clear()
+        from bizreason.semantic import conventions as _conventions, solver as _solver
+        _conventions.ENABLED = args.conventions == "on"
+        _solver.PHRASE_RULES = args.phrase_rules == "on"
         make_client = _client_factory(args)  # validates the connection file and endpoint before any build starts
         intent_client = make_client(
             INTENT_REASONING_MAX_TOKENS if args.reasoning == "on" else INTENT_MAX_TOKENS, INTENT_TIMEOUT)
@@ -802,8 +872,18 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         alternate = fewshot.provider(args.fewshot_k, alternate=True) if fewshot is not None else None
         definitions = (rulebook_definitions.provider(rulebook.read_text(encoding="utf-8"))
                        if args.rulebook_definitions == "on" and rulebook.exists() else None)
+        value_links = _value_link_provider(out) if args.value_linking == "on" else None
+        from bizreason.semantic.column_links import ColumnIndex
+        column_links = _shop_index_provider(out, ColumnIndex.from_connection) if args.column_measures == "on" else None
         intent_parser = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile, examples,
-                                           reasoning=args.reasoning == "on", definitions=definitions)
+                                           reasoning=args.reasoning == "on", definitions=definitions,
+                                           value_links=value_links, column_links=column_links)
+        if args.plan_fallback == "on":
+            from bizreason.semantic.plan import PlanFallback
+            from bizreason.semantic.solver import set_fallback
+            from bizreason.semantic.value_linking import ValueIndex
+            set_fallback(PlanFallback(GatedModel(make_client(INTENT_REASONING_MAX_TOKENS, INTENT_TIMEOUT), gate),
+                                      temporal, definitions=definitions, value_index=ValueIndex.from_connection))
         if args.sql_fallback == "on":
             from bizreason.semantic.sql_fallback import SqlFallback
             from bizreason.semantic.solver import set_fallback

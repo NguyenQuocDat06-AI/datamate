@@ -142,3 +142,19 @@ These are assumptions, not facts. Each one needs confirming before the exam.
 
 Measured with code 0ad37de: train 3000 PA 0.959 (c23d215), public 1000 PA 0.752
 (dev shops 0.809, held-out shops 0.619). Offline package on Kaggle T4x2: 3000 questions in 4.4 h, 1000 in 1.6 h.
+
+## Final configuration (14/11)
+
+Defaults of `run_v2` now give the submitted configuration; `run_submission.py` adds the few-shot bank.
+
+| Option | Value | Measured on public (dev / held-out shops) |
+|---|---|---|
+| `--value-linking` | on | 0.809 / 0.619 -> 0.819 / 0.642 |
+| `--column-measures` | on | with kept columns, README conventions and rule gating: 0.842 / 0.659 |
+| `--rule-terms`, `--rulebook-definitions` | on | |
+| `--consensus`, `--sql-fallback`, `--reasoning` | off | each measured lower |
+
+Data stage per shop (one model, cached): column annotation, statuses, line kinds, value groups, README conventions
+(checked on the data before use). Every source column is kept (`x_` columns, `src_` tables, `column_catalog`).
+Industry rules apply only when the test set's rulebook (or the shop README) states them.
+Public 1000 questions: PA 0.787 (code 623b9a2). Run time on 2 servers: 1.1 h; one T4x2 machine ~2 h.
