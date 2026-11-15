@@ -1,0 +1,74 @@
+{
+  "repo": "google/gemma-4-12B-it",
+  "revision": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+  "revision_date": "2026-07-20",
+  "original_release_date": "2026-06-03",
+  "license": "Apache-2.0",
+  "parameters": 11959730224,
+  "files": [
+    {
+      "path": "README.md",
+      "size": 28484,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/README.md",
+      "sha256": "04a06469e3d83b941eaa776a3647b8690b5a7cc5c833af2381e5345bb1bb45c0",
+      "remote_stream": false
+    },
+    {
+      "path": "chat_template.jinja",
+      "size": 18683,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/chat_template.jinja",
+      "sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+      "remote_stream": false
+    },
+    {
+      "path": "config.json",
+      "size": 4423,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/config.json",
+      "sha256": "478c46e8d2c52d5c2d85bf67e3b3e8c90e7c9d91086cee27e3c267907e936bd9",
+      "remote_stream": false
+    },
+    {
+      "path": "generation_config.json",
+      "size": 260,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/generation_config.json",
+      "sha256": "a8349d9bd64cc5841297fcb5002f0fdc4749c473c8f1b10ea337f9ce4ee7014e",
+      "remote_stream": false
+    },
+    {
+      "path": "model.safetensors",
+      "size": 23919549408,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/model.safetensors",
+      "sha256": "5a84cb313260ac447237b890387116dfa8682e49a6b44bc585ae8353abbff18d",
+      "remote_stream": true
+    },
+    {
+      "path": "processor_config.json",
+      "size": 1382,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/processor_config.json",
+      "sha256": "6b938e76555b3e9946890770e1abcd442a4718f34041a58e8139dc8ad34545c9",
+      "remote_stream": false
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 32169626,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/tokenizer.json",
+      "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+      "remote_stream": false
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 3089,
+      "source_url": "https://huggingface.co/google/gemma-4-12B-it/resolve/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/tokenizer_config.json",
+      "sha256": "a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9",
+      "remote_stream": false
+    },
+    {
+      "path": "LICENSE",
+      "size": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source_url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "remote_stream": false
+    }
+  ],
+  "release_source": "https://blog.google/innovation-and-ai/technology/developers-tools/introducing-gemma-4-12B/"
+}

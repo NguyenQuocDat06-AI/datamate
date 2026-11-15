@@ -509,6 +509,7 @@ def run_worker(args: argparse.Namespace) -> int:
     import copy
 
     import torch
+    torch.manual_seed(int(os.environ.get("DATAMATE_SEED", "42")))
     from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig
 
     cuda = torch.cuda.is_available()
@@ -924,6 +925,12 @@ class GatewayState:
         self.served_model = served_model
         self.stop_event = stop_event
         self.pool = WorkerPool(worker_ports)
+        self.metadata: dict[str, Any] = {}
+        self.activity_file: Path | None = None
+
+    def touch(self) -> None:
+        if self.activity_file is not None:
+            self.activity_file.touch()
 
     def forward_chat(self, raw: bytes) -> tuple[int, bytes]:
         """Send the request to the least busy live worker. A worker that refuses connections is dropped and the
@@ -969,10 +976,15 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         state: GatewayState = self.server.state  # type: ignore[attr-defined]
-        if self.path.rstrip("/") != "/v1/models":
+        path = self.path.rstrip("/")
+        if path not in ("/v1/models", "/v1/metadata", "/health"):
             return send_error_json(self, 404, "not found", "not_found")
         if not bearer_ok(self.headers, state.token):
             return send_error_json(self, 401, UNAUTHORIZED, "auth_error")
+        if path != "/v1/models":
+            if not state.metadata:
+                return send_error_json(self, 404, "metadata not configured", "not_found")
+            return send_json(self, 200, {**state.metadata, "ready": True})
         send_json(self, 200, {"object": "list", "data": [{"id": state.served_model, "object": "model"}]})
 
     def do_POST(self) -> None:
@@ -980,6 +992,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if not bearer_ok(self.headers, state.token):
             return send_error_json(self, 401, UNAUTHORIZED, "auth_error")
         if self.path == "/admin/shutdown":
+            instance = state.metadata.get("instance_id")
+            if instance and not hmac.compare_digest(self.headers.get("X-Datamate-Instance", ""), instance):
+                return send_error_json(self, 409, "service instance does not match", "instance_mismatch")
             state.stop_event.set()
             log("shutdown requested via /admin/shutdown")
             return send_json(self, 200, {"ok": True})
@@ -989,7 +1004,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         body = parse_json_object(raw) if raw is not None else None
         if body is None:
             return send_error_json(self, 400, "request body must be a JSON object", "invalid_request")
-        status, data = state.forward_chat(raw)
+        state.touch()
+        try:
+            status, data = state.forward_chat(raw)
+        finally:
+            state.touch()
         if status != 200 or not body.get("stream"):
             return send_raw(self, status, data)
         payload = parse_json_object(data)
@@ -1222,6 +1241,17 @@ def serve_main(args: argparse.Namespace) -> int:
             return 1
         try:
             httpd, state = start_gateway(args.port, [w.port for w in healthy], token, args.served_model_name, stop)
+            metadata_file = getattr(args, "metadata_file", None)
+            if metadata_file:
+                metadata = json.loads(Path(metadata_file).read_text(encoding="utf-8"))
+                if not isinstance(metadata, dict) or any(
+                    key in metadata for key in ("token", "bearer_token", "api_key", "base_url")
+                ):
+                    raise ValueError("metadata must contain public model information only")
+                state.metadata = metadata
+            if getattr(args, "activity_file", None):
+                state.activity_file = Path(args.activity_file)
+                state.touch()
         except OSError as exc:
             log(f"gateway could not bind 127.0.0.1:{args.port}: {exc}")
             return 1
@@ -1252,6 +1282,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--served-model-name", default=None, help="model id reported by /v1/models (default: model dir name)")
     p.add_argument("--startup-timeout", type=float, default=1800.0,
                    help="seconds to wait for the workers to load and warm up (default 1800)")
+    p.add_argument("--metadata-file", help="public model/instance metadata exposed behind bearer authentication")
+    p.add_argument("--activity-file", help="touch this file when a generation starts/finishes, for an idle watchdog")
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--worker-port", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args(argv)

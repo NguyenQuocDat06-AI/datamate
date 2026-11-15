@@ -25,6 +25,10 @@ from bizreason.utils import normalize_lookup
 CANONICAL = ("orders", "lines", "purchases", "deliveries", "payments")
 # A column whose distinct values occur in the other side this often is a join key to it.
 LINK_MIN_SHARE = 0.5
+# Dimension links need annotation evidence as well as observed overlap. Name keys are normalized,
+# while customer codes retain their exact spelling.
+DIMENSION_LINKS = {"employee_name": ("employee", True), "customer_id": ("customer_key", False),
+                   "customer_name": ("customer_name", True)}
 # Canonical text columns with at most this many distinct values show their values in the card.
 CANONICAL_SAMPLE_MAX = 12
 SAMPLES_SHOWN = 4
@@ -108,7 +112,7 @@ def _file_stem(name: str) -> str:
 class Link:
     table: str
     column: str
-    kind: str  # "order" (values are orders.order_id), "product_name" or "product_id" (values name products of lines)
+    kind: str  # "order", "product_name", "product_id", or an annotated DIMENSION_LINKS role
     share: float
     unique: bool  # one row of the table per key value
 
@@ -172,7 +176,10 @@ class TableCard:
         for link in self.links:
             if self.canonical and link.column == "order_id":
                 continue
-            target = "orders.order_id" if link.kind == "order" else f"lines.{link.kind}"
+            if link.kind in DIMENSION_LINKS:
+                target = "orders." + DIMENSION_LINKS[link.kind][0]
+            else:
+                target = "orders.order_id" if link.kind == "order" else f"lines.{link.kind}"
             bits.append(f"{link.column} links {target}" + (" (one row each)" if link.unique else " (several rows each)"))
         return f"{self.name} ({'; '.join(bits)})"
 
@@ -377,9 +384,21 @@ class _Targets:
         self.orders: set[str] = set()
         self.product_names: set[str] = set()
         self.product_ids: set[str] = set()
+        self.dimensions: dict[str, set[str]] = {}
+        self.customer_names: dict[str, set[str]] = {}
         if "orders" in names:
             self.orders = {str(r[0]) for r in db.execute("SELECT DISTINCT order_id FROM orders "
                                                          "WHERE order_id IS NOT NULL")}
+            order_cols = set(_cols(db, "orders"))
+            for role, (column, normalize) in DIMENSION_LINKS.items():
+                if column in order_cols:
+                    values = _distinct_texts(db, "orders", column)
+                    self.dimensions[role] = {normalize_lookup(v) if normalize else v for v in values}
+            if {"customer_key", "customer_name"} <= order_cols:
+                for key, name in db.execute("SELECT DISTINCT customer_key,customer_name FROM orders "
+                                             "WHERE customer_key IS NOT NULL AND customer_name IS NOT NULL"):
+                    if normalize_lookup(str(name)):
+                        self.customer_names.setdefault(str(key), set()).add(normalize_lookup(str(name)))
         line_cols = set(_cols(db, "lines")) if "lines" in names else set()
         if "product_name" in line_cols:
             self.product_names = {normalize_lookup(r[0]) for r in db.execute(
@@ -396,7 +415,8 @@ def _share(values: list[str], target: set[str]) -> float:
 
 
 def detect_links(db: sqlite3.Connection, table: str, columns: list[str],
-                 catalog_join: dict[str, str | None] | None = None, targets: _Targets | None = None) -> list[Link]:
+                 catalog_join: dict[str, str | None] | None = None, targets: _Targets | None = None,
+                 catalog_roles: dict[str, str] | None = None) -> list[Link]:
     """How a table links to orders (a column of order ids) and to the products of sale lines (a column of their
     names or ids): the column whose distinct values occur there at least LINK_MIN_SHARE of the time."""
     targets = targets or _Targets(db)
@@ -405,9 +425,12 @@ def detect_links(db: sqlite3.Connection, table: str, columns: list[str],
             return [Link(table, "order_id", "order", 1.0, _unique(db, table, "order_id", False))]
         return []
     best: dict[str, Link] = {}
+    has_dimension_roles = any(role in DIMENSION_LINKS for role in (catalog_roles or {}).values())
     for column in columns:
         if column.startswith(("xn_", "xd_")) or column.endswith("_raw"):
             continue
+        if has_dimension_roles and (catalog_roles or {}).get(column) not in ("order_id", "product_id", "product_name"):
+            continue  # a commission/rate in a staff list is not an order or product code
         values = _distinct_texts(db, table, column)
         shares = [("order", 1.0 if (catalog_join or {}).get(column) == "orders.order_id"
                    else _share(values, targets.orders), False),
@@ -419,6 +442,39 @@ def detect_links(db: sqlite3.Connection, table: str, columns: list[str],
     out = [best[k] for k in ("order", "product_id", "product_name") if k in best]
     if "product_id" in best and "product_name" in best:  # one product link, by id when both match
         out = [x for x in out if x.kind != "product_name"]
+    for kind, (_, normalize) in DIMENSION_LINKS.items():
+        candidates = []
+        target = targets.dimensions.get(kind, set())
+        if not target:
+            continue
+        for column in columns:
+            if (catalog_roles or {}).get(column) != kind:
+                continue
+            values = _distinct_texts(db, table, column)
+            keys = {normalize_lookup(v) if normalize else v for v in values}
+            if not keys or (normalize and not any(any(ch.isalpha() for ch in v) for v in keys)):
+                continue
+            share = sum(key in target for key in keys) / len(keys)
+            if share >= LINK_MIN_SHARE:
+                candidates.append(Link(table, column, kind, share, _unique(db, table, column, normalize)))
+        candidates.sort(key=lambda link: link.share, reverse=True)
+        if candidates and (len(candidates) == 1 or candidates[0].share > candidates[1].share):
+            out.append(candidates[0])
+    customer_id = next((link for link in out if link.kind == "customer_id"), None)
+    customer_name = next((link for link in out if link.kind == "customer_name"), None)
+    if customer_id and customer_name:
+        # Codes and names describe the same customer dimension. Prefer the code, but only
+        # after checking that a row naming both does not contradict the recorded orders.
+        contradictory = False
+        for key, name in db.execute(f"SELECT {_q(customer_id.column)}, {_q(customer_name.column)} "
+                                    f"FROM {_q(table)}"):
+            known = targets.customer_names.get(str(key), set()) if key is not None else set()
+            if known and name is not None and normalize_lookup(str(name)) \
+                    and normalize_lookup(str(name)) not in known:
+                contradictory = True
+                break
+        out = [link for link in out if link.kind != "customer_name"
+               and not (contradictory and link.kind == "customer_id")]
     return out
 
 
@@ -491,7 +547,8 @@ def build_card(db: sqlite3.Connection) -> ShopCard:
             if f"xd_{column[2:] if column.startswith('x_') else column}" in names and not col.value_type:
                 col.value_type = "date"
             card.columns[column] = col
-        card.links = detect_links(db, t, columns, {c: r["join"] for c, r in meta.items()}, targets)
+        card.links = detect_links(db, t, columns, {c: r["join"] for c, r in meta.items()}, targets,
+                                  catalog_roles={c: r["role"] for c, r in meta.items()})
         tables[t] = card
     intro, conventions, file_notes = _attach_readme(_readme(db), tables, catalog)
     return ShopCard(tables, intro, conventions, file_notes)

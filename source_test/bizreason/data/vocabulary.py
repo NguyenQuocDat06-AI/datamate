@@ -144,7 +144,57 @@ AGE_OPEN_BUCKET_WORDS = r"(?:tren|hon|qua|sau)"
 
 # A price rise named by its new price ("lên giá 97.500đ", "tăng giá lên 3.200đ"), after normalize_lookup keeps the
 # digits; and the words around the counted days of a price-rise comparison.
-PRICE_RISE_RE = r"(?:len gia|gia len|tang gia len|tang gia|len)\s+(\d[\d ]*?)\s*(?:d|dong|vnd)\b"
+PRICE_RISE_RE = r"(?:len gia|gia len|tang gia len|tang gia|len)\s+(\d[\d ]*?)\s*(d|dong|vnd|k)\b"
+# The unit word of a price that means thousands ("152k"), after normalize_lookup.
+PRICE_THOUSAND_UNITS = {"k"}
+# Words that make a question one about a price rise even when it does not name the new price, after normalize_lookup.
+PRICE_RISE_CUE_RE = r"\b(?:len gia|tang gia|gia len|doi gia|gia moi|ngay tang)\b"
+# "N days ... before" with at most two words between, after normalize_lookup: the comparison window of a price rise.
+DAYS_BEFORE_RE = r"\b(\d{1,3}) ngay (?:\w+ ){0,2}?(?:truoc|trc)\b"
+# A day written with its year, day first ("28/5/2025", "01-09-25"); the separator is never a dot (prices use it).
+DMY_DATE_RE = r"(?<![\d/\-])(\d{1,2})\s*[/\-]\s*(\d{1,2})\s*[/\-]\s*(\d{4}|\d{2})(?![\d/\-])"
+
+# Phrases where "thứ <n>" or "thứ tự" is a rank or an order, not a day of the week, after normalize_lookup.
+NON_WEEKDAY_PHRASE_RE = r"\b(?:theo|co|xep|hang|dung|vi tri|top) thu (?:tu|\d)\b"
+
+# Regional word variants of the same thing (north / south); a name a question writes with one may be stored with the
+# other, after normalize_lookup. Used only when the written name matches nothing and exactly one variant does.
+REGIONAL_WORD_VARIANTS = (("lac", "dau phong"), ("heo", "lon"))
 
 # A million written with its decimals after the word: "3tr7" = 3.7 million, "1tr250" = 1.25 million.
 MILLION_SHORT_RE = r"(?<![\d.,])(\d+)\s*(?:tr|trieu|triệu|củ)\s*(\d{1,3})(?![\d.,])"
+
+# Words that make a question ask an amount of money ("bao nhiêu tiền vốn", "giá trị"), after normalize_lookup.
+MONEY_QUESTION_WORDS = ("tien", "von", "gia tri", "dong", "vnd")
+
+# Words that tie a larger unit to a count of a smaller one in a written conversion ("1 X = N Y", "1 X có N Y",
+# "mỗi X gồm N Y", "quy đổi: X N Y"), lower-case with diacritics kept; used as regex alternations by the layer.
+UNIT_STATEMENT_LINKERS = ("=", "bằng", "có", "gồm", "là", "tương đương", "quy đổi được")
+UNIT_EACH_WORDS = ("mỗi",)
+UNIT_PACKING_CUES = ("quy đổi", "đóng gói", "quy cách")
+# Words that are money or time, never a countable unit: a statement naming one is a price or a duration, after
+# normalize_lookup.
+UNIT_NON_QUANTITY_WORDS = frozenset({
+    "d", "dong", "vnd", "k", "nghin", "ngan", "trieu", "tr", "ty", "ti", "usd", "dollar", "xu",
+    "ngay", "tuan", "thang", "nam", "gio", "phut", "giay", "quy", "tiet",
+})
+
+
+# A question that asks for one value per member it names ("A và B lần lượt bao nhiêu"), after normalize_lookup.
+MEMBER_LIST_CUES = ("lan luot", "moi ben", "moi loai", "tung ben", "tung loai")
+# A question that asks its amount once per member ("A bao nhiêu, B bao nhiêu"), after normalize_lookup.
+MEMBER_ASK_RE = r"\b(?:bao nhieu|bnhieu|bn|nhieu)\b"
+# Words that make a second member an exclusion or a contrast rather than a member to list, after normalize_lookup.
+MEMBER_LIST_NEGATION_CUES = ("khong phai", "ngoai tru", "tru ", "khong tinh", "khong bao gom", "loai tru", "ngoai ",
+    "so sanh", "chenh", " hon ", " gap ", "phan tram", "ti le", " % ")
+
+# Words a question uses for the canonical values of a closed dimension (after normalize_lookup), longest first per code.
+CLOSED_VALUE_WORDS = {
+    "payment_method": {
+        "cash": ("tien mat",), "ewallet": ("vi dien tu",), "transfer": ("chuyen khoan",),
+        "cod": ("cod", "thu ho"), "debt": ("ghi no", "cong no"),
+    },
+    "channel": {
+        "store": ("tai quay", "ban le tai cua hang"), "phone": ("dien thoai",), "zalo_oa": ("zalo oa",),
+    },
+}

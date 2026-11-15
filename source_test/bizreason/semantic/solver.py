@@ -10,9 +10,12 @@ from datetime import date, timedelta
 from typing import Any, Protocol
 
 from bizreason.contracts import AnswerType, Prediction, Question, TimeWindow
-from bizreason.data.vocabulary import AGE_BUCKET_WORD, AGE_OPEN_BUCKET_WORDS, PRICE_RISE_RE
+from bizreason.data.vocabulary import (
+    AGE_BUCKET_WORD, AGE_OPEN_BUCKET_WORDS, DAYS_BEFORE_RE, DMY_DATE_RE, NON_WEEKDAY_PHRASE_RE, PRICE_RISE_CUE_RE,
+    CLOSED_VALUE_WORDS, MEMBER_ASK_RE, MEMBER_LIST_CUES, MEMBER_LIST_NEGATION_CUES, MONEY_QUESTION_WORDS, PRICE_RISE_RE, PRICE_THOUSAND_UNITS, REGIONAL_WORD_VARIANTS,
+)
 from bizreason.semantic.compiler import DEBT_MEASURES, Answer, Compiler, Intent, NotRecorded, Unsupported
-from bizreason.semantic import rule_terms, rulebook_params
+from bizreason.semantic import rule_terms, rulebook_params, stock_sources
 from bizreason.semantic.quality import QualityFlags, assess
 from bizreason.semantic.vocabulary import DIMENSIONS
 from bizreason.semantic.vocabulary import (
@@ -44,6 +47,10 @@ FLAG_NAMES = (
     "customer_group_incomplete",
 )
 PERIOD_SHAPES = {"breakdown", "argmax_period", "trend_check"}
+# Quantity measures read from the sale lines: never the answer to how much the delivery book shows was delivered.
+DELIVERED_QTY_GUARD = {"qty_base_sold", "qty_sold"}
+# Measures that are only ever an amount of money; asked without any money word, the parse chose the wrong measure.
+MONEY_ONLY_MEASURES = {"expiring_lot_value"}
 # Stored values offered to the parser, per filter dimension: (table, column).
 CHOICE_COLUMNS = {
     "channel": ("orders", "channel"),
@@ -92,6 +99,8 @@ FALLBACK_REASONS = (
     "debt measure with filter", "breakdown names", "invalid measure",
 )
 _FALLBACK: Any = None
+_CONTRACT_RUNTIME: Any = None
+_TIME_READER: Any = None
 # Phrase-triggered repairs learned from seen questions (most-orders ranking, cancellation share and cause, delivery
 # trips for an order count). Switched off by run_v2 --phrase-rules off for ablation.
 PHRASE_RULES = True
@@ -101,6 +110,18 @@ def set_fallback(fallback: Any) -> None:
     """The SqlFallback the solvers use (None disables it). Set once per run, before questions are solved."""
     global _FALLBACK
     _FALLBACK = fallback
+
+
+def set_time_reader(reader: Any) -> None:
+    """The TimeReader used only when the temporal rules give no window (None disables it)."""
+    global _TIME_READER
+    _TIME_READER = reader
+
+
+def set_contract_runtime(runtime: Any) -> None:
+    """Set the experimental evidence-backed path; None preserves legacy routing."""
+    global _CONTRACT_RUNTIME
+    _CONTRACT_RUNTIME = runtime
 
 
 MIN_NAME_CHARS = 3
@@ -119,12 +140,56 @@ def _implausible(kind: str, value: Any) -> str | None:
     return None
 
 
+def _has_list_cue(asked: str) -> bool:
+    """True when the padded, normalized question holds a list cue; one mistyped letter in the cue's last word is
+    tolerated (questions are typed fast), the first word must be exact."""
+    words = asked.split()
+    for cue in MEMBER_LIST_CUES:
+        head, *rest = cue.split()
+        for i, word in enumerate(words):
+            if word != head or i + len(rest) >= len(words):
+                continue
+            nxt = words[i + 1:i + 1 + len(rest)]
+            if all(a == b or (len(a) == len(b) and len(a) >= 4 and sum(x != y for x, y in zip(a, b)) <= 1)
+                   for a, b in zip(nxt, rest)):
+                return True
+    return False
+
+
+def _named_closed_members(asked: str, intent: Intent) -> Intent:
+    """Members of a closed dimension (payment method, channel) in the order the question writes them.
+
+    When the question writes two or more known words of one such dimension and the intent filters only that dimension
+    (or names fewer members than the question), the filters become the written members, each as its canonical value.
+    The member must still resolve in the shop's data afterwards. Intents with filters on other closed dimensions,
+    or with a member the words do not explain, are left as they are."""
+    for dim, codes in CLOSED_VALUE_WORDS.items():
+        found: list[tuple[int, str]] = []
+        for code, words in codes.items():
+            hits = [asked.find(f" {w} ") for w in words if f" {w} " in asked]
+            if hits:
+                found.append((min(hits), code))
+        if len(found) < 2:
+            continue
+        mine = [f for f in intent.filters if f.get("dim") == dim]
+        if len(mine) >= 2:
+            return intent  # the intent already names members; the written words do not replace them
+        if any(f.get("dim") in CLOSED_VALUE_WORDS and f.get("dim") != dim for f in intent.filters):
+            return intent
+        if intent.group_by not in (None, dim) or not mine and intent.group_by != dim:
+            return intent
+        ordered = [code for _, code in sorted(found)]
+        rest = [f for f in intent.filters if f.get("dim") != dim]
+        return replace(intent, filters=[*rest, *({"dim": dim, "value": c, "exclude": False} for c in ordered)])
+    return intent
+
+
 def _weekday_from_question(question: str, intent: Intent) -> dict[str, Any] | None:
     """A weekday filter for an 'average per weekday' intent that has none, when the question names one weekday."""
     from bizreason.semantic.compiler import WEEKDAY_TOKENS, _asks_weekday_average
     if not _asks_weekday_average(intent) or any(f.get("dim") == "weekday" for f in intent.filters):
         return None
-    padded = f" {normalize_lookup(question)} "
+    padded = f" {re.sub(NON_WEEKDAY_PHRASE_RE, ' ', normalize_lookup(question))} "
     found = {day: token for token, day in WEEKDAY_TOKENS.items() if f" {token} " in padded}
     if len(found) != 1:
         return None
@@ -211,6 +276,8 @@ class SolveTrace:
     reason: str
     # Names of the data-quality flags that fired for this question, when they were checked.
     quality: list[str] = field(default_factory=list)
+    semantic_contract: dict[str, Any] | None = None
+    plan: dict[str, Any] | None = None
 
 
 def filter_choices(connection: sqlite3.Connection) -> dict[str, list[str]]:
@@ -343,6 +410,17 @@ class SemanticSolver:
     def solve(self, question: Question) -> tuple[Prediction, SolveTrace]:
         trace = SolveTrace(question_id=question.id, intent=None, windows=[], decision="abstain", reason="")
         try:
+            if _CONTRACT_RUNTIME is not None:
+                decision = _CONTRACT_RUNTIME.answer(question, self.connection)
+                if decision.handled:
+                    trace.semantic_contract = decision.trace
+                    trace.reason = decision.reason
+                    if decision.type is not None:
+                        trace.decision = "value"
+                        return Prediction(id=question.id, type=decision.type, answer=decision.answer), trace
+                    # A matched but ungrounded definition cannot escape through a legacy formula or fallback.
+                    trace.decision = "abstain"
+                    return Prediction(id=question.id, type=AnswerType.ABSTAIN, reason=decision.reason), trace
             return self._decide(question, trace)
         except Exception as exc:  # one bad question must never crash the run
             return self._finish(question, trace, "abstain", type(exc).__name__)
@@ -388,6 +466,15 @@ class SemanticSolver:
             # "xe đã giao mấy đợt hàng" counts delivery trips, not orders (rulebook: giao nhiều đợt).
             intent = replace(intent, measure="delivery_trip_count")
             trace.intent = intent
+        if (intent.measure in DELIVERED_QTY_GUARD and any(f" {w} " in asked for w in DELIVERY_WORDS)
+                and self._has_rows("deliveries")):
+            # "đã chở đi / đã giao bao nhiêu thùng" asks what the delivery book shows up to today, which the sold
+            # quantity of the orders is not (orders may be delivered later or in part). No measure reads delivered
+            # quantities, so answering with the sold quantity would be a confident wrong answer.
+            return self._finish(question, trace, "abstain", "delivered quantity is not modelled")
+        if intent.measure in MONEY_ONLY_MEASURES and not any(f" {w} " in asked for w in MONEY_QUESTION_WORDS):
+            # A money measure for a question that names no money ("còn mấy lô sắp hết hạn") asks something else.
+            return self._finish(question, trace, "abstain", f"{intent.measure} for a question about no money")
         if re.search(PURCHASE_MINUS_SOLD_RE, asked) and any(f.get("dim") == "product" for f in intent.filters):
             # "số nhập trừ số bán" / "chênh lệch nhập trừ bán" (rulebook §5): received minus sold, one product.
             intent = replace(intent, measure="purchase_minus_sold", measure2=None, shape="scalar", group_by=None)
@@ -411,6 +498,14 @@ class SemanticSolver:
         weekday = _weekday_from_question(question.question, intent)
         if weekday is not None:
             intent = replace(intent, filters=[*intent.filters, weekday])
+            trace.intent = intent
+        variant = self._product_variants(intent)
+        if variant is not None:
+            intent = variant
+            trace.intent = intent
+        unit_free = self._drop_redundant_units(intent)
+        if unit_free is not None:
+            intent = unit_free
             trace.intent = intent
         trimmed = _trim_added_words(question.question, intent)
         if trimmed is not None:
@@ -454,8 +549,15 @@ class SemanticSolver:
             windows = self.temporal.resolve_periods(question.question, question.as_of_date)
         if not windows:
             windows = self.temporal.resolve(question.question, question.as_of_date)
-        if not windows and intent.shape == "compare_periods":
-            windows = self._price_rise_windows(question.question, intent)
+        if (not windows and _TIME_READER is not None and intent.measure not in POINT_IN_TIME
+                and not intent.column_measure and re.search(r"\d", question.question)):
+            # Only a question that writes some number (a day, a month, N days) can name a period the rules missed; a
+            # question with no time phrase keeps the rulebook defaults below (a balance at the end of today).
+            # The rules read nothing: the model reads the periods and code keeps them only if every boundary is grounded.
+            windows = _TIME_READER.read(question.question, question.as_of_date) or windows
+        if intent.shape == "compare_periods":
+            # A price-rise comparison fixes both windows itself, whatever single window the text alone gave.
+            windows = self._price_rise_windows(question.question, intent) or windows
         relative = {"after_today", "before_today", "on_or_before_today", "on_or_after_today"}
         if intent.column_measure and any(f.get("op") in relative for f in intent.column_filters):
             # A condition measured against today ("ngày phải trả sau hôm nay") reads everything up to today.
@@ -505,11 +607,16 @@ class SemanticSolver:
 
         if intent.measure in STOCK_MEASURES | LOT_MEASURES:
             return self._decide_stock(question, trace, intent, windows)
+        intent = self._months_not_weekdays(question.question, intent, windows)
+        trace.intent = intent
         wants_table = intent.group_by is not None and asks_entity_values(question.question)
         try:
             compiler = Compiler(self.connection)
             compiler.as_of = question.as_of_date
-            if intent.measure == "purchase_minus_sold":
+            listed = self._member_list(compiler, question.question, intent, windows)
+            if listed is not None:
+                answer = listed
+            elif intent.measure == "purchase_minus_sold":
                 target = [w for w in windows if w.role != "comparison"]
                 if len(target) != 1:
                     raise Unsupported("purchase minus sold needs one window")
@@ -543,6 +650,71 @@ class SemanticSolver:
         trace.decision = "value"
         return prediction, trace
 
+    @staticmethod
+    def _months_not_weekdays(text: str, intent: Intent, windows: list[TimeWindow]) -> Intent:
+        """Several whole calendar months with no weekday written is a list per month: the parse that groups the same
+        question by weekday (an abbreviated month read as a weekday) is dropped."""
+        from bizreason.semantic.compiler import WEEKDAY_TOKENS
+        if intent.group_by != "weekday" or intent.shape != "breakdown" or any(f.get("dim") == "weekday" for f in intent.filters):
+            return intent
+        target = [w for w in windows if w.role != "comparison"]
+        if len(target) < 2 or len(target) != len(windows):
+            return intent
+        months = {(w.start.year, w.start.month) for w in target}
+        if len(months) != len(target) or any(
+                w.start.day != 1 or (w.end_exclusive - timedelta(days=1)).month != w.start.month
+                or w.end_exclusive.day != 1 for w in target):
+            return intent
+        padded = f" {re.sub(NON_WEEKDAY_PHRASE_RE, ' ', normalize_lookup(text))} "
+        if any(f" {token} " in padded for token in WEEKDAY_TOKENS):
+            return intent
+        return replace(intent, group_by=None, compare_as="percent")
+
+    @staticmethod
+    def _member_list(compiler: Compiler, text: str, intent: Intent, windows: list[TimeWindow]) -> Answer | None:
+        """'A và B lần lượt bao nhiêu': one value per member of one dimension, in the order the intent names them.
+
+        Only when the question says so (a list cue, no exclusion word), the intent names two or more members of exactly
+        one dimension, and one window applies. The parse often marks a member as an exclusion or adds a second measure;
+        here every named member is listed. Each member must resolve in the shop's own data: a member of a closed
+        dimension the shop does not record makes the whole question unanswerable (the compiler raises NotRecorded)."""
+        asked = f" {normalize_lookup(text)} "
+        if not (_has_list_cue(asked) or len(re.findall(MEMBER_ASK_RE, asked)) >= 2) or any(cue in asked for cue in MEMBER_LIST_NEGATION_CUES):
+            return None
+        if (intent.column_measure or intent.column_filters or intent.top_k is not None or intent.threshold is not None
+                or intent.location is not None or intent.age_days is not None):
+            return None
+        if intent.measure2 is not None and intent.measure2 != intent.measure:
+            return None
+        if intent.shape not in ("breakdown", "compare_periods", "scalar"):
+            return None
+        target = [w for w in windows if w.role != "comparison"]
+        if len(target) != 1 or len(target) != len(windows):
+            return None
+        intent = _named_closed_members(asked, intent)
+        positions: dict[Any, list[int]] = {}
+        for index, item in enumerate(intent.filters):
+            positions.setdefault(item.get("dim"), []).append(index)
+        repeated = {dim: at for dim, at in positions.items() if len(at) > 1}
+        if len(repeated) != 1:
+            return None
+        dim, at = next(iter(repeated.items()))
+        if intent.group_by not in (None, dim):
+            return None
+        if len({normalize_lookup(str(intent.filters[i].get("value"))) for i in at}) != len(at):
+            return None
+        others = [f for i, f in enumerate(intent.filters) if i not in at]
+        values: list[Any] = []
+        for i in at:
+            member = {**intent.filters[i], "exclude": False}
+            member_intent = replace(intent, filters=[*others, member], shape="scalar", measure2=None, group_by=None,
+                                    compare_as="percent")
+            answer = compiler.answer(member_intent, windows)
+            if answer.type != "number" or answer.value is None:
+                raise Unsupported("member value is not a number")
+            values.append(answer.value)
+        return Answer("list", values)
+
     def _decide_lots(self, question: Question, trace: SolveTrace, intent: Intent,
                      windows: list[TimeWindow]) -> tuple[Prediction, SolveTrace]:
         """An expiry question: the lots still in stock today, by expiry date (see Compiler.lots)."""
@@ -570,7 +742,14 @@ class SemanticSolver:
         bought-in products at zero. Any other shape or a second measure is not answered."""
         if intent.measure in LOT_MEASURES:
             return self._decide_lots(question, trace, intent, windows)
+        target_windows = [w for w in windows if w.role != "comparison"]
+        if len(target_windows) == 1 and stock_sources.is_expiry_range_list(
+                intent, target_windows[0].start, target_windows[0].end_exclusive):
+            return self._decide_lots(question, trace, replace(intent, measure="expiry_lot"), windows)
         split = asks_unit_split(question.question) and intent.measure == "inventory_qty"
+        if split and intent.threshold is None:
+            # A two-unit split reads its units from the question text (stock_split), not from the intent's measure2.
+            intent = replace(intent, measure2=None, group_by=None, shape="scalar")
         if intent.measure2 is not None or intent.group_by is not None or intent.threshold is not None:
             return self._finish(question, trace, "abstain", "stock question with a second measure or grouping")
         if intent.shape == "breakdown" and not split:
@@ -581,7 +760,7 @@ class SemanticSolver:
         if len(target) != 1:
             return self._finish(question, trace, "abstain", "stock needs one day")
         try:
-            value = Compiler(self.connection).stock(intent, target[0], split=split)
+            value = Compiler(self.connection).stock(intent, target[0], split=split, question_text=question.question)
         except NotRecorded as exc:
             return self._finish(question, trace, "unanswerable", str(exc))
         except Unsupported as exc:
@@ -591,43 +770,153 @@ class SemanticSolver:
         trace.decision = "value"
         return Prediction(id=question.id, type=AnswerType(value.type), answer=value.value), trace
 
-    def _price_rise_windows(self, text: str, intent: Intent) -> list[TimeWindow]:
-        """Rulebook §5 (hiệu ứng tăng giá) when the question names the new price but not the day: the day D is the
-        first price-list day the product's price rose to that price; compare N days from D with the N days before.
+    def _product_variants(self, intent: Intent) -> Intent | None:
+        """A product the question writes with one regional word ("lạc") that the shop stores with its variant
+        ("đậu phộng"): when the written name matches nothing and exactly one variant spelling matches, use it."""
+        compiler = Compiler(self.connection)
+        changed, filters = False, []
+        for item in intent.filters:
+            if item.get("dim") == "product" and not item.get("exclude"):
+                try:
+                    compiler.resolve_filter("product", item["value"])
+                except Unsupported as exc:
+                    if str(exc).startswith("unresolved product"):
+                        alt = self._variant_spelling(compiler, str(item["value"]))
+                        if alt is not None:
+                            filters.append({**item, "value": alt})
+                            changed = True
+                            continue
+                except (NotRecorded, sqlite3.Error):
+                    pass
+            filters.append(item)
+        return replace(intent, filters=filters) if changed else None
 
-        [] unless there is exactly one product filter, one new price, one N, and a matching rise."""
+    @staticmethod
+    def _variant_spelling(compiler: Compiler, value: str) -> str | None:
+        padded = f" {normalize_lookup(value)} "
+        found = set()
+        for pair in REGIONAL_WORD_VARIANTS:
+            for word, other in (pair, pair[::-1]):
+                if f" {word} " in padded:
+                    candidate = padded.replace(f" {word} ", f" {other} ").strip()
+                    try:
+                        compiler.resolve_filter("product", candidate)
+                    except (Unsupported, NotRecorded, sqlite3.Error):
+                        continue
+                    found.add(candidate)
+        return found.pop() if len(found) == 1 else None
+
+    def _drop_redundant_units(self, intent: Intent) -> Intent | None:
+        """A unit filter on a quantity in base units that every line of the named product already satisfies ("số bình"
+        for a product only ever sold by the bình) changes no row, so it is dropped. A unit that differs for any line
+        of the product stays a filter. Only for a comparison of periods: a scalar quantity may carry a meaning the unit
+        filter alone does not (e.g. what was delivered), which this does not model. None when nothing changes."""
+        if intent.measure != "qty_base_sold" or intent.shape != "compare_periods":
+            return None
+        products = [f for f in intent.filters if f.get("dim") == "product" and not f.get("exclude")]
+        units = [f for f in intent.filters if f.get("dim") == "unit" and not f.get("exclude")]
+        if len(products) != 1 or not units:
+            return None
+        compiler = Compiler(self.connection)
+        try:
+            sql, args, _ = compiler.resolve_filter("product", products[0]["value"])
+            base = "base_unit" if "base_unit" in compiler.line_columns else "NULL"
+            rows = self.connection.execute(f"SELECT DISTINCT unit, {base} FROM lines WHERE {sql}", args).fetchall()
+        except (Unsupported, NotRecorded, sqlite3.Error):
+            return None
+        counted = {normalize_lookup(base_unit if base_unit is not None else unit) for unit, base_unit in rows}
+        if not rows or len(counted) != 1:
+            return None
+        only = next(iter(counted))
+        drop = [f for f in units if normalize_lookup(str(f.get("value", ""))) == only]
+        if not drop:
+            return None
+        return replace(intent, filters=[f for f in intent.filters if not any(f is d for d in drop)])
+
+    def _price_rise_windows(self, text: str, intent: Intent) -> list[TimeWindow]:
+        """Rulebook §5 (hiệu ứng tăng giá): the day D of the rise, then N days from D (D included) against the N days
+        before D, as [target, comparison]. [] when the question is not one, or D or N is not certain.
+
+        D is the day the question writes (one day, with its year) when it gives one: the question wins over the price
+        list (rulebook: a question that says otherwise is followed). Otherwise D is the first price-list day the
+        product's price rose to the new price the question names. N is the one number of days the question writes."""
         normalized = normalize_lookup(text)
-        prices = {int(p.replace(" ", "")) for p in re.findall(PRICE_RISE_RE, normalized)}
+        found = re.findall(PRICE_RISE_RE, normalized)
+        prices = {int(digits.replace(" ", "")) * (1000 if unit in PRICE_THOUSAND_UNITS else 1)
+                  for digits, unit in found}
         days = set(re.findall(r"\b(\d{1,3}) ngay\b", normalized))
-        products = [item for item in intent.filters if item.get("dim") == "product" and not item.get("exclude")]
-        if len(prices) != 1 or len(days) != 1 or len(products) != 1:
+        if len(days) != 1 or not (found or re.search(PRICE_RISE_CUE_RE, normalized)):
             return []
-        price, n = prices.pop(), int(days.pop())
+        n = int(days.pop())
+        if n < 1:
+            return []
+        written = self._question_days(text)
+        before = set(re.findall(DAYS_BEFORE_RE, normalized))
+        evidence = ["question"]
+        start = None
+        if len(written) == 1 and before == {str(n)}:
+            start = next(iter(written))
+        table_day = self._price_rise_day(intent, prices.pop()) if len(prices) == 1 else None
+        if start is None:
+            start = table_day
+        elif table_day is not None and table_day != start:
+            evidence.append("question_overrides_price_changes")
+        if start is None:
+            return []
+        if table_day is not None:
+            evidence.append("price_changes")
+        return [
+            TimeWindow(role="target", start=start, end_exclusive=start + timedelta(days=n), evidence=evidence),
+            TimeWindow(role="comparison", start=start - timedelta(days=n), end_exclusive=start, evidence=evidence),
+        ]
+
+    @staticmethod
+    def _question_days(text: str) -> set[date]:
+        """The distinct calendar days a question writes day-first with a year; impossible dates are ignored."""
+        days = set()
+        for day, month, year in re.findall(DMY_DATE_RE, text):
+            try:
+                days.add(date(int(year) + (2000 if len(year) == 2 else 0), int(month), int(day)))
+            except ValueError:
+                continue
+        return days
+
+    def _price_rise_day(self, intent: Intent, price: int) -> date | None:
+        """The first day the one product the intent names rose to `price` in the price list, else None."""
+        products = [item for item in intent.filters if item.get("dim") == "product" and not item.get("exclude")]
+        if len(products) != 1:
+            return None
         try:
             rows = self.connection.execute(
-                "SELECT product_name, date, old_price, new_price FROM price_changes "
-                "WHERE product_name IS NOT NULL AND date IS NOT NULL ORDER BY date").fetchall()
+                "SELECT product_id, product_name, date, old_price, new_price FROM price_changes "
+                "WHERE date IS NOT NULL ORDER BY date").fetchall()
+            ids_to_names: dict[Any, set[str]] = {}
+            if any(row[1] is None and row[0] is not None for row in rows):
+                # A price list with codes only: the names the sales lines write for each code.
+                for code, name in self.connection.execute(
+                        "SELECT DISTINCT product_id, product_name FROM lines "
+                        "WHERE product_id IS NOT NULL AND product_name IS NOT NULL"):
+                    ids_to_names.setdefault(code, set()).add(name)
         except sqlite3.Error:
-            return []
-        names = sorted({row[0] for row in rows})
-        chosen = set(Compiler._match("product", names, normalize_lookup(str(products[0].get("value", "")))))
-        if not chosen or n < 1:
-            return []
-        keys = {normalize_lookup(name) for name in chosen}
-        history = [row for row in rows if normalize_lookup(row[0]) in keys]
+            return None
+        names_of = [({row[1]} if row[1] is not None else ids_to_names.get(row[0], set())) for row in rows]
+        every = sorted(set().union(*names_of)) if names_of else []
+        chosen = set(Compiler._match("product", every, normalize_lookup(str(products[0].get("value", ""))))) \
+            if every else set()
+        if not chosen:
+            return None
+        history = [(row, names) for row, names in zip(rows, names_of) if names & chosen]
+        owners = {(row[0] if row[0] is not None else tuple(sorted(normalize_lookup(x) for x in names)))
+                  for row, names in history}
+        if len(owners) != 1:
+            return None
         previous = None
-        for _, day, old_price, new_price in history:
+        for (_, _, day, old_price, new_price), _names in history:
             before = old_price if old_price is not None else previous
             if new_price is not None and abs(new_price - price) < 0.5 and before is not None and new_price > before:
-                start = date.fromisoformat(str(day)[:10])
-                evidence = ["question", "price_changes"]
-                return [
-                    TimeWindow(role="target", start=start, end_exclusive=start + timedelta(days=n), evidence=evidence),
-                    TimeWindow(role="comparison", start=start - timedelta(days=n), end_exclusive=start,
-                               evidence=evidence),
-                ]
+                return date.fromisoformat(str(day)[:10])
             previous = new_price if new_price is not None else previous
-        return []
+        return None
 
     def _catalog(self) -> dict[str, dict[str, Any]]:
         try:
@@ -769,7 +1058,7 @@ class SemanticSolver:
     ) -> tuple[Prediction, SolveTrace]:
         if decision == "abstain" and _FALLBACK is not None and reason.startswith(
                 getattr(_FALLBACK, "reasons", FALLBACK_REASONS)):
-            # The typed intent cannot express the question; let two independent SQL readings try (they must agree).
+            # The configured fallback validates its own representation before returning an answer.
             result = None
             try:
                 # Its own read-only connection: the fallback sets an authorizer and a progress handler, which must not
@@ -783,6 +1072,8 @@ class SemanticSolver:
                         own.close()
             except Exception:
                 result = None
+            if getattr(_FALLBACK, "last_diagnostics", None):
+                trace.plan = dict(_FALLBACK.last_diagnostics)
             if result is not None:
                 trace.decision = "value"
                 trace.reason = f"sql fallback after: {reason}"

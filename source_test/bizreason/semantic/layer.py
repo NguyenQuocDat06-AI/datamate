@@ -15,12 +15,18 @@ from typing import Any, NamedTuple
 from bizreason.contracts import BusinessContext, TableMeta
 from bizreason.data.notes_facets import classify_note_status
 from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
-from bizreason.semantic import rulebook_params
+from bizreason.semantic import annotation_check, rulebook_params, stock_sources
 from bizreason.semantic.vocabulary import (
     ADDRESS_HEADER_TOKENS,
     CANCEL_TOKENS,
     CURRENCY_SUFFIXES,
     INGESTION_ROLES,
+)
+from bizreason.data.vocabulary import (
+    UNIT_EACH_WORDS,
+    UNIT_NON_QUANTITY_WORDS,
+    UNIT_PACKING_CUES,
+    UNIT_STATEMENT_LINKERS,
 )
 from bizreason.utils import normalize_lookup, quote_identifier as q
 
@@ -111,8 +117,8 @@ VALUE_GROUP_FIELDS = {
 }
 VALUE_GROUP_KEEPS_RAW = ("payment_method", "channel", "customer_group", "category")
 # Source columns that no canonical field reads are kept (see _carry_plan): x_<name> text, xn_<name> number and
-# xd_<name> date twins. A table's unmapped columns are carried only for these kinds; every other annotated table
-# whose kind the layer does not carry from is copied whole as src_<table> (see _copy_unloaded).
+# xd_<name> date twins. A table's unmapped columns are carried only for these kinds; every other source table
+# is copied whole as src_<table>, including catalogs whose loader reads just selected roles (see _copy_unloaded).
 EXTRA_PREFIXES = ("x_", "xn_", "xd_")
 CARRIED_KINDS = ("sales", "service_ticket", "purchase", "payment", "delivery")
 LAYER_KINDS = (*CARRIED_KINDS, "sales_return", "customer_catalog", "product_catalog", "unit_conversion", "alias",
@@ -726,8 +732,14 @@ def _insert(dst: sqlite3.Connection, target: str, table: TableMeta, roles: dict[
         for name, expr, _ in _carry_columns(c):
             names.append(name)
             exprs.append(expr)
+    where = ""
+    if target == "payments":
+        # A method/label alone is not a payment event. Keep zero amounts and
+        # unallocated receipts, but do not turn export annotations into payments.
+        event = [exprs[names.index(field)] for field in ("order_id", "date", "amount")]
+        where = " WHERE " + " OR ".join(f"({expr}) IS NOT NULL" for expr in event)
     cursor = dst.execute(
-        f"INSERT INTO {target} ({','.join(names)}) SELECT {','.join(exprs)} FROM {source} AS src"
+        f"INSERT INTO {target} ({','.join(names)}) SELECT {','.join(exprs)} FROM {source} AS src{where}"
     )
     return cursor.rowcount
 
@@ -934,22 +946,100 @@ def _load_price_changes(dst: sqlite3.Connection, table: TableMeta, roles: dict[s
     )
 
 
+# A conversion cell that names the unit its number counts in: "<number> <unit>" ("15 vỉ"), the unit being another
+# unit of the same product rather than its base unit.
+FACTOR_WITH_UNIT = re.compile(r"\s*(?P<number>\d[\d.,]*)\s*(?P<unit>[^\W\d_][^\d]*?)\s*")
+
+
+class _FactorRow(NamedTuple):
+    unit: str  # normalized unit the row converts
+    cell: Any  # the factor cell as written
+    bases: frozenset[str]  # normalized base units the row's product is counted in
+
+
+def _factor_cell(cell: Any, locale: str | None) -> tuple[float, str | None] | None:
+    """A factor cell as (number, unit key it counts in); the unit is None for a number alone. None when the cell
+    gives no number or names its unit in a shape other than "<number> <unit>"."""
+    if isinstance(cell, str):
+        match = FACTOR_WITH_UNIT.fullmatch(cell)
+        if match:
+            number = _number(match.group("number"), locale, unit=None) if locale else to_quantity(match.group("number"))
+            companion = normalize_lookup(match.group("unit"))
+            return (number, companion) if number is not None and companion else None
+    if cell is None:
+        return None
+    number = _number(cell, locale, unit=None) if locale else to_quantity(cell)
+    return None if number is None else (number, None)
+
+
+def _chain_factors(rows: list[_FactorRow], locale: str | None,
+                   packing_units: frozenset[str] = frozenset()) -> list[float | None]:
+    """Base units per unit for each conversion row of one product (None where the layer will not guess).
+
+    A cell of a number alone counts base units. A cell "<number> <unit>" counts that unit: when it is a base unit
+    the number stands; when it is another unit with a conversion row of the same product the number is multiplied
+    by that unit's own factor, at any depth. A unit with no row, a loop, or a cell with no number gives no factor."""
+    parsed = [_factor_cell(row.cell, locale) for row in rows]
+    first: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        if parsed[index] is not None:
+            first.setdefault(row.unit, index)  # the first row of a unit wins, like every other reader of factors
+    bases = frozenset().union(*(row.bases for row in rows)) if rows else frozenset()
+    done: dict[int, float | None] = {}
+
+    def resolve(index: int, visiting: tuple[int, ...]) -> float | None:
+        if index in done:
+            return done[index]
+        number, companion = parsed[index]  # type: ignore[misc]
+        value: float | None
+        if companion is None or companion in bases or (companion not in first and companion not in packing_units):
+            # A number alone, a number in the base unit, or a word the table never uses as a packing unit: the
+            # number counts base units, as before units were read from the cell.
+            value = number
+        elif companion not in first:
+            value = None  # a packing unit of other products only: this product's count in it is unknown
+        elif first[companion] not in visiting and first[companion] != index:
+            inner = resolve(first[companion], (*visiting, index))
+            value = None if inner is None else number * inner
+        else:
+            value = None  # a loop between the product's own conversion rows
+        done[index] = value
+        return value
+
+    return [None if parsed[index] is None else resolve(index, ()) for index in range(len(rows))]
+
+
 def _load_unit_factors(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> None:
-    """Base units per large unit, for each product that a conversion or catalog row gives one for."""
+    """Base units per large unit, for each product that a conversion or catalog row gives one for.
+
+    A factor cell may name the unit it counts in ("15 vỉ"): see _chain_factors."""
     if not (roles.get("product_id") or roles.get("product_name")):
         return
     if not (roles.get("large_unit") and roles.get("conversion_factor")):
         return
     column = roles["conversion_factor"]
-    locale = _column_locale(dst, table, column)
-    factor = f"{_parse_fn('qty', locale)}(src.{q(column)})"  # a ratio of quantities, not money
-    dst.execute(
-        "INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) "
-        f"SELECT pid, NULLIF(lookup(nm), ''), lk, fc FROM (SELECT {_text(roles.get('product_id'))} AS pid, "
-        f"{_text(roles.get('product_name'))} AS nm, NULLIF(lookup({_text(roles['large_unit'])}), '') AS lk, "
-        f"{factor} AS fc FROM source.{q(table.name)} AS src) "
-        "WHERE (pid IS NOT NULL OR nm IS NOT NULL) AND lk IS NOT NULL AND fc IS NOT NULL"
-    )
+    locale = _column_locale(dst, table, column)  # a ratio of quantities, not money
+    base = f"lookup({_text(roles['base_unit'])})" if roles.get("base_unit") else "NULL"
+    groups: dict[str, list[tuple[str | None, str | None, _FactorRow]]] = {}
+    for pid, name, unit_key, cell, base_key in dst.execute(
+            f"SELECT {_text(roles.get('product_id'))}, {_text(roles.get('product_name'))}, "
+            f"NULLIF(lookup({_text(roles['large_unit'])}), ''), src.{q(column)}, {base} "
+            f"FROM source.{q(table.name)} AS src"):
+        name_key = normalize_lookup(name) if name else None
+        if unit_key is None or not (pid or name_key):
+            continue
+        facts = dst.execute("SELECT base_unit FROM temp.product_facts WHERE base_unit IS NOT NULL AND "
+                            + ("product_id=?" if pid else "name_key=?"), (pid or name_key,)).fetchall()
+        bases = frozenset({base_key} if base_key else ()) | {normalize_lookup(row[0]) for row in facts}
+        groups.setdefault(f"i:{pid}" if pid else f"n:{name_key}", []).append(
+            (pid, name_key, _FactorRow(unit_key, cell, bases)))
+    inserts: list[tuple[str | None, str | None, str, float]] = []
+    packing = frozenset(m[2].unit for members in groups.values() for m in members)
+    for members in groups.values():
+        for (pid, name_key, row), factor in zip(members, _chain_factors([m[2] for m in members], locale, packing)):
+            if factor is not None:
+                inserts.append((pid, name_key, row.unit, factor))
+    dst.executemany("INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) VALUES (?,?,?,?)", inserts)
 
 
 def _load_stock_table(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any], roles: dict[str, str]) -> int:
@@ -962,8 +1052,122 @@ def _load_stock_table(dst: sqlite3.Connection, table: TableMeta, note: dict[str,
     quantities = [column for column, role in given.items() if role == "inventory_qty"]
     dated = [column for column, role in given.items() if role == "inventory_date"]
     if len(quantities) != 1 or dated:
+        _load_stock_ledger(dst, table, roles)
         return 0
     return _load_stock(dst, table, roles, quantities[0])
+
+
+LEDGER_MIN_SHARE = 0.99  # share of a product's consecutive rows that must follow the running balance
+LEDGER_MIN_DATE_SHARE = 0.95  # share of a column's values that must be dates for it to be the movement time
+
+
+def _timestamp_text(value: Any) -> str | None:
+    result = parse_date(value)
+    return str(result.value)[:19] if result.status == ParseStatus.OK else None
+
+
+LEDGER_SAMPLE = 300  # rows read to find the time column before the whole ledger is parsed
+
+
+def _ledger_reading(rows: list[tuple[Any, ...]], columns: list[str], product: str) -> tuple[str, str, str] | None:
+    """(time column, balance column, quantity column) of a movement ledger, from its values, or None.
+
+    The time column is the one column whose values are dates (with a time of day). The balance column is the numeric
+    column that, product by product in time order, changes by exactly the amount another column gives, in nearly
+    every row. Two columns that fit the same role, or none, is a doubt and gives None."""
+    index = {name: i for i, name in enumerate(columns)}
+    step = max(1, len(rows) // LEDGER_SAMPLE)
+    sample = rows[::step]
+    times = [c for c in columns if c != product and any(row[index[c]] is not None for row in sample)
+             and sum(_timestamp_text(row[index[c]]) is not None for row in sample) >= LEDGER_MIN_DATE_SHARE * len(sample)]
+    if len(times) != 1:
+        return None
+    when = times[0]
+    moments = [_timestamp_text(row[index[when]]) for row in rows]
+    parsed: dict[str, list[float | None]] = {}
+    for c in columns:
+        if c in (product, when):
+            continue
+        values = [to_quantity(row[index[c]]) if row[index[c]] is not None and str(row[index[c]]).strip() else None
+                  for row in rows]
+        if all(value is not None or row[index[c]] is None or not str(row[index[c]]).strip()
+               for value, row in zip(values, rows)):
+            parsed[c] = values
+    order = sorted((i for i, row in enumerate(rows) if row[index[product]] is not None and moments[i] is not None),
+                   key=lambda i: (str(rows[i][index[product]]), moments[i], i))
+    fits: list[tuple[str, str]] = []
+    for balance, series in parsed.items():
+        for quantity, change in parsed.items():
+            if quantity == balance:
+                continue
+            checked = followed = 0
+            previous: int | None = None
+            for i in order:
+                if previous is not None and rows[previous][index[product]] == rows[i][index[product]] \
+                        and series[i] is not None and series[previous] is not None and change[i] is not None:
+                    checked += 1
+                    followed += abs(abs(series[i] - series[previous]) - abs(change[i])) < 1e-9
+                previous = i
+            if checked and followed >= LEDGER_MIN_SHARE * checked:
+                fits.append((balance, quantity))
+    balances = {balance for balance, _ in fits}
+    if len(balances) != 1:
+        return None
+    balance = next(iter(balances))
+    return when, balance, next(quantity for b, quantity in fits if b == balance)
+
+
+def _load_stock_ledger(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> int:
+    """A stock movement ledger with a running balance per row: its rows go to temp.ledger_rows for _build_ledger.
+    Needs a product column and the evidence of _ledger_reading. Returns the rows kept."""
+    product = roles.get("product_id") or roles.get("product_name")
+    if not product:
+        return 0
+    columns = [c.name for c in table.columns]
+    rows = dst.execute("SELECT " + ", ".join(f"src.{q(c)}" for c in columns)
+                       + f" FROM source.{q(table.name)} AS src ORDER BY src.rowid").fetchall()
+    if not rows:
+        return 0
+    reading = _ledger_reading(rows, columns, product)
+    if reading is None:
+        return 0
+    when, balance, _ = reading
+    kept = 0
+    for row in rows:
+        key, moment, value = row[columns.index(product)], _timestamp_text(row[columns.index(when)]), \
+            to_quantity(row[columns.index(balance)])
+        if key is None or moment is None or value is None:
+            continue
+        dst.execute("INSERT INTO temp.ledger_rows VALUES (?,?,?,?,?)",
+                    (str(key).strip(), 1 if roles.get("product_id") == product else 0, moment, value, kept))
+        kept += 1
+    return kept
+
+
+def _build_ledger(dst: sqlite3.Connection) -> bool:
+    """The stock_ledger table (name_key, product_name, product_id, ts, balance: the balance after each movement),
+    and, when no stock report was read, the stock report at the report's date from each product's last movement.
+    A movement of a product the catalogs do not name leaves the whole ledger unbuilt. Returns whether it was built."""
+    dst.execute("CREATE TABLE stock_ledger (name_key TEXT, product_name TEXT, product_id TEXT, ts TEXT, balance REAL)")
+    if not dst.execute("SELECT 1 FROM temp.ledger_rows LIMIT 1").fetchone():
+        return False
+    facts = dst.execute("SELECT product_id, name_key, product_name FROM temp.product_facts "
+                        "WHERE product_name IS NOT NULL").fetchall()
+    by_id = {row[0]: row for row in facts if row[0] is not None}
+    by_name = {row[1]: row for row in facts if row[1] is not None}
+    rows = []
+    for key, is_id, moment, balance, order in dst.execute(
+            "SELECT product_key, is_id, ts, balance, seq FROM temp.ledger_rows ORDER BY product_key, ts, seq"):
+        found = by_id.get(key) if is_id else by_name.get(normalize_lookup(key))
+        if found is None:
+            return False
+        rows.append((found[1], found[2], found[0], moment, balance))
+    dst.executemany("INSERT INTO stock_ledger VALUES (?,?,?,?,?)", rows)
+    if not dst.execute("SELECT 1 FROM temp.stock_rows LIMIT 1").fetchone():
+        dst.execute("INSERT INTO temp.stock_rows (product_id, name_key, product_name, unit, qty) "
+                    "SELECT l.product_id, l.name_key, l.product_name, NULL, l.balance FROM stock_ledger l "
+                    "WHERE NOT EXISTS (SELECT 1 FROM stock_ledger n WHERE n.name_key = l.name_key AND n.rowid > l.rowid)")
+    return True
 
 
 def _load_stock(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], qty_column: str) -> int:
@@ -1028,16 +1232,33 @@ def _qty_expr(dst: sqlite3.Connection, table: TableMeta, column: str) -> str:
     return f"{_parse_fn('qty', _column_locale(dst, table, column))}(src.{q(column)})"
 
 
-def _load_lot_receipts(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], qty_role: str) -> int:
-    """One row per lot received: its lot id, product, expiry date and quantity in base units."""
+def _load_lot_receipts(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], qty_role: str,
+                       scale: int = 1) -> int:
+    """One row per lot received: its lot id, product, expiry date and quantity in base units.
+
+    The row's purchase cost is kept with what it is counted per: a row that gives its quantity in base units
+    gives the cost per base unit ('base'); a purchase line gives it per its own unit ('unit'), which
+    _build_lot_stock converts only when the unit's factor is known."""
     lot, expiry = roles.get("lot_id"), roles.get("expires_at")
     product_id, product_name = roles.get("product_id"), roles.get("product_name")
     if not (lot and expiry and (product_id or product_name)):
         return 0
+    cost_column = roles.get("purchase_unit_cost")
+    if cost_column:
+        money = _parse_fn("unit_cost", _column_locale(dst, table, cost_column))
+        cost = f"{money}(src.{q(cost_column)})*{int(scale)}"
+    else:
+        cost = "NULL"
+    if qty_role == "qty_purchased_base":
+        cost_unit, basis = "NULL", "'base'"
+    else:
+        cost_unit, basis = _text(roles.get("unit")), "'unit'"
     cursor = dst.execute(
-        "INSERT INTO temp.lot_receipts (lot_id, product_id, product_name, expires_at, qty) "
-        f"SELECT lid, pid, nm, to_date(exp), qty FROM (SELECT {_text(lot)} AS lid, {_text(product_id)} AS pid, "
-        f"{_text(product_name)} AS nm, {_text(expiry)} AS exp, {_qty_expr(dst, table, roles[qty_role])} AS qty "
+        "INSERT INTO temp.lot_receipts (lot_id, product_id, product_name, expires_at, qty, cost, cost_unit, cost_basis) "
+        f"SELECT lid, pid, nm, to_date(exp), qty, cst, lookup(cu), CASE WHEN cst IS NULL THEN NULL ELSE bs END "
+        f"FROM (SELECT {_text(lot)} AS lid, {_text(product_id)} AS pid, "
+        f"{_text(product_name)} AS nm, {_text(expiry)} AS exp, {_qty_expr(dst, table, roles[qty_role])} AS qty, "
+        f"{cost} AS cst, {cost_unit} AS cu, {basis} AS bs "
         f"FROM source.{q(table.name)} AS src) WHERE lid IS NOT NULL AND (pid IS NOT NULL OR nm IS NOT NULL) "
         "AND qty IS NOT NULL"
     )
@@ -1063,7 +1284,122 @@ def _load_lot_sales(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, 
     return cursor.rowcount
 
 
-def _load_lots(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any], roles: dict[str, str]) -> None:
+LOT_SALES_MIN_SHARE = 0.95  # share of a column's distinct values that must be known lot ids
+LOT_SALES_MIN_ORDER_SHARE = 0.9  # share of a column's distinct values that must be known order ids
+LOT_SALES_KINDS = ("sales", "other")  # annotation kinds a table of sales from lots may have been given
+
+
+def _matching_share(dst: sqlite3.Connection, table: TableMeta, column: str,
+                    known: list[tuple[TableMeta, str]]) -> float:
+    """Share of a column's distinct non-blank values found in any of the known (table, column) value sets."""
+    value = f"NULLIF(TRIM(CAST(src.{q(column)} AS TEXT)),'')"
+    inside = " OR ".join(
+        f"v IN (SELECT NULLIF(TRIM(CAST(k.{q(col)} AS TEXT)),'') FROM source.{q(other.name)} AS k)"
+        for other, col in known)
+    total, hit = dst.execute(
+        f"SELECT COUNT(*), COALESCE(SUM({inside}), 0) FROM (SELECT DISTINCT {value} AS v "
+        f"FROM source.{q(table.name)} AS src) WHERE v IS NOT NULL").fetchone()
+    return hit / total if total else 0.0
+
+
+def _is_ordinal(rows: list[tuple[Any, Any]]) -> bool:
+    """A column that numbers the lines of each order: within every order its distinct values run 1, 2, ... without
+    gaps, and some order has two. A column of quantities, including returns that are mostly 0, does not. A column
+    counted from 0 is not recognised here, which leaves a doubt the caller resolves by not guessing."""
+    per_order: dict[Any, set[float]] = {}
+    for order, value in rows:
+        per_order.setdefault(order, set()).add(value)
+    if not any(len(values) >= 2 for values in per_order.values()):
+        return False
+    for values in per_order.values():
+        ordered = sorted(values)
+        if ordered != [1 + i for i in range(len(ordered))]:
+            return False
+    return True
+
+
+def _lot_sales_reading(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any],
+                       lot_columns: list[tuple[TableMeta, str]], order_columns: list[tuple[TableMeta, str]]
+                       ) -> dict[str, str] | None:
+    """The roles of a table of sales from lots, read from its values rather than from its column names, or None.
+
+    Such a table has one column whose values are (nearly) all lot ids of the lot tables, one that joins the shop's
+    orders, and the quantity sold from the lot; a second quantity that never exceeds the first is the quantity
+    returned to the lot. It carries no product of its own, so it is never a table of sale lines. Any doubt (two
+    columns that fit a role, a missing quantity) returns None and the table keeps its annotation."""
+    given, _ = _given_by_column(table, note.get("roles") or {})
+    if any(role in ("product_id", "product_name") for role in given.values()):
+        return None
+    names = [column.name for column in table.columns]
+    lots = [c for c in names if _matching_share(dst, table, c, lot_columns) >= LOT_SALES_MIN_SHARE]
+    if len(lots) != 1:
+        return None
+    orders = [c for c in names if c != lots[0]
+              and _matching_share(dst, table, c, order_columns) >= LOT_SALES_MIN_ORDER_SHARE]
+    if len(orders) != 1:
+        return None
+    lot, order = lots[0], orders[0]
+    others = [c for c in names if c not in (lot, order)]
+    cells = dst.execute("SELECT " + ", ".join(f"src.{q(c)}" for c in [order, *others])
+                        + f" FROM source.{q(table.name)} AS src").fetchall()
+    numeric: dict[str, list[float | None]] = {}
+    for index, column in enumerate(others, 1):
+        parsed = [to_quantity(row[index]) if row[index] is not None and str(row[index]).strip() else None
+                  for row in cells]
+        filled = [value for value in parsed if value is not None]
+        present = sum(1 for row in cells if row[index] is not None and str(row[index]).strip())
+        if filled and len(filled) >= CARRY_MIN_SHARE * present and min(filled) >= 0 \
+                and not _is_ordinal([(row[0], value) for row, value in zip(cells, parsed) if value is not None]):
+            numeric[column] = parsed
+    quantity_roles = [c for c in numeric if given.get(c) in ("qty_base", "qty", "qty_sold_base")]
+    if len(quantity_roles) == 1:
+        sold = quantity_roles[0]
+    elif not quantity_roles and len(numeric) == 1:
+        sold = next(iter(numeric))
+    else:  # roles that do not settle it (none, or two): the quantity no other column exceeds is the one sold
+        sold = stock_sources.dominant_quantity(numeric, quantity_roles or list(numeric))
+        if sold is None:
+            return None
+    returns = [c for c in numeric if c != sold and all(
+        r is None or s is None or r <= s for r, s in zip(numeric[c], numeric[sold]))]
+    if len([c for c in numeric if c != sold]) != len(returns) or len(returns) > 1:
+        return None  # a quantity that is not a return amount: unclear what it is
+    roles = {order: "order_id", lot: "lot_id", sold: "qty_sold_base"}
+    if returns:
+        roles[returns[0]] = "qty_returned"
+    return roles
+
+
+def _reread_lot_sales(dst: sqlite3.Connection, annotated: list[tuple[TableMeta, dict[str, Any]]]
+                      ) -> list[tuple[TableMeta, dict[str, Any]]]:
+    """Tables of sales from lots that the annotation took for sale lines (or left as other) become lot tables with
+    the roles their values show (see _lot_sales_reading), so their rows are never counted as sales and the lot
+    balances can be built. Needs lot ids from a lot or purchase table and orders from a sales table."""
+    lot_columns: list[tuple[TableMeta, str]] = []
+    order_columns: list[tuple[TableMeta, str]] = []
+    for table, note in annotated:
+        roles = effective_roles(table, note, dst)
+        if note["kind"] in ("lot", "purchase") and roles.get("lot_id"):
+            lot_columns.append((table, roles["lot_id"]))
+        if note["kind"] == "sales" and roles.get("order_id") and (
+                roles.get("product_name") or roles.get("product_id")
+                or any(roles.get(role) for role in ORDER_SIGNAL_ROLES)):
+            order_columns.append((table, roles["order_id"]))
+    if not lot_columns or not order_columns:
+        return annotated
+    result = []
+    for table, note in annotated:
+        reading = None
+        if note["kind"] in LOT_SALES_KINDS and (table, effective_roles(table, note, dst).get("order_id")) \
+                not in order_columns:
+            reading = _lot_sales_reading(dst, table, note, lot_columns,
+                                         [pair for pair in order_columns if pair[0].name != table.name])
+        result.append((table, note) if reading is None else (table, {**note, "kind": "lot", "roles": reading}))
+    return result
+
+
+def _load_lots(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any], roles: dict[str, str],
+               scale: int = 1) -> None:
     """Lot tables give the lots received (a lot table with a purchased quantity, or a purchase line that names a lot)
     and the sales from lots (a lot table with a sold quantity)."""
     if note["kind"] == "lot" and roles.get("qty_sold_base"):
@@ -1071,18 +1407,47 @@ def _load_lots(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any], 
         return
     for qty_role in ("qty_purchased_base", "qty_purchased"):
         if roles.get(qty_role):
-            _load_lot_receipts(dst, table, roles, qty_role)
+            _load_lot_receipts(dst, table, roles, qty_role, scale)
             return
 
 
-def _build_lot_stock(dst: sqlite3.Connection) -> int:
+LOT_COST_TOLERANCE = 0.005  # relative spread within which two readings of one lot's cost are the same cost
+
+
+def _cost_per_base_unit(dst: sqlite3.Connection, product: Any, cost: float, cost_unit: str | None,
+                        basis: str | None) -> float | None:
+    """A lot's purchase cost counted per base unit, or None when the unit it was written in has no known factor.
+    product is the product_facts row (product_id, name_key, product_name, base_unit)."""
+    if basis == "base":
+        return float(cost)
+    if basis != "unit" or not cost_unit:
+        return None
+    if product[3] is not None and normalize_lookup(product[3]) == cost_unit:
+        return float(cost)
+    factor = _single_value(
+        dst, "SELECT DISTINCT factor FROM temp.unit_factors WHERE factor IS NOT NULL AND large_key="
+        + _sql_text(cost_unit) + " AND {column}=?", product[0], product[1])
+    return float(cost) / factor if factor else None
+
+
+def _agreed_cost(readings: list[float | None]) -> float | None:
+    """The one cost all known readings of a lot agree on. A reading whose unit has no known factor says nothing and
+    is left out; None when no reading is known, one is not positive, or the known ones differ."""
+    known = [r for r in readings if r is not None]
+    if not known or any(r <= 0 for r in known):
+        return None
+    low, high = min(known), max(known)
+    return known[0] if high - low <= LOT_COST_TOLERANCE * high else None
+
+
+def _build_lot_stock(dst: sqlite3.Connection, write_stock: bool = True) -> int:
     """Stock from lots, for a shop with no stock report: each lot's balance is its received quantity less what was sold
     from it on orders not cancelled, plus what customers returned to it (rulebook §6, lots: a return goes back to the
     lot it came from). Products are the ones that received a lot; the stock table then holds them at the lot balances,
     valued at catalog cost like a stock report. A lot whose product or order cannot be placed leaves the whole lot
     stock unbuilt, so no answer rests on partial balances. Returns the number of products written."""
     dst.execute("CREATE TABLE lot_balance (name_key TEXT, product_name TEXT, product_id TEXT, lot_id TEXT, "
-                "expires_at TEXT, balance REAL)")
+                "expires_at TEXT, balance REAL, unit_cost REAL)")
     sources = {row[0] for row in dst.execute("SELECT kind FROM temp.lot_sources")}
     if not {"receipts", "sales"} <= sources:
         return 0
@@ -1098,8 +1463,10 @@ def _build_lot_stock(dst: sqlite3.Connection) -> int:
         "SELECT s.lot_id, SUM(s.sold), SUM(s.returned) FROM temp.lot_sales s JOIN orders o ON o.order_id = s.order_id "
         "WHERE COALESCE(o.status, '') <> 'cancelled' GROUP BY s.lot_id")}
     lots: dict[tuple[str, str], tuple[str, str | None, str | None, float]] = {}
-    for lot_id, product_id, product_name, expires_at, qty in dst.execute(
-            "SELECT lot_id, product_id, product_name, expires_at, qty FROM temp.lot_receipts"):
+    costs: dict[tuple[str, str], list[float | None]] = {}
+    for lot_id, product_id, product_name, expires_at, qty, cost, cost_unit, basis in dst.execute(
+            "SELECT lot_id, product_id, product_name, expires_at, qty, cost, cost_unit, cost_basis "
+            "FROM temp.lot_receipts"):
         row = by_id.get(product_id) if product_id is not None else None
         if row is None and product_name is not None:
             row = by_name.get(normalize_lookup(product_name))
@@ -1108,6 +1475,8 @@ def _build_lot_stock(dst: sqlite3.Connection) -> int:
         key = (str(lot_id), row[1])
         if key not in lots or qty > lots[key][3]:  # one line of a lot named by two tables counts once
             lots[key] = (row[1], row[0], expires_at, float(qty))
+        if cost is not None:
+            costs.setdefault(key, []).append(_cost_per_base_unit(dst, row, cost, cost_unit, basis))
     totals: dict[str, float] = {}
     rows_by_name: dict[str, Any] = {}
     for (lot_id, name_key), (_, product_id, expires_at, qty) in lots.items():
@@ -1115,11 +1484,12 @@ def _build_lot_stock(dst: sqlite3.Connection) -> int:
         balance = qty - sold_qty + returned
         totals[name_key] = totals.get(name_key, 0.0) + balance
         rows_by_name.setdefault(name_key, (product_id, by_name[name_key][2], by_name[name_key][3]))
-        dst.execute("INSERT INTO lot_balance VALUES (?,?,?,?,?,?)",
-                    (name_key, by_name[name_key][2], product_id, lot_id, expires_at, balance))
+        dst.execute("INSERT INTO lot_balance VALUES (?,?,?,?,?,?,?)",
+                    (name_key, by_name[name_key][2], product_id, lot_id, expires_at, balance,
+                     _agreed_cost(costs.get((lot_id, name_key), []))))
     report_day = dst.execute(
         "SELECT MAX(d) FROM (SELECT MAX(date) AS d FROM orders UNION ALL SELECT MAX(date) FROM purchases)").fetchone()[0]
-    for name_key, qty in totals.items():
+    for name_key, qty in (totals.items() if write_stock else ()):
         product_id, product_name, unit = rows_by_name[name_key]
         cost = _single_value(dst, "SELECT DISTINCT unit_cost FROM temp.product_facts "
                              "WHERE unit_cost IS NOT NULL AND {column}=?", product_id, name_key)
@@ -1131,33 +1501,113 @@ def _build_lot_stock(dst: sqlite3.Connection) -> int:
     return len(totals)
 
 
-_README_FACTOR = re.compile(r"(?<![\d.,])1\s+(?P<large>[^\W\d_]+)\s*=\s*(?P<n>\d+(?:[.,]\d+)?)\s+(?P<base>[^\W\d_]+)")
+_UNIT_WORD = r"[^\W\d_]+"
+_UNIT_COUNT = r"\d+(?:[.,]\d+)?"
+_UNIT_LINK = "|".join(re.escape(w) for w in UNIT_STATEMENT_LINKERS)
+_UNIT_EACH = "|".join(re.escape(w) for w in UNIT_EACH_WORDS)
+_UNIT_CUE = "|".join(re.escape(w) for w in UNIT_PACKING_CUES)
+# Each pattern captures large, n, base. A bare "X N Y" is read only right after a cue word, never inside a name.
+_UNIT_STATEMENTS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    rf"(?<![\d.,])1\s+(?P<large>{_UNIT_WORD})\s*(?:{_UNIT_LINK})\s*(?P<n>{_UNIT_COUNT})\s+(?P<base>{_UNIT_WORD})",
+    rf"(?<!\w)(?:{_UNIT_EACH})\s+(?P<large>{_UNIT_WORD})\s*(?:(?:{_UNIT_LINK})\s*)?(?P<n>{_UNIT_COUNT})\s+(?P<base>{_UNIT_WORD})",
+    rf"(?<!\w)(?:{_UNIT_CUE})\s*:?\s*(?P<large>{_UNIT_WORD})\s*(?:(?:{_UNIT_LINK})\s*)?(?P<n>{_UNIT_COUNT})\s+(?P<base>{_UNIT_WORD})",
+    rf"\|\s*1\s+(?P<large>{_UNIT_WORD})\s*\|\s*(?P<n>{_UNIT_COUNT})\s+(?P<base>{_UNIT_WORD})\s*(?:\||$)",
+))
+_GROUPED_THOUSANDS = re.compile(r"^\d{1,3}(?:[.,]\d{3})+$")
+
+
+def _unit_statements(text: str) -> list[tuple[str, str, float, str]]:
+    """Conversions written in words: (line, large unit, factor, base unit) for each, in order. A statement whose units
+    are money or time, whose count is a grouped amount ("25.000"), or whose two units are the same, is not one."""
+    found: list[tuple[str, str, float, str]] = []
+    for line in (text or "").splitlines():
+        for pattern in _UNIT_STATEMENTS:
+            for match in pattern.finditer(line):
+                raw = match.group("n")
+                large, base = match.group("large"), match.group("base")
+                keys = {normalize_lookup(large), normalize_lookup(base)}
+                if (_GROUPED_THOUSANDS.match(raw) or len(keys) < 2 or keys & UNIT_NON_QUANTITY_WORDS
+                        or "" in keys):
+                    continue
+                factor = float(raw.replace(",", "."))
+                if factor > 0:
+                    found.append((line, large, factor, base))
+    return found
+
+
+def _load_text_unit_factors(dst: sqlite3.Connection, text: str) -> int:
+    """Unit conversions a text (shop README or rulebook) states in words. A statement naming sold products gives them
+    the factor; one naming none gives it to every product sold by the large unit whose base unit is the small unit or
+    unknown (a product with another base unit is left alone). A factor the shop already has for a product and large
+    unit stays; two statements of this text that disagree for one (product, large unit) give nothing. Returns the
+    number of (product, unit) factors added."""
+    statements = _unit_statements(text)
+    if not statements:
+        return 0
+    sold: dict[str, set[str]] = {}
+    pids: dict[str, set[str]] = {}
+    present = {row[1] for row in dst.execute("PRAGMA table_info(raw_lines)")}
+    id_col, unit_col = ("product_id" if "product_id" in present else "NULL"), ("unit" if "unit" in present else "NULL")
+    for name, pid, unit in dst.execute(
+            f"SELECT DISTINCT product_name, {id_col}, {unit_col} FROM raw_lines WHERE product_name IS NOT NULL"):
+        key = normalize_lookup(name)
+        sold.setdefault(key, set()).add(normalize_lookup(unit) if unit else "")
+        if pid is not None:
+            pids.setdefault(key, set()).add(pid)
+    base_by_id: dict[str, str] = {}
+    base_by_name: dict[str, str] = {}
+    for pid, name_key, base in dst.execute(
+            "SELECT product_id, name_key, base_unit FROM temp.product_facts WHERE base_unit IS NOT NULL"):
+        if pid is not None:
+            base_by_id.setdefault(pid, normalize_lookup(base))
+        if name_key is not None:
+            base_by_name.setdefault(name_key, normalize_lookup(base))
+    have_id: set[tuple[str, str]] = set()
+    have_name: set[tuple[str, str]] = set()
+    for pid, name_key, large in dst.execute("SELECT product_id, name_key, large_key FROM temp.unit_factors"):
+        if pid is not None:
+            have_id.add((pid, large))
+        if name_key is not None:
+            have_name.add((name_key, large))
+
+    def known_base(key: str) -> str | None:
+        for pid in pids.get(key, ()):
+            if pid in base_by_id:
+                return base_by_id[pid]
+        return base_by_name.get(key)
+
+    def has_factor(key: str, large: str) -> bool:
+        return (key, large) in have_name or any((pid, large) in have_id for pid in pids.get(key, ()))
+
+    proposals: dict[tuple[str, str], set[tuple[float, str, str]]] = {}
+    for line, large_word, factor, base_word in statements:
+        large, base = normalize_lookup(large_word), normalize_lookup(base_word)
+        folded = f" {normalize_lookup(line)} "
+        named = [key for key in sold if len(key) >= 6 and f" {key} " in folded]
+        if named:
+            keys = named
+        else:
+            keys = [key for key in sold if large in sold[key]
+                    and (base in sold[key] or known_base(key) in (None, base))]
+        for key in keys:
+            proposals.setdefault((key, large), set()).add((factor, base, base_word))
+    added = 0
+    for (key, large), options in proposals.items():
+        if len(options) != 1 or has_factor(key, large):
+            continue
+        factor, base, base_word = next(iter(options))
+        dst.executemany(
+            "INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) VALUES (NULL,?,?,?)",
+            [(key, large, factor), (key, base, 1.0)])
+        dst.execute("INSERT INTO temp.product_facts (product_id, name_key, category, base_unit, unit_cost) "
+                    "VALUES (NULL,?,NULL,?,NULL)", (key, base_word))
+        added += 1
+    return added
 
 
 def _load_readme_unit_factors(dst: sqlite3.Connection, readme: str) -> int:
-    """Unit conversions the shop README states in words ("… bán theo bó, 1 bó = 10 cây"), for the products named in
-    the same line. A line that names no sold product gives nothing. Returns the number of factors added."""
-    names = {normalize_lookup(r[0]): r[0] for r in dst.execute(
-        "SELECT DISTINCT product_name FROM raw_lines WHERE product_name IS NOT NULL")}
-    added = 0
-    for line in (readme or "").splitlines():
-        match = _README_FACTOR.search(line)
-        if not match:
-            continue
-        factor = float(match.group("n").replace(",", "."))
-        large = normalize_lookup(match.group("large"))
-        text = f" {normalize_lookup(line)} "
-        named = [key for key in names if len(key) >= 6 and f" {key} " in text]
-        base = normalize_lookup(match.group("base"))
-        for key in named:
-            # the large unit, and the base unit itself (factor 1), so lines sold in either unit get a base quantity
-            dst.executemany(
-                "INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) VALUES (NULL,?,?,?)",
-                [(key, large, factor), (key, base, 1.0)])
-            dst.execute("INSERT INTO temp.product_facts (product_id, name_key, category, base_unit, unit_cost) "
-                        "VALUES (NULL,?,NULL,?,NULL)", (key, match.group("base")))
-            added += 1
-    return added
+    """Unit conversions the shop README states in words ("… bán theo bó, 1 bó = 10 cây"). Returns the factors added."""
+    return _load_text_unit_factors(dst, readme)
 
 
 def _derive_qty_base(dst: sqlite3.Connection) -> int:
@@ -1166,7 +1616,12 @@ def _derive_qty_base(dst: sqlite3.Connection) -> int:
     The sold unit is the base unit: the quantity stands. A packing unit with a factor: quantity times factor.
     A product with a known base unit that gives no factor for the sold unit stays NULL. A product with no
     base unit and no factor row at all sells in its base unit (rulebook section 10).
+    Keep that identity branch's unit alongside its derived quantity. A supplied
+    base quantity or an incomplete documented conversion does not identify a unit.
     """
+    columns = {row[1] for row in dst.execute("PRAGMA table_info(raw_lines)")}
+    if "_qty_base_identity_unit" not in columns:
+        dst.execute("ALTER TABLE raw_lines ADD COLUMN _qty_base_identity_unit TEXT")
     base_by_id: dict[str, str] = {}
     base_by_name: dict[str, str] = {}
     for pid, name_key, base in dst.execute(
@@ -1184,6 +1639,13 @@ def _derive_qty_base(dst: sqlite3.Connection) -> int:
         if name_key is not None:
             factors_by_name.setdefault(name_key, {}).setdefault(large, factor)
     updates: list[tuple[float, int]] = []
+    identity_units: list[tuple[str, int]] = []
+    sold_units: dict[str, set[str]] = {}  # a product's sold units, by id (else name): identity needs exactly one
+    for pid, name, unit in dst.execute(
+            "SELECT DISTINCT product_id, product_name, unit FROM raw_lines WHERE has_product=1"):
+        unit_key = normalize_lookup(unit) if unit is not None else ""
+        if unit_key:
+            sold_units.setdefault(pid if pid is not None else normalize_lookup(name or ""), set()).add(unit_key)
     lines = dst.execute(
         "SELECT rowid, product_id, product_name, unit, qty FROM raw_lines "
         "WHERE qty_base IS NULL AND qty IS NOT NULL AND has_product=1"
@@ -1202,9 +1664,12 @@ def _derive_qty_base(dst: sqlite3.Connection) -> int:
             updates.append((qty, rowid))
         elif unit_key in factor_map:
             updates.append((qty * factor_map[unit_key], rowid))
-        elif base is None and not factor_map:
+        elif base is None and not factor_map and len(
+                sold_units.get(pid if pid is not None else name_key, ())) == 1:
             updates.append((qty, rowid))
+            identity_units.append((unit, rowid))
     dst.executemany("UPDATE raw_lines SET qty_base=? WHERE rowid=?", updates)
+    dst.executemany("UPDATE raw_lines SET _qty_base_identity_unit=? WHERE rowid=?", identity_units)
     return len(updates)
 
 
@@ -1290,6 +1755,13 @@ def _load_employee_names(dst: sqlite3.Connection, table: TableMeta, roles: dict[
     name = roles.get("employee_name")
     if not name:
         return
+    code = roles.get("employee_id")
+    if code and code != name:
+        dst.execute(
+            "INSERT INTO temp.employee_codes (code, full_name) "
+            f"SELECT DISTINCT lookup(cd), TRIM(fn) FROM (SELECT {_text(code)} AS cd, {_text(name)} AS fn "
+            f"FROM source.{q(table.name)} AS src) WHERE cd IS NOT NULL AND fn IS NOT NULL AND TRIM(fn) <> ''"
+        )
     dst.execute(
         "INSERT INTO temp.employee_names (full_name) "
         f"SELECT DISTINCT fn FROM (SELECT {_text(name)} AS fn FROM source.{q(table.name)} AS src) "
@@ -1314,6 +1786,27 @@ def match_employee(spelling: str, full_names: Iterable[str]) -> str | None:
     return next(iter(found.values())) if len(found) == 1 else None
 
 
+EMPLOYEE_CODE_MIN_SHARE = 0.95  # share of the codes on orders that the staff list must know
+
+
+def _employee_code_mapping(dst: sqlite3.Connection, spellings: list[str]) -> dict[str, str]:
+    """Staff names by the codes orders write, when the staff list gives each code one name: at least
+    EMPLOYEE_CODE_MIN_SHARE of the codes on orders are in the list, no code has two names and no two codes share one.
+    Otherwise empty, and the spellings are matched as names instead."""
+    names: dict[str, set[str]] = {}
+    for code, full in dst.execute("SELECT code, full_name FROM temp.employee_codes"):
+        names.setdefault(code, set()).add(full)
+    known = {s: names[normalize_lookup(s)] for s in spellings if normalize_lookup(s) in names}
+    if not spellings or len(known) < EMPLOYEE_CODE_MIN_SHARE * len(spellings):
+        return {}
+    if any(len(full) != 1 for full in known.values()):
+        return {}
+    resolved = {s: next(iter(full)) for s, full in known.items()}
+    if len({normalize_lookup(full) for full in resolved.values()}) != len(resolved):
+        return {}
+    return {s: full for s, full in resolved.items() if full != s}
+
+
 def _map_employees(dst: sqlite3.Connection) -> int:
     """Rewrite each employee spelling on orders and lines to its full staff name, where match_employee finds one.
     The raw spelling goes to employee_raw first, and only when some spelling changes.
@@ -1324,7 +1817,16 @@ def _map_employees(dst: sqlite3.Connection) -> int:
     if not names:
         return 0
     spellings = [row[0] for row in dst.execute("SELECT DISTINCT employee FROM orders WHERE employee IS NOT NULL")]
-    mapping = {}
+    mapping = _employee_code_mapping(dst, spellings)
+    if mapping:
+        # Orders write staff codes and the staff list names them. Rulebook §8: a file with codes goes by the codes, so
+        # the code stays the employee (answers and rankings name it); the full name goes to employee_raw, where a
+        # filter that names the person finds it (the compiler maps a raw spelling back to the code).
+        for table in ("orders", "lines"):
+            dst.execute(f"ALTER TABLE {table} ADD COLUMN employee_raw")
+            dst.executemany(f"UPDATE {table} SET employee_raw=? WHERE employee=?",
+                            [(full, code) for code, full in mapping.items()])
+        return len(mapping)
     for spelling in spellings:
         full = match_employee(spelling, names)
         if full is not None and full != spelling:
@@ -1535,9 +2037,10 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.execute("CREATE TEMP TABLE product_facts (product_id TEXT, name_key TEXT, product_name TEXT, category TEXT, "
                 "base_unit TEXT, unit_cost REAL)")
     dst.execute("CREATE TEMP TABLE lot_receipts (lot_id TEXT, product_id TEXT, product_name TEXT, expires_at TEXT, "
-                "qty REAL)")
+                "qty REAL, cost REAL, cost_unit TEXT, cost_basis TEXT)")
     dst.execute("CREATE TEMP TABLE lot_sales (order_id TEXT, lot_id TEXT, sold REAL, returned REAL)")
     dst.execute("CREATE TEMP TABLE lot_sources (kind TEXT)")
+    dst.execute("CREATE TEMP TABLE ledger_rows (product_key TEXT, is_id INTEGER, ts TEXT, balance REAL, seq INTEGER)")
     dst.execute("CREATE TEMP TABLE stock_rows (product_id TEXT, name_key TEXT, product_name TEXT, unit TEXT, "
                 "qty REAL)")
     dst.execute("CREATE TEMP TABLE product_attrs (product_id TEXT, name_key TEXT, prescription INTEGER, "
@@ -1546,6 +2049,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.execute("CREATE TEMP TABLE catalog_ids (role TEXT, id TEXT, name TEXT)")
     dst.execute("CREATE TEMP TABLE alias_map (alias_key TEXT PRIMARY KEY, full_name TEXT)")
     dst.execute("CREATE TEMP TABLE employee_names (full_name TEXT)")
+    dst.execute("CREATE TEMP TABLE employee_codes (code TEXT, full_name TEXT)")
     dst.execute("CREATE TABLE build_stats (key TEXT, value INTEGER)")
     dst.execute("CREATE TABLE stock_sources (kind TEXT, rows INTEGER)")
     dst.execute("CREATE TABLE expenses (date TEXT, amount REAL, category TEXT)")
@@ -1575,6 +2079,8 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             key, note = sibling
         annotated.append((table, note))
         annotation_key[table.name] = key
+    annotated = _reread_lot_sales(dst, annotated)
+    annotated, report["annotation_fixes"] = annotation_check.check_annotations(dst, annotated)
     pools: dict[tuple[str, ...], list[TableMeta]] = {}
     for table, note in annotated:
         if note["kind"] in CATALOG_KINDS:
@@ -1590,7 +2096,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     for table, kind, roles in first_pass:
         _load_catalog_keys(dst, table, kind, roles)
     carry_log: list[tuple[str, list[Carried]]] = []  # (layer table, columns carried into it), for the catalog
-    layer_loaded: set[str] = set()  # tables whose kind the layer loads; every other table is copied as src_
+    carried_tables: set[str] = set()  # all source columns survive in canonical fields or carried extra columns
     for table, note in annotated:
         given, unresolved = _given_by_column(table, note.get("roles") or {})
         roles = effective_roles(table, note, dst, pool_of(table, note))
@@ -1606,8 +2112,8 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
         if lost_order:
             stats["tables_skipped_missing_order_id"] += 1
             continue
-        if _layer_loads(note["kind"], roles):
-            layer_loaded.add(table.name)
+        if note["kind"] in CARRIED_KINDS and _layer_loads(note["kind"], roles):
+            carried_tables.add(table.name)
         scale = _amount_scale(context, table)
         if scale != 1:
             stats["scaled_tables"] += 1
@@ -1676,7 +2182,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             loaded = _load_stock_table(dst, table, note, roles)
             dst.execute("INSERT INTO stock_sources VALUES (?,?)", (note["kind"], loaded))
         if note["kind"] in ("lot", "purchase"):
-            _load_lots(dst, table, note, roles)
+            _load_lots(dst, table, note, roles, scale)
     _fill_receipts(dst)
     _fill_from_catalogs(dst)
     report["alias_tables_found"] = _promote_alias_tables(dst, annotated)
@@ -1685,11 +2191,16 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["status_mapped"] = _map_status(dst, status_map or {}, stats)
     report["readme_unit_factors"] = _load_readme_unit_factors(dst, context.readme)
     report["convention_unit_factors"] = _apply_unit_conventions(dst, conventions or [])
+    report["rulebook_unit_factors"] = _load_text_unit_factors(dst, rulebook_params.rulebook_raw_text() or "")
     report["qty_base_derived"] = _derive_qty_base(dst)
     _derive(dst)
+    report["ledger_built"] = _build_ledger(dst)
     report["stock_rows"] = _build_stock(dst)
     if not report["stock_rows"]:
         report["lot_stock_rows"] = _build_lot_stock(dst)
+    else:  # a stock read from a report or the movement ledger: the lots still get their balances
+        report["lot_stock_rows"] = _build_lot_stock(dst, write_stock=False)
+        report["lot_report_mismatch"] = stock_sources.drop_lots_if_disagreeing(dst)
     # Tables the annotator did not read may hold stock or lots: a question about them is not unanswerable.
     # A table of kind other is read as unknown too: it may hold lots.
     unknown = len(report["unannotated"]) + sum(1 for _, note in annotated if note["kind"] == "other")
@@ -1699,7 +2210,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["orders_marked_returned"] = _mark_returned(dst)
     notes_of = {table.name: note for table, note in annotated}
     for table in context.tables:
-        if table.name not in layer_loaded:
+        if table.name not in carried_tables:
             copied = _copy_unloaded(dst, table, notes_of.get(table.name), carry_log)
             if copied:
                 report["src_tables"].append(copied)
@@ -1751,8 +2262,9 @@ def _carry_order_columns(dst: sqlite3.Connection) -> None:
 
 def _copy_unloaded(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any] | None,
                    carry_log: list[tuple[str, list[Carried]]]) -> str | None:
-    """A table the layer does not read, copied whole as src_<table name>: every column as text, with the numeric and
-    date twins. Returns the copy's name, or None when the table has no column."""
+    """A source not fully carried into canonical tables, copied whole as src_<table name>: every column as text,
+    with numeric and date twins. This also preserves catalog attributes not consumed by a specialized loader.
+    Returns the copy's name, or None when the table has no column."""
     given = _given_by_column(table, note.get("roles") or {})[0] if note is not None else None
     carried = _carry_plan(dst, table, set(), given)
     if not carried:
@@ -1880,6 +2392,16 @@ def _attach_catalog_attributes(dst: sqlite3.Connection, annotated: list[tuple[Ta
         return []
     line_cols = {r[1] for r in dst.execute("PRAGMA table_info(lines)")}
     attached: list[str] = []
+    # Catalogs may be split across sheets. Collect every candidate before writing a line:
+    # the first sheet is not necessarily complete, and contradictory rows are not a fact.
+    attributes: dict[str, list[tuple[str, str, str]]] = {}
+    origins: dict[str, tuple[str, str]] = {}
+    sold_names = {normalize_lookup(str(row[0])) for row in dst.execute(
+        "SELECT DISTINCT product_name FROM lines WHERE product_name IS NOT NULL")} \
+        if "product_name" in line_cols else set()
+    sold_ids = {str(row[0]).strip() for row in dst.execute(
+        "SELECT DISTINCT product_id FROM lines WHERE product_id IS NOT NULL")} \
+        if "product_id" in line_cols else set()
     for table, note in annotated:
         if note.get("kind") not in CATALOG_ATTR_KINDS:
             continue
@@ -1888,8 +2410,9 @@ def _attach_catalog_attributes(dst: sqlite3.Connection, annotated: list[tuple[Ta
         pid, name = roles.get("product_id"), roles.get("product_name")
         if not (pid or name):
             continue
-        use_id = bool(pid) and "product_id" in line_cols and dst.execute(
-            "SELECT 1 FROM lines WHERE product_id IS NOT NULL LIMIT 1").fetchone() is not None
+        use_id = bool(pid and sold_ids)
+        if not use_id and not (name and sold_names):
+            continue
         for column in table.columns:
             if by_column.get(column.name) in CATALOG_READ_ROLES or column.name.startswith("__"):
                 continue
@@ -1900,22 +2423,50 @@ def _attach_catalog_attributes(dst: sqlite3.Connection, annotated: list[tuple[Ta
                                    ).fetchone()[0]
             if not distinct or distinct > CATALOG_ATTR_MAX_DISTINCT:
                 continue
-            key_src, key_line = ((_text(pid), "lines.product_id") if use_id
-                                 else (f"lookup({_text(name)})", "lookup(lines.product_name)"))
+            key_src = _text(pid) if use_id else f"lookup({_text(name)})"
+            sold = sold_ids if use_id else sold_names
+            values = [("id" if use_id else "name", str(key), str(value))
+                      for key, value in dst.execute(
+                          f"SELECT DISTINCT {key_src}, {_text(column.name)} "
+                          f"FROM source.{q(table.name)} AS src "
+                          f"WHERE {key_src} IS NOT NULL AND {_text(column.name)} IS NOT NULL")
+                      if str(key) in sold]
+            if values:
+                attributes.setdefault(target, []).extend(values)
+                origins.setdefault(target, (table.name, column.original_name))
+    if not attributes:
+        return []
+    dst.execute("CREATE TEMP TABLE _catalog_attrs (kind TEXT, key TEXT, value TEXT)")
+    dst.execute("CREATE INDEX temp._catalog_attrs_key ON _catalog_attrs(kind, key)")
+    try:
+        for target, values in attributes.items():
+            if len({normalize_lookup(value) for _, _, value in values}) > CATALOG_ATTR_MAX_DISTINCT:
+                continue
+            dst.execute("DELETE FROM temp._catalog_attrs")
+            dst.executemany("INSERT INTO temp._catalog_attrs VALUES (?,?,?)", values)
             dst.execute(f"ALTER TABLE lines ADD COLUMN {q(target)} TEXT")
+            line_cols.add(target)
+            matches = []
+            if sold_ids:
+                matches.append("(kind='id' AND key=TRIM(CAST(lines.product_id AS TEXT)))")
+            if sold_names:
+                matches.append("(kind='name' AND key=lookup(lines.product_name))")
             dst.execute(
-                f"UPDATE lines SET {q(target)} = (SELECT {_text(column.name)} FROM source.{q(table.name)} AS src "
-                f"WHERE {key_src} = {key_line} AND {_text(column.name)} IS NOT NULL LIMIT 1)")
+                f"UPDATE lines SET {q(target)} = (SELECT CASE WHEN COUNT(DISTINCT lookup(value))=1 "
+                f"THEN MIN(value) END FROM temp._catalog_attrs WHERE {' OR '.join(matches)})")
             filled = dst.execute(f"SELECT COUNT({q(target)}) FROM lines").fetchone()[0]
             if not filled:
                 continue
+            distinct = dst.execute(f"SELECT COUNT(DISTINCT {q(target)}) FROM lines").fetchone()[0]
             samples = [r[0] for r in dst.execute(
                 f"SELECT DISTINCT {q(target)} FROM lines WHERE {q(target)} IS NOT NULL LIMIT {CATALOG_SAMPLES}")]
+            source_table, header = origins[target]
             dst.execute("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)",
-                        ("lines", target, table.name, column.original_name, "other", "text", distinct,
+                        ("lines", target, source_table, header, "other", "text", distinct,
                          json.dumps(samples, ensure_ascii=False), None))
-            line_cols.add(target)
             attached.append(target)
+    finally:
+        dst.execute("DROP TABLE temp._catalog_attrs")
     return attached
 
 
@@ -2112,6 +2663,8 @@ def _derive_lines(dst: sqlite3.Connection) -> None:
     status = "','".join(CANONICAL_STATUS)
     service_fees = ",".join(_sql_text(name) for name in rulebook_params.active().service_fee_names)
     extra = "".join(f", l.{q(name)}" for name, _ in _extra_columns(dst, "raw_lines"))  # each line's own values
+    raw_columns = {row[1] for row in dst.execute("PRAGMA table_info(raw_lines)")}
+    identity_unit = "l._qty_base_identity_unit" if "_qty_base_identity_unit" in raw_columns else "NULL"
     dst.executescript(
         f"""
         CREATE TABLE lines AS
@@ -2124,7 +2677,7 @@ def _derive_lines(dst: sqlite3.Connection) -> None:
                l.line_cost, l.unit_price,
                CASE WHEN l.line_kind='service_fee' OR lookup(l.product_name) IN ({service_fees}) THEN 0 ELSE 1 END
                    AS is_item,
-               {_product_fact('base_unit')} AS base_unit,
+               COALESCE({_product_fact('base_unit')}, {identity_unit}) AS base_unit,
                {_product_fact('prescription', 'temp.product_attrs')} AS prescription,
                {_product_fact('active_ingredient', 'temp.product_attrs')} AS active_ingredient,
                {_product_fact('product_kind', 'temp.product_attrs')} AS product_kind{extra}

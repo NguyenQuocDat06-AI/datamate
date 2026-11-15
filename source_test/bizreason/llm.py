@@ -31,6 +31,9 @@ RETIRED_CLIENT_LIMIT = 4
 __all__ = [
     "LanguageModel",
     "ModelError",
+    "InvalidJSONError",
+    "IncompleteCandidateError",
+    "EmptyCandidateError",
     "ProviderError",
     "RETRYABLE_STATUS_CODES",
     "TrammayClient",
@@ -45,17 +48,31 @@ __all__ = [
 
 
 class ModelError(RuntimeError):
-    pass
+    code = "model_error"
+
+
+class InvalidJSONError(ModelError):
+    code = "invalid_json"
+
+
+class IncompleteCandidateError(ModelError):
+    code = "output_incomplete"
+
+
+class EmptyCandidateError(ModelError):
+    code = "empty_candidate"
 
 
 class ProviderError(ModelError):
     """Transport/auth/provider failure; SQL repair cannot resolve it."""
+    code = "provider_error"
 
 
 @dataclass
 class Usage:
     calls: int = 0
     tokens: int = 0
+    http_attempts: int = 0
 
 
 class LanguageModel(Protocol):
@@ -155,7 +172,10 @@ def _repair_json_syntax(candidate: str) -> str:
                         stack.pop()
                     elif stack and ch in stack:
                         while stack and stack[-1] != ch:
-                            stack.pop()
+                            # Preserve the inner container before closing its parent.
+                            # This only inserts delimiters at an existing outer close;
+                            # it never invents fields/values or completes a truncated EOF.
+                            out.append(stack.pop())
                         if stack:
                             stack.pop()
                 out.append(ch)
@@ -211,7 +231,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
     try:
         value = json.loads(fast_text)
         if not isinstance(value, dict):
-            raise ModelError("Model output must be a JSON object")
+            raise InvalidJSONError("Model output must be a JSON object")
         return value
     except json.JSONDecodeError:
         pass
@@ -222,7 +242,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
         try:
             val = json.loads(block)
             if not isinstance(val, dict):
-                raise ModelError("Model output must be a JSON object")
+                raise InvalidJSONError("Model output must be a JSON object")
             return val
         except json.JSONDecodeError:
             pass
@@ -251,7 +271,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
         try:
             val = json.loads(repaired)
             if not isinstance(val, dict):
-                raise ModelError("Model output must be a JSON object")
+                raise InvalidJSONError("Model output must be a JSON object")
             return val
         except json.JSONDecodeError:
             pass
@@ -370,7 +390,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
         if "{" not in sql_candidate and "}" not in sql_candidate:
             return {"sql": sql_candidate}
 
-    raise ModelError("Model returned invalid JSON")
+    raise InvalidJSONError("Model returned invalid JSON")
 
 
 def endpoint_file_resolver(path: Path) -> Callable[[], str | None]:
@@ -580,6 +600,8 @@ class TrammayClient:
 
             with self._lock:
                 client = self._client
+                if count_call:
+                    self.usage.http_attempts += 1
             try:
                 response = client.request(method, path, timeout=attempt_timeout, **kwargs)
             except (httpx.HTTPError, OSError, ValueError, RuntimeError) as error:
@@ -690,6 +712,20 @@ class TrammayClient:
         ]
 
     def generate_json(self, system: str, prompt: str, *, timeout: float) -> dict[str, Any]:
+        return self._generate_json(system, prompt, timeout=timeout)
+
+    def reask_json(self, system: str, prompt: str, previous: dict[str, Any], feedback: str,
+                   *, timeout: float) -> dict[str, Any]:
+        """Continue a failed structured response with deterministic validator feedback."""
+        if not isinstance(previous, dict) or not isinstance(feedback, str) or not feedback.strip():
+            raise ValueError("JSON repair needs an object and nonempty validation feedback")
+        return self._generate_json(system, prompt, timeout=timeout, correction=(previous, feedback))
+
+    def _generate_json(self, system: str, prompt: str, *, timeout: float,
+                       correction: tuple[dict[str, Any], str] | None = None) -> dict[str, Any]:
+        started = time.monotonic()
+        continuation = ([{"role": "assistant", "content": json.dumps(correction[0], ensure_ascii=False)},
+                         {"role": "user", "content": correction[1]}] if correction is not None else [])
         if self.settings.api_style == "responses":
             payload = self._request(
                 "POST",
@@ -699,7 +735,7 @@ class TrammayClient:
                 json={
                     "model": self.settings.model,
                     "instructions": system,
-                    "input": prompt,
+                    "input": ([{"role": "user", "content": prompt}, *continuation] if continuation else prompt),
                     "max_output_tokens": self.settings.max_output_tokens,
                 },
             )
@@ -715,21 +751,21 @@ class TrammayClient:
                 choices = payload.get("choices", [])
                 if choices:
                     if choices[0].get("finish_reason") == "length":
-                        raise ModelError("Provider returned no complete candidate")
+                        raise IncompleteCandidateError("Provider returned no complete candidate")
                     msg = choices[0].get("message", {}).get("content", "")
                     if isinstance(msg, list):
                         text = "".join(part.get("text", "") for part in msg if isinstance(part, dict))
                     elif isinstance(msg, str):
                         text = msg
             if payload.get("status") == "incomplete":
-                raise ModelError("Provider returned no complete candidate")
+                raise IncompleteCandidateError("Provider returned no complete candidate")
         else:
             def _build_chat_payload(merge: bool) -> dict[str, Any]:
                 return {
                     "model": self.settings.model,
                     "messages": build_chat_messages(
                         self.settings.model, system, prompt, merge_system=merge
-                    ),
+                    ) + continuation,
                     "temperature": 0,
                     "max_tokens": self.settings.max_output_tokens,
                 }
@@ -754,13 +790,16 @@ class TrammayClient:
                     and sent_separate_system
                     and ("Provider HTTP 400" in str(exc) or "Provider error 400" in str(exc))
                 ):
+                    remaining = timeout - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise ProviderError("Provider request deadline exceeded") from None
                     if self.usage.calls > 0:
                         self.usage.calls -= 1
                     payload = self._request(
                         "POST",
                         "chat/completions",
                         count_call=True,
-                        timeout=timeout,
+                        timeout=remaining,
                         json=_build_chat_payload(merge=True),
                     )
                 else:
@@ -768,7 +807,7 @@ class TrammayClient:
 
             choices = payload.get("choices", [])
             if not choices or choices[0].get("finish_reason") == "length":
-                raise ModelError("Provider returned no complete candidate")
+                raise IncompleteCandidateError("Provider returned no complete candidate")
             text = choices[0].get("message", {}).get("content", "")
             if isinstance(text, list):
                 text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
@@ -781,5 +820,5 @@ class TrammayClient:
         )
         self.usage.tokens += int(total)
         if not isinstance(text, str) or not text.strip():
-            raise ModelError("Provider returned an empty candidate")
+            raise EmptyCandidateError("Provider returned an empty candidate")
         return parse_json_object(text)

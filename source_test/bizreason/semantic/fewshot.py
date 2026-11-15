@@ -80,6 +80,36 @@ class FewShotBank:
     def __len__(self) -> int:
         return len(self._rows)
 
+    def excluding(
+        self, *, businesses: Iterable[str] = (), groups: Iterable[str] = (),
+        business_groups: dict[str, list[str]] | None = None,
+    ) -> FewShotBank:
+        """Fit a fresh index using only the permitted fold, including its IDF weights.
+
+        Group names are explicit metadata supplied by the experiment, never guessed
+        from questions or shop names. When groups are held out, missing shop metadata
+        is an error rather than a silent inclusion of potentially related examples.
+        """
+        blocked_businesses, blocked_groups = set(businesses), set(groups)
+        mapping = business_groups or {}
+        if blocked_groups:
+            if any(not isinstance(tags, list) or not tags
+                   or any(not isinstance(tag, str) or not tag for tag in tags) for tags in mapping.values()):
+                raise ValueError("invalid few-shot group metadata")
+            for business in {str(row["business_id"]) for row in self._rows}:
+                tags = mapping.get(business)
+                if (not isinstance(tags, list) or not tags
+                        or any(not isinstance(tag, str) or not tag for tag in tags)):
+                    raise ValueError(f"few-shot group metadata missing or invalid for {business}")
+            available = {tag for tags in mapping.values() for tag in tags}
+            if blocked_groups - available:
+                raise ValueError("excluded few-shot group is absent from group metadata")
+        return FewShotBank(
+            row for row in self._rows
+            if str(row["business_id"]) not in blocked_businesses
+            and not blocked_groups.intersection(mapping.get(str(row["business_id"]), ()))
+        )
+
     def _build_index(self) -> tuple[dict[str, list[tuple[int, float]]], list[float], list[dict[str, float]]]:
         counts = [_ngrams(str(row["question"])) for row in self._rows]
         document_frequency: Counter[str] = Counter()

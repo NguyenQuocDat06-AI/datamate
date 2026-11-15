@@ -19,6 +19,7 @@ import statistics
 import subprocess
 import threading
 import time
+import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
@@ -37,6 +38,7 @@ from bizreason.semantic.annotator import Annotator, load_or_annotate, load_statu
 from bizreason.semantic.fewshot import FewShotBank
 from bizreason.semantic.intent import ConsensusParser, IntentParser, ParsedIntent
 from bizreason.semantic.layer import annotations_by_signature, build, effective_roles, to_date, to_number
+from bizreason.semantic.answer_gate import AnswerGate
 from bizreason.semantic.solver import SemanticSolver
 from bizreason.temporal import TemporalResolver
 from bizreason.utils import PathPolicy, atomic_json, dumps, file_hash, normalize_lookup, quote_identifier, writable_path
@@ -328,12 +330,23 @@ def make_intent_parser(model: Any, profile: str, examples: Callable[..., str] | 
                          f"this IntentParser does not ({exc})") from exc
 
 
+def load_answer_gate(path: Path | None) -> AnswerGate | None:
+    if path is None:
+        return None
+    return AnswerGate(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
 def _trace_row(question: Question, trace: Any, attempts: int | None, seconds: float) -> dict[str, Any]:
     intent = asdict(trace.intent) if trace.intent is not None else None
     windows = [[window.role, window.start.isoformat(), window.end_exclusive.isoformat()] for window in trace.windows]
-    return {"id": question.id, "business_id": question.business_id, "question": question.question,
+    row = {"id": question.id, "business_id": question.business_id, "question": question.question,
             "decision": trace.decision, "reason": trace.reason, "intent": intent, "windows": windows,
             "attempts": attempts, "seconds": seconds}
+    if getattr(trace, "semantic_contract", None) is not None:
+        row["semantic_contract"] = trace.semantic_contract
+    if getattr(trace, "plan", None) is not None:
+        row["plan"] = trace.plan
+    return row
 
 
 class GatedModel:
@@ -348,8 +361,26 @@ class GatedModel:
         self._gate = gate
 
     def generate_json(self, system: str, prompt: str, *, timeout: float) -> dict[str, Any]:
-        with self._gate:
-            return self._client.generate_json(system, prompt, timeout=timeout)
+        return self._gated("generate_json", system, prompt, timeout=timeout)
+
+    def reask_json(self, system: str, prompt: str, previous: dict[str, Any], feedback: str,
+                   *, timeout: float) -> dict[str, Any]:
+        return self._gated("reask_json", system, prompt, previous, feedback, timeout=timeout)
+
+    def _gated(self, method: str, *args: Any, timeout: float, deadline: float | None = None) -> dict[str, Any]:
+        call_deadline = time.monotonic() + timeout
+        if deadline is not None:
+            call_deadline = min(call_deadline, deadline)
+        remaining = call_deadline - time.monotonic()
+        if remaining <= 0 or not self._gate.acquire(timeout=remaining):
+            raise TimeoutError("model gate deadline exhausted")
+        try:
+            remaining = call_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("model request deadline exhausted")
+            return getattr(self._client, method)(*args, timeout=remaining)
+        finally:
+            self._gate.release()
 
     def close(self) -> None:
         self._client.close()
@@ -358,11 +389,28 @@ class GatedModel:
         return getattr(self._client, name)
 
 
+class DeadlineGatedModel(GatedModel):
+    """Bound both semaphore waiting and the request by the experiment's wall deadline."""
+
+    def __init__(self, client: Any, gate: Any, deadline: float):
+        super().__init__(client, gate)
+        self._deadline = deadline
+
+    def generate_json(self, system: str, prompt: str, *, timeout: float) -> dict[str, Any]:
+        return self._gated("generate_json", system, prompt, timeout=timeout, deadline=self._deadline)
+
+    def reask_json(self, system: str, prompt: str, previous: dict[str, Any], feedback: str,
+                   *, timeout: float) -> dict[str, Any]:
+        return self._gated("reask_json", system, prompt, previous, feedback,
+                           timeout=timeout, deadline=self._deadline)
+
+
 class SolverPool:
     """Answers questions. Each thread keeps its own read-only connection and solver per shop."""
 
     def __init__(self, parser: IntentParser, temporal: TemporalResolver, paths: dict[str, Path], *,
-                 traces: bool = False, bind_questions: bool = False):
+                 traces: bool = False, bind_questions: bool = False, answer_gate: AnswerGate | None = None):
+        self._answer_gate = answer_gate
         self._recorder = _AttemptRecorder(parser) if traces else None
         self._parser = self._recorder if traces else parser
         self._binder = _QuestionBoundParser(self._parser) if bind_questions else None
@@ -389,6 +437,16 @@ class SolverPool:
         try:
             try:
                 prediction, trace = self._solver(question.business_id, path).solve(question)
+                gated_answer = None
+                if self._answer_gate is not None:
+                    allowed, gate_key = self._answer_gate.allows(
+                        asdict(trace.intent) if trace.intent is not None else None,
+                        _trace_row(question, trace, None, 0.0), prediction.type.value)
+                    if not allowed:
+                        gated_answer = prediction.answer
+                        prediction = Prediction(id=question.id, type=AnswerType.ABSTAIN,
+                                                reason=f"answer gate: {gate_key}")
+                        trace.decision = "answer_gate"
                 line = submission_line(prediction)
             except Exception as exc:  # one bad question must never stop the run
                 return _abstain(question, f"error: {type(exc).__name__}", "error", started, checkpoint=True)
@@ -400,6 +458,8 @@ class SolverPool:
         if self._traces:
             attempts = self._recorder.attempts() if self._recorder is not None else None
             row = _trace_row(question, trace, attempts, seconds)
+            if gated_answer is not None:
+                row["gated_answer"] = gated_answer
         return Outcome(question.id, trace.decision, seconds, line, checkpoint=True,
                        finished=time.monotonic(), trace=row)
 
@@ -424,6 +484,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m bizreason.run_v2", description=__doc__.split("\n")[0])
     parser.add_argument("--rulebook-params", choices=["on", "off"], default="on",
                         help="read shifts, walk-in names, fees, debt methods and the Tet window from the rulebook")
+    parser.add_argument("--rulebook-context", choices=rulebook_params.CONTEXT_MODES, default="cues",
+                        help="parameter extraction context: lexical cues (default), or full document for ablation")
+    parser.add_argument("--rulebook-validation-retries", type=int, choices=(0, 1), default=0,
+                        help="bounded validator-feedback repair for rulebook parameters (default off)")
+    parser.add_argument("--model-identity-file", type=Path,
+                        help="public verified model metadata used to identify rulebook extraction caches")
     parser.add_argument("--data", required=True, type=Path, help="test root: questions.jsonl, rulebook.md, data/<biz>")
     parser.add_argument("--out", required=True, type=Path, help="output and cache directory")
     parser.add_argument("--business", nargs="+", action="extend", metavar="ID", help="only these business ids")
@@ -456,6 +522,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="show the parser the stored values each question likely names (per-shop value index)")
     parser.add_argument("--plan-fallback", choices=("off", "on"), default="off",
                         help="when the typed intent cannot express a question, answer from a typed query plan")
+    parser.add_argument("--time-reader", choices=("off", "on"), default="off",
+                        help="when the temporal rules find no window, let the model read periods; code checks every date")
+    parser.add_argument("--plan-binding-retries", type=int, choices=(0, 1), default=0,
+                        help="experimental: one bounded identifier-only plan repair (default off)")
+    parser.add_argument("--plan-definitions", choices=("eligible", "all"), default="eligible",
+                        help="runtime definition eligibility for the plan path; requires rulebook-definitions on")
+    parser.add_argument("--semantic-contracts", choices=("off", "on"), default="off",
+                        help="experimental: compile documented metrics and validate question contracts before intent routing")
     parser.add_argument("--sql-fallback", choices=("off", "on"), default="off",
                         help="when the typed intent cannot express a question, answer from two agreeing SQL queries")
     parser.add_argument("--rule-terms", choices=("off", "on"), default="on",
@@ -468,6 +542,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="ask the intent model for a short analysis (first JSON key) before the intent")
     parser.add_argument("--prompt-profile", choices=PROMPT_PROFILES, default="default",
                         help="intent prompt profile passed to every IntentParser built for question solving")
+    parser.add_argument("--answer-gate", type=Path, default=None, metavar="PATH",
+                        help="fitted answer-gate JSON (scripts/fit_answer_gate.py); abstain on low-precision solve paths. "
+                             "Default: off")
     parser.add_argument("--traces", action="store_true",
                         help="also write traces.jsonl: one row per solved question with its intent and windows")
     parser.add_argument("--questions-file", type=Path, metavar="PATH",
@@ -477,6 +554,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "shops, are shown to the intent parser for each question")
     parser.add_argument("--fewshot-k", type=int, default=4, metavar="N",
                         help="number of few-shot examples per question when --fewshot-bank is given (default 4)")
+    parser.add_argument("--fewshot-groups", type=Path,
+                        help="JSON mapping business ids to explicit industry/source-family group tags")
+    parser.add_argument("--fewshot-exclude-groups", nargs="+", default=[],
+                        help="remove these groups before fitting the few-shot index")
+    parser.add_argument("--fewshot-exclude-businesses", nargs="+", default=[],
+                        help="remove all examples of these shops before fitting the few-shot index")
     return parser.parse_args(argv)
 
 
@@ -501,6 +584,28 @@ def _client_factory(args: argparse.Namespace) -> Callable[[int, float], TrammayC
         return TrammayClient(settings, endpoint_resolver=resolver, outage_wait_seconds=args.outage_wait)
 
     return make
+
+
+def _rulebook_model_identity(model: Any, path: Path | None) -> dict[str, Any]:
+    """Use only public generation metadata; unknown identities cannot share caches across runs."""
+    configured_model = getattr(getattr(model, "settings", None), "model", None)
+    if path is None:
+        return {"model": configured_model, "unverified_run": uuid.uuid4().hex}
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    required = ("model", "revision", "weights_sha256", "quantization", "compute_dtype")
+    if (not isinstance(metadata, dict) or metadata.get("weights_verified") is not True
+            or not all(isinstance(metadata.get(name), str) and metadata[name].strip() for name in required)
+            or configured_model is None or metadata["model"] != configured_model):
+        raise ValueError("model identity metadata is incomplete, unverified, or differs from the configured model")
+    allowed = (*required, "parameters", "seed", "torch", "cuda", "transformers", "bitsandbytes", "batch_max",
+               "server_source_sha256")
+    identity = {name: metadata[name] for name in allowed if name in metadata}
+    settings = getattr(model, "settings", None)
+    for name in ("max_output_tokens", "api_style"):
+        value = getattr(settings, name, None)
+        if value is not None:
+            identity[name] = value
+    return identity
 
 
 def make_annotation_client(args: argparse.Namespace) -> TrammayClient:
@@ -650,7 +755,8 @@ def build_and_answer(args: argparse.Namespace, data: Path, out: Path, questions:
         by_shop.setdefault(question.business_id, []).append(question)
     waiting = deque(build_order(questions))
     paths: dict[str, Path] = {}
-    solvers = SolverPool(parser, temporal, paths, traces=args.traces, bind_questions=args.fewshot_bank is not None)
+    solvers = SolverPool(parser, temporal, paths, traces=args.traces, bind_questions=args.fewshot_bank is not None,
+                         answer_gate=load_answer_gate(args.answer_gate))
     builds: dict[Future[ShopBuild], str] = {}
     answers: set[Future[Outcome]] = set()
 
@@ -800,10 +906,23 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
     if args.max_model_concurrency < 1:
         raise ValueError("--max-model-concurrency must be at least 1")
     fewshot: FewShotBank | None = None
+    fewshot_original_size = 0
+    if (args.fewshot_groups or args.fewshot_exclude_groups or args.fewshot_exclude_businesses) and args.fewshot_bank is None:
+        raise ValueError("few-shot fold options require --fewshot-bank")
     if args.fewshot_bank is not None:
         if args.fewshot_k < 1:
             raise ValueError("--fewshot-k must be at least 1")
         fewshot = FewShotBank.load(args.fewshot_bank)
+        fewshot_original_size = len(fewshot)
+        groups = json.loads(args.fewshot_groups.read_text(encoding="utf-8")) if args.fewshot_groups else None
+        if groups is not None and (not isinstance(groups, dict) or any(
+            not isinstance(tags, list) or not tags or any(not isinstance(tag, str) or not tag for tag in tags)
+            for tags in groups.values()
+        )):
+            raise ValueError("--fewshot-groups must map business ids to nonempty lists of group tags")
+        if args.fewshot_exclude_businesses or args.fewshot_exclude_groups:
+            fewshot = fewshot.excluding(businesses=args.fewshot_exclude_businesses,
+                                       groups=args.fewshot_exclude_groups, business_groups=groups)
         if len(fewshot) == 0:
             raise ValueError(f"--fewshot-bank {args.fewshot_bank} has no examples")
     questions_path = args.questions_file if args.questions_file is not None else data / "questions.jsonl"
@@ -822,13 +941,23 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         "rule_terms": args.rule_terms,
         "sql_fallback": args.sql_fallback,
         "plan_fallback": args.plan_fallback,
+        "time_reader": args.time_reader,
+        "plan_binding_retries": args.plan_binding_retries,
+        "plan_definitions": args.plan_definitions,
+        "semantic_contracts": args.semantic_contracts,
         "value_linking": args.value_linking,
         "column_measures": args.column_measures,
         "conventions": args.conventions,
         "phrase_rules": args.phrase_rules,
+        "rulebook_context": args.rulebook_context,
+        "rulebook_validation_retries": args.rulebook_validation_retries,
+        "model_identity_sha256": file_hash(args.model_identity_file) if args.model_identity_file else None,
         "fewshot_bank": str(args.fewshot_bank) if fewshot is not None else None,
         "fewshot_bank_sha256": file_hash(args.fewshot_bank) if fewshot is not None else None,
         "fewshot_k": args.fewshot_k if fewshot is not None else None,
+        "fewshot_examples_before_exclusion": fewshot_original_size,
+        "fewshot_examples_after_exclusion": len(fewshot) if fewshot is not None else 0,
+        "fewshot_groups_sha256": file_hash(args.fewshot_groups) if args.fewshot_groups else None,
         "questions_path": str(questions_path),
         "rulebook_path": str(rulebook),
         "rulebook_sha256": file_hash(rulebook),
@@ -841,12 +970,19 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
     log = RunLog(out / "timing.jsonl")
     traces = TraceWriter(out / "traces.jsonl", set(checkpoint.lines)) if args.traces else None
     intent_client: TrammayClient | None = None
+    auxiliary_clients: list[Any] = []
+    plan_client: Any = None
     saved_roles: dict[str, Any] | None = None
     try:
         if args.aliases == "off":
             saved_roles = dict(schema.ROLE_LOOKUP)
             schema.ROLE_LOOKUP.clear()
         from bizreason.semantic import conventions as _conventions, solver as _solver
+        _solver.set_contract_runtime(None)
+        # Separate invocations in the same process start from the declared defaults,
+        # even when extraction is disabled or the next root has no rulebook.
+        rulebook_params.set_active(rulebook_params.DEFAULTS)
+        rule_terms.set_active(())
         _conventions.ENABLED = args.conventions == "on"
         _solver.PHRASE_RULES = args.phrase_rules == "on"
         make_client = _client_factory(args)  # validates the connection file and endpoint before any build starts
@@ -857,8 +993,18 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
         if args.rulebook_params == "on" and rulebook.exists():
             # Business parameters (shifts, walk-in names, fees, debt methods, Tết) come from this test set's own
             # rulebook. Set before any shop build so forked build workers inherit them; defaults when unstated.
-            params, taken = rulebook_params.load_or_extract(
-                rulebook, make_client(ANNOTATION_MAX_TOKENS, ANNOTATION_TIMEOUT), out / "rulebook_params.json")
+            parameter_client = make_client(ANNOTATION_MAX_TOKENS, ANNOTATION_TIMEOUT)
+            extraction_diagnostics: dict[str, Any] = {}
+            try:
+                identity = _rulebook_model_identity(parameter_client, args.model_identity_file)
+                params, taken = rulebook_params.load_or_extract(
+                    rulebook, parameter_client, out / "rulebook_params.json", context_mode=args.rulebook_context,
+                    validation_retries=args.rulebook_validation_retries, model_identity=identity,
+                    diagnostics=extraction_diagnostics)
+            finally:
+                if parameter_client is not intent_client:
+                    parameter_client.close()
+            atomic_json(out / "rulebook_extraction.json", extraction_diagnostics)
             rulebook_params.set_active(params)
             print(f"rulebook params taken from the rulebook: {taken or 'none (defaults)'}", flush=True)
         if args.rule_terms == "on" and rulebook.exists():
@@ -867,6 +1013,7 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
                 rulebook, make_client(ANNOTATION_MAX_TOKENS, ANNOTATION_TIMEOUT), out / "rule_terms.json")
             rule_terms.set_active(terms)
             print(f"rulebook ranking terms translated: {len(terms)}", flush=True)
+        deadline = t0 + args.total_seconds - BUDGET_MARGIN_SECONDS
         gate = multiprocessing.get_context("fork").BoundedSemaphore(args.max_model_concurrency)
         examples = fewshot.provider(args.fewshot_k) if fewshot is not None else None
         alternate = fewshot.provider(args.fewshot_k, alternate=True) if fewshot is not None else None
@@ -882,8 +1029,21 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
             from bizreason.semantic.plan import PlanFallback
             from bizreason.semantic.solver import set_fallback
             from bizreason.semantic.value_linking import ValueIndex
-            set_fallback(PlanFallback(GatedModel(make_client(INTENT_REASONING_MAX_TOKENS, INTENT_TIMEOUT), gate),
-                                      temporal, definitions=definitions, value_index=ValueIndex.from_connection))
+            plan_definitions = (rulebook_definitions.provider(rulebook.read_text(encoding="utf-8"),
+                                include_all=args.plan_definitions == "all")
+                                if args.rulebook_definitions == "on" and rulebook.exists() else None)
+            plan_client = DeadlineGatedModel(make_client(INTENT_REASONING_MAX_TOKENS, INTENT_TIMEOUT), gate, deadline)
+            auxiliary_clients.append(plan_client)
+            set_fallback(PlanFallback(plan_client, temporal, definitions=plan_definitions,
+                                      value_index=ValueIndex.from_connection,
+                                      binding_retries=args.plan_binding_retries))
+        if args.time_reader == "on":
+            from bizreason.semantic.solver import set_time_reader
+            from bizreason.semantic.time_reader import TimeReader
+            time_client = DeadlineGatedModel(make_client(300, INTENT_TIMEOUT), gate, deadline)
+            auxiliary_clients.append(time_client)
+            set_time_reader(TimeReader(time_client, rulebook_text=rulebook.read_text(encoding="utf-8")
+                                       if rulebook.exists() else None, timeout=INTENT_TIMEOUT))
         if args.sql_fallback == "on":
             from bizreason.semantic.sql_fallback import SqlFallback
             from bizreason.semantic.solver import set_fallback
@@ -895,7 +1055,15 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
             second = make_intent_parser(GatedModel(intent_client, gate), args.prompt_profile, alternate,
                                         reasoning=args.reasoning == "on", definitions=definitions)
             intent_parser = ConsensusParser(intent_parser, second)
-        deadline = t0 + args.total_seconds - BUDGET_MARGIN_SECONDS
+        if args.semantic_contracts == "on":
+            from bizreason.semantic.contract_runtime import ContractRuntime
+            extraction_client = DeadlineGatedModel(make_client(3000, 120.0), gate, deadline)
+            question_client = DeadlineGatedModel(make_client(INTENT_REASONING_MAX_TOKENS, 120.0), gate, deadline)
+            auxiliary_clients.extend([extraction_client, question_client])
+            _solver.set_contract_runtime(ContractRuntime(
+                extraction_client, question_client, temporal,
+                rulebook.read_text(encoding="utf-8") if rulebook.exists() else "", out / "metrics",
+                model_identity=intent_client.settings.model, deadline=deadline))
 
         pending = [question for question in questions if question.id not in checkpoint.lines]
         lines = dict(checkpoint.lines)
@@ -917,6 +1085,17 @@ def _run(args: argparse.Namespace, data: Path, out: Path) -> int:
                          deadline, t0, log, record)
         write_final(out / "submission.final.jsonl", questions, lines)
     finally:
+        from bizreason.semantic.solver import set_contract_runtime, set_fallback, set_time_reader
+        set_contract_runtime(None)
+        set_fallback(None)
+        set_time_reader(None)
+        if plan_client is not None:
+            usage = getattr(plan_client, "usage", None)
+            if usage is not None:
+                manifest["plan_model_usage"] = {key: getattr(usage, key, None)
+                                                for key in ("calls", "http_attempts")}
+        for client in auxiliary_clients:
+            client.close()
         checkpoint.close()
         log.close()
         if traces is not None:

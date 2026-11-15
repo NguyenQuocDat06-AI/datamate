@@ -74,6 +74,7 @@ SOURCES: tuple[tuple[str, str, str, int | None], ...] = (
 CATALOG_MAX_DISTINCT = 200
 # A digit and a letter that touch are split apart, so "500ml" and "500 ml" are the same words.
 _BOUNDARY = re.compile(r"(?<=[0-9])(?=[a-z])|(?<=[a-z])(?=[0-9])")
+_ASCII_NON_WORD = re.compile(r"[^a-z0-9]+")
 # Dimensions whose values are people or companies: a name is matched on at least two of its words.
 PERSON_DIMS = frozenset({"customer", "employee", "supplier"})
 
@@ -86,7 +87,11 @@ def _grams(text: str) -> Counter:
 
 def _canonical(text: str) -> str:
     """Normalized text with a space at each digit and letter boundary, so "500ml" and "500 ml" are the same words."""
-    return _BOUNDARY.sub(" ", normalize_lookup(text))
+    text = str(text)
+    # ASCII has neither accents nor compatibility characters to decompose. The same
+    # replacement collapses every separator run, so strip is enough after it.
+    norm = _ASCII_NON_WORD.sub(" ", text.lower()).strip() if text.isascii() else normalize_lookup(text)
+    return _BOUNDARY.sub(" ", norm)
 
 
 @functools.lru_cache(maxsize=65536)
@@ -206,11 +211,12 @@ class ValueIndex:
         prune_df = max(MIN_PRUNE_DF, int(PRUNE_SHARE * total))
         self._prune_df = prune_df
         for gid, grams in enumerate(grams_of):
-            vec = {g: (1.0 + math.log(c)) * self._idf[g] for g, c in grams.items()}
+            vec = {g: (1.0 if c == 1 else 1.0 + math.log(c)) * self._idf[g] for g, c in grams.items()}
             length = math.sqrt(sum(w * w for w in vec.values())) or 1.0
-            vec = {g: w / length for g, w in vec.items()}
             self._vec.append(vec)
             for g, w in vec.items():
+                w /= length
+                vec[g] = w
                 self._post[g].append((gid, w))
 
     @classmethod
@@ -230,7 +236,8 @@ class ValueIndex:
 
     def _window_vector(self, words: tuple[str, ...]) -> tuple[dict[str, float], float]:
         grams = _grams(" ".join(words))
-        vec = {g: (1.0 + math.log(c)) * self._idf.get(g, self._unknown_idf) for g, c in grams.items()}
+        vec = {g: (1.0 if c == 1 else 1.0 + math.log(c)) * self._idf.get(g, self._unknown_idf)
+               for g, c in grams.items()}
         length = math.sqrt(sum(w * w for w in vec.values())) or 1.0
         return vec, length
 

@@ -30,9 +30,11 @@ so answers that the intent path already gives are untouched.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -40,6 +42,7 @@ from typing import Any
 
 from bizreason.contracts import AnswerType
 from bizreason.semantic import knowledge, rulebook_params
+from bizreason.semantic.plan_repair import binding_changes_only, binding_feedback, reference_at, references
 from bizreason.semantic.compiler import _round2, _round_money, _status_sql
 from bizreason.utils import normalize_lookup
 
@@ -159,10 +162,15 @@ class PlanResult:
     type: AnswerType
     answer: Any
     plan: dict[str, Any]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class PlanError(Exception):
     pass
+
+
+class PlanBindingError(PlanError):
+    """A missing or malformed column identifier, distinct from semantic/relational failures."""
 
 
 def _q(name: str) -> str:
@@ -254,15 +262,15 @@ class PlanCompiler:
         """A plan column. purpose 'filter' allows a linked table with several rows per key (as a remote filter);
         'value' needs one value per source row."""
         if not isinstance(name, str):
-            raise PlanError(f"bad column {name!r}")
+            raise PlanBindingError(f"bad column {name!r}")
         parts = name.split(".")
         if len(parts) > 2 or not all(_NAME.fullmatch(p) for p in parts):
-            raise PlanError(f"bad column {name!r}")
+            raise PlanBindingError(f"bad column {name!r}")
         table, column = (parts[0], parts[1]) if len(parts) == 2 else (self.source, parts[0])
         if table not in _tables(self.db):
-            raise PlanError(f"unknown table {table}")
+            raise PlanBindingError(f"unknown table {table}")
         if column not in self.cols(table):
-            raise PlanError(f"unknown column {table}.{column}")
+            raise PlanBindingError(f"unknown column {table}.{column}")
         if table == self.source:
             return _Col(f"t.{_q(column)}", table, column, "source")
         if table == "orders":
@@ -293,6 +301,25 @@ class PlanCompiler:
                 return "t.product_id", "{a}." + _q(product.column), product.unique
             if product.kind == "product_name" and "product_name" in cols:
                 return "lookup(t.product_name)", "lookup({a}." + _q(product.column) + ")", product.unique
+        dimensions = [self.card.link(table, kind) for kind in knowledge.DIMENSION_LINKS]
+        dimensions = [link for link in dimensions if link is not None]
+        # A catalog naming both a staff member and a customer has two different relationships;
+        # never choose one just because it appears first in the card.
+        if len(dimensions) > 1:
+            raise PlanError(f"ambiguous dimension link from {table} to {self.source}")
+        if dimensions:
+            dimension = dimensions[0]
+            column, normalize = knowledge.DIMENSION_LINKS[dimension.kind]
+            if self.source == "orders":
+                outer = f"t.{_q(column)}"
+            elif self.order_key is not None and column in self.cols("orders"):
+                self.need_parent = True
+                outer = f"o.{_q(column)}"
+            else:
+                raise PlanError(f"{table} has no link to {self.source}")
+            inner = "{a}." + _q(dimension.column)
+            return ((f"lookup({outer})", f"lookup({inner})", dimension.unique) if normalize
+                    else (outer, inner, dimension.unique))
         raise PlanError(f"{table} has no link to {self.source}")
 
     def _twin(self, col: _Col, prefix: str) -> str | None:
@@ -340,7 +367,7 @@ class PlanCompiler:
         if not isinstance(items, list):
             raise PlanError("filters must be a list")
         local: list[_Sql] = []
-        remote: dict[tuple[str, bool], list[tuple[_Col, _Sql]]] = {}
+        remote: dict[tuple[str, bool], list[tuple[_Col, _Sql, bool]]] = {}
         for item in items:
             if not isinstance(item, dict):
                 raise PlanError(f"bad filter {item!r}")
@@ -354,15 +381,24 @@ class PlanCompiler:
             negative = item.get("op") in NEGATIVE_OPS
             positive = {**item, "op": NEGATIVE_OPS[item["op"]]} if negative else item
             inner = _Col(col.sql.format(a="e"), col.table, col.column, "remote")
-            remote.setdefault((col.table, negative), []).append((col, self._test(inner, positive)))
+            remote.setdefault((col.table, negative), []).append(
+                (col, self._test(inner, positive), positive.get("op") in ("eq", "in", "contains")))
         parts = list(local)
         for (table, negative), tests in remote.items():
             outer, inner_key = tests[0][0].remote
-            where = " AND ".join(s.text for _, s in tests)
-            args = [a for _, s in tests for a in s.args]
+            where = " AND ".join(s.text for _, s, _ in tests)
+            args = [a for _, s, _ in tests for a in s.args]
             sql = (f"{outer} {'NOT ' if negative else ''}IN (SELECT {inner_key.format(a='e')} FROM {_q(table)} e "
                    f"WHERE {inner_key.format(a='e')} IS NOT NULL AND {where})")
             parts.append(_Sql(sql, args))
+            if not negative:
+                # The inner alias cannot be used by _zero_check. Recheck the correlated
+                # value predicate against source rows in scope instead.
+                for _, test, value_filter in tests:
+                    if value_filter:
+                        self.checked.append(_Sql(
+                            f"{outer} IN (SELECT {inner_key.format(a='e')} FROM {_q(table)} e "
+                            f"WHERE {inner_key.format(a='e')} IS NOT NULL AND {test.text})", test.args))
         if not parts:
             return _Sql("1")
         return _Sql(" AND ".join(f"({p.text})" for p in parts), [a for p in parts for a in p.args])
@@ -390,7 +426,10 @@ class PlanCompiler:
                 return _Sql(f"{self._dated(col)} {CMP[op]} {self._dated(other)}")
             return _Sql(f"{self._numeric(col)} {CMP[op]} {self._numeric(other)}")
         if op in ("eq", "ne") and isinstance(value, (int, float)) and not isinstance(value, bool):
-            return _Sql(f"{self._numeric(col)} {CMP[op]} ?", [float(value)])
+            sql = _Sql(f"{self._numeric(col)} {CMP[op]} ?", [float(value)])
+            if op == "eq" and col.owner != "remote":
+                self.checked.append(sql)
+            return sql
         if op in ("eq", "ne", "in", "not_in"):
             values = value if isinstance(value, list) else [value]
             keys = sorted({normalize_lookup(str(v)) for v in values if v is not None and str(v).strip()})
@@ -500,14 +539,19 @@ class PlanCompiler:
         if scope == "all":
             return None
         if self.source == "purchases":
-            return "COALESCE(t.cancelled, 0) = 0" if scope == "valid" and "cancelled" in self.cols("purchases") \
-                else None
+            if "cancelled" in self.cols("purchases"):
+                return f"COALESCE(t.cancelled, 0) = {1 if scope == 'cancelled' else 0}"
+            if scope == "cancelled":
+                raise PlanError("source has no cancellation status")
+            return None
         if self.source in ("orders", "lines"):
             ref = "t.status"
         elif self.order_key is not None:
             self.need_parent = True
             ref = "o.status"
         else:
+            if scope == "cancelled":
+                raise PlanError("source has no cancellation status or order link")
             return None
         params = rulebook_params.active()
         statuses = params.valid_sale_statuses if scope == "valid" else params.cancelled_statuses
@@ -590,7 +634,7 @@ class PlanCompiler:
             if self._is_date(col):
                 return _Value(_Sql(f"{agg.upper()}({gated(self._dated(col))})", args), "date")
         sql, kinds = self._expr(expr)
-        if "parent" in kinds and agg in ("sum", "avg", "count") and not self.rows_per_order_unique:
+        if "parent" in kinds and agg in ("sum", "avg", "count", "count_rows") and not self.rows_per_order_unique:
             raise PlanError(f"an order column is aggregated over {self.source} rows (several per order): "
                             "use source orders")
         if agg in ("count", "count_rows"):
@@ -623,6 +667,12 @@ class PlanCompiler:
         output = plan.get("output", "scalar")
         if output not in OUTPUTS:
             raise PlanError("bad output")
+        if plan.get("having") is not None and not (plan.get("group_by") or plan.get("per")):
+            raise PlanError("having needs grouping")
+        if plan.get("share_filters") and output != "share":
+            raise PlanError("share_filters need share output")
+        if plan.get("test") is not None and output != "yesno":
+            raise PlanError("test needs yesno output")
         # resolve every part first: references add the joins the FROM clause needs
         where: list[_Sql] = []
         status = self._status(plan.get("scope", "valid"))
@@ -745,8 +795,7 @@ class PlanCompiler:
 
     def _final(self, value: Any, kind: str, as_percent: bool, plan: dict[str, Any],
                output: str) -> tuple[AnswerType, Any]:
-        kind_out, number = _rounded(value, kind, as_percent)
-        if output == "yesno" and kind_out == AnswerType.DATE:
+        if output == "yesno" and kind == "date":
             raise PlanError("yesno on a date")
         if output == "yesno":
             test = plan.get("test")
@@ -756,10 +805,15 @@ class PlanCompiler:
                 bound = float(test.get("value"))
             except (TypeError, ValueError) as exc:
                 raise PlanError("test needs a number") from exc
+            if value is None:
+                raise PlanError("empty result")
+            number = float(value) * (100 if as_percent else 1)
+            if not (math.isfinite(number) and math.isfinite(bound)):
+                raise PlanError("test needs finite numbers")
             ops = {"gt": float.__gt__, "gte": float.__ge__, "lt": float.__lt__, "lte": float.__le__,
                    "eq": float.__eq__, "ne": float.__ne__}
             return AnswerType.BOOLEAN, bool(ops[test["op"]](float(number), bound))
-        return kind_out, number
+        return _rounded(value, kind, as_percent)
 
     def _groups(self, rows: list[tuple[Any, Any]], plan: dict[str, Any], output: str, kind: str,
                 as_percent: bool, gcol: _Col) -> tuple[AnswerType, Any]:
@@ -822,7 +876,7 @@ def _rounded(value: Any, kind: str, as_percent: bool) -> tuple[AnswerType, Any]:
         return AnswerType.PERCENT, _round2(value)
     if kind == "count" or abs(value - round(value)) < 1e-9:
         return AnswerType.NUMBER, int(round(value))
-    if kind == "money" or (kind == "number" and abs(value) >= 1000):
+    if kind == "money":
         return AnswerType.NUMBER, _round_money(value)
     return AnswerType.NUMBER, _round2(value)
 
@@ -834,32 +888,58 @@ def _number(value: Any, plan: dict[str, Any]) -> tuple[AnswerType, Any]:
 
 # ---------------------------------------------------------------------------------- checks against the question
 
-def _all_filters(plan: dict[str, Any]) -> list[dict[str, Any]]:
+def _measure_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Only aggregates that the compiler actually evaluates, excluding unused JSON fields."""
     found: list[dict[str, Any]] = []
 
     def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            for key in ("filters", "share_filters"):
-                for item in node.get(key) or []:
-                    if isinstance(item, dict):
-                        found.append(item)
-            for key in ("measure", "left", "right", "having", "per"):
-                walk(node.get(key))
-    walk(plan)
+        if not isinstance(node, dict):
+            return
+        if node.get("agg") in AGGS:
+            found.append(node)
+        elif node.get("op") in ARITH:
+            walk(node.get("left"))
+            walk(node.get("right"))
+
+    walk(plan.get("measure"))
+    per = plan.get("per")
+    if isinstance(per, dict):
+        walk(per.get("having"))
+    elif plan.get("group_by"):
+        walk(plan.get("having"))
     return found
 
 
+def _all_filters(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    groups = [plan.get("filters")]
+    if plan.get("output") == "share":
+        groups.append(plan.get("share_filters"))
+    groups.extend(node.get("filters") for node in _measure_nodes(plan))
+    return [item for group in groups if isinstance(group, list) for item in group if isinstance(item, dict)]
+
+
+def _date_references(expr: Any) -> set[str]:
+    if not isinstance(expr, dict):
+        return set()
+    if isinstance(expr.get("days"), list) and len(expr["days"]) == 2:
+        return {ref for ref in expr["days"] if isinstance(ref, str) and ref in DATE_REFS}
+    if expr.get("op") in ARITH:
+        return _date_references(expr.get("left")) | _date_references(expr.get("right"))
+    return set()
+
+
 def _mentions_period(plan: dict[str, Any], which: str) -> bool:
-    text = json.dumps(plan)
-    if which == "comparison":
-        return '"comparison"' in text
-    if '"period": "question"' in text:
+    if plan.get("period") == which or any(node.get("period") == which for node in _measure_nodes(plan)):
         return True
+    if which == "comparison":
+        return False
     if plan.get("period") is None and not _side_periods(plan.get("measure")):
         return True  # the compiler applies the question's period by default
     if any(item.get("op") in PERIOD_OPS for item in _all_filters(plan)):
         return True
-    return '"period_start"' in text or '"period_end"' in text
+    expressions = [node.get("expr") for node in _measure_nodes(plan)]
+    expressions.extend(item.get("expr") for item in _all_filters(plan))
+    return any(_date_references(expr) & {"period_start", "period_end"} for expr in expressions)
 
 
 def named_values(question: str, index: Any) -> list[str]:
@@ -895,9 +975,15 @@ def _canonical(text: str) -> str:
 
 
 def _today_relative(plan: dict[str, Any]) -> bool:
-    text = json.dumps(plan)
-    return '"until_today"' in text or '"today"' in text or any(
-        str(item.get("op", "")).endswith("_today") for item in _all_filters(plan))
+    if plan.get("period") == "until_today" or any(node.get("period") == "until_today"
+                                                for node in _measure_nodes(plan)):
+        return True
+    filters = _all_filters(plan)
+    if any(item.get("op") in DATE_OPS and item["op"].endswith("_today") for item in filters):
+        return True
+    expressions = [node.get("expr") for node in _measure_nodes(plan)]
+    expressions.extend(item.get("expr") for item in filters)
+    return any("today" in _date_references(expr) for expr in expressions)
 
 
 def question_check(plan: dict[str, Any], period: tuple[date, date] | None, comparison: tuple[date, date] | None,
@@ -918,7 +1004,7 @@ def question_check(plan: dict[str, Any], period: tuple[date, date] | None, compa
                 used.append(f" {_canonical(v)} ")
     for value in named:
         norm = f" {_canonical(value)} "
-        if not any(norm in u or u in norm for u in used if u.strip()):
+        if not any(norm in u for u in used if u.strip()):
             return f"plan ignores {value!r} named in the question"
     return None
 
@@ -940,16 +1026,32 @@ class PlanFallback:
     )
 
     def __init__(self, model: Any, temporal: Any, definitions: Any = None, value_index: Any = None,
-                 timeout: float = 120.0, card_budget: int = 1200):
+                 timeout: float = 120.0, card_budget: int = 1200, binding_retries: int = 0):
+        if type(binding_retries) is not int or binding_retries not in (0, 1):
+            raise ValueError("binding retries must be zero or one")
         self.model = model
         self.temporal = temporal
         self.definitions = definitions  # callable(question) -> str block, or None
         self.value_index = value_index  # callable(connection) -> ValueIndex, or None
         self.timeout = timeout
         self.card_budget = card_budget
+        self.binding_retries = binding_retries
+        self._local = threading.local()
         self.last_reason = ""
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[knowledge.ShopCard, Any]] = {}
+
+    @property
+    def last_reason(self) -> str:
+        return getattr(self._local, "reason", "")
+
+    @last_reason.setter
+    def last_reason(self, value: str) -> None:
+        self._local.reason = value
+
+    @property
+    def last_diagnostics(self) -> dict[str, Any]:
+        return getattr(self._local, "diagnostics", {})
 
     def _shop(self, connection: sqlite3.Connection) -> tuple[knowledge.ShopCard, Any]:
         """The shop's card and value index, built once per layer file."""
@@ -991,6 +1093,17 @@ class PlanFallback:
         return "\n\n".join(parts)
 
     def answer(self, question: str, connection: sqlite3.Connection, as_of: date) -> PlanResult | None:
+        started = time.monotonic()
+        diagnostics: dict[str, Any] = {"model_calls_attempted": 0, "binding_retries": self.binding_retries,
+                                       "validation_scope": "schema", "repair_attempted": False}
+        self._local.diagnostics = diagnostics
+
+        def remaining() -> float:
+            value = self.timeout - (time.monotonic() - started)
+            if value <= 0:
+                raise TimeoutError("plan deadline exhausted")
+            return value
+
         try:
             windows = self.temporal.resolve(question, as_of) if self.temporal is not None else []
             target = [w for w in windows if w.role != "comparison"]
@@ -1002,19 +1115,55 @@ class PlanFallback:
             comparison = (compared[0].start, compared[0].end_exclusive) if compared else None
             card, index = self._shop(connection)
             text = self.prompt(question, card, index, as_of, period, comparison)
-            plan = self.model.generate_json(SYSTEM, text, timeout=self.timeout)
+            diagnostics["model_calls_attempted"] += 1
+            plan = self.model.generate_json(SYSTEM, text, timeout=remaining())
+            remaining()
+            diagnostics["initial_plan"] = plan
             if not isinstance(plan, dict) or not plan.get("source"):
                 self.last_reason = "no plan"
                 return None
             problem = question_check(plan, period, comparison, named_values(question, index), as_of)
             if problem:
                 raise PlanError(problem)
-            kind, value = PlanCompiler(connection, as_of, period, card=card, comparison=comparison).run(plan)
+            try:
+                kind, value = PlanCompiler(connection, as_of, period, card=card, comparison=comparison).run(plan)
+            except PlanBindingError as exc:
+                repair = getattr(self.model, "reask_json", None)
+                if not self.binding_retries or not callable(repair):
+                    raise
+                checker = PlanCompiler(connection, as_of, period, card=card, comparison=comparison)
+                checker._setup(plan)
+                invalid = set()
+                for path, purpose in references(plan).items():
+                    try:
+                        checker._ref(reference_at(plan, path), purpose)
+                    except PlanBindingError:
+                        invalid.add(path)
+                    except PlanError:
+                        pass  # a valid reference with a relational problem must stay unchanged
+                if not invalid:
+                    raise
+                diagnostics.update(repair_attempted=True, invalid_paths=[list(p) for p in sorted(invalid)])
+                diagnostics["model_calls_attempted"] += 1
+                corrected = repair(SYSTEM, text, plan, binding_feedback(exc, card, text), timeout=remaining())
+                remaining()
+                diagnostics["corrected_plan"] = corrected
+                accepted, changed = binding_changes_only(plan, corrected, invalid)
+                diagnostics.update(binding_only=accepted, changed_paths=[list(p) for p in changed])
+                if not accepted:
+                    raise PlanError("binding repair changed nonbinding fields")
+                problem = question_check(corrected, period, comparison, named_values(question, index), as_of)
+                if problem:
+                    raise PlanError(problem)
+                kind, value = PlanCompiler(connection, as_of, period, card=card, comparison=comparison).run(corrected)
+                plan = corrected
             self.last_reason = "answered by plan"
-            return PlanResult(kind, value, plan)
+            return PlanResult(kind, value, plan, diagnostics)
         except PlanError as exc:
             self.last_reason = f"plan rejected: {exc}"
             return None
         except Exception as exc:
             self.last_reason = f"plan failed: {type(exc).__name__}"
             return None
+        finally:
+            diagnostics.update(reason=self.last_reason, elapsed_seconds=round(time.monotonic() - started, 4))

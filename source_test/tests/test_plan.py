@@ -7,7 +7,7 @@ import pytest
 from bizreason.contracts import AnswerType
 from bizreason.semantic import knowledge
 from bizreason.semantic.plan import SYSTEM, PlanCompiler, PlanError, PlanFallback, named_values, question_check
-from test_knowledge import build_shop
+from test_knowledge import add_staff_catalog, build_shop
 
 
 def _db():
@@ -420,3 +420,131 @@ def test_fallback_rejects_a_plan_that_ignores_a_named_value():
 def test_system_prompt_examples_cover_the_language():
     for part in ('"per"', "src_", '"op": "/"', '"contains"', '"output": "table"', '"ranking"', '"comparison"'):
         assert part in SYSTEM
+
+
+def test_large_nonmoney_quantity_keeps_fractional_precision():
+    db = _db()
+    db.execute("UPDATE lines SET qty=1000.25")
+    plan = {"source": "lines", "measure": {"agg": "avg", "expr": "qty"}}
+    assert PlanCompiler(db, TODAY, JAN).run(plan) == (AnswerType.NUMBER, 1000.25)
+
+
+def test_yesno_compares_the_unrounded_measure():
+    db = _db()
+    db.execute("UPDATE orders SET revenue=100.49 WHERE order_id='o1'")
+    plan = {"source": "orders", "filters": [{"column": "order_id", "op": "eq", "value": "o1"}],
+            "measure": {"agg": "sum", "expr": "revenue"}, "output": "yesno",
+            "test": {"op": "gt", "value": 100.4}}
+    assert PlanCompiler(db, TODAY, JAN).run(plan) == (AnswerType.BOOLEAN, True)
+    plan["test"] = {"op": "eq", "value": 100}
+    assert PlanCompiler(db, TODAY, JAN).run(plan) == (AnswerType.BOOLEAN, False)
+
+
+def test_count_rows_of_a_parent_column_rejects_order_multiplication():
+    plan = {"source": "lines", "measure": {"agg": "count_rows", "expr": "orders.customer_key"}}
+    with pytest.raises(PlanError, match="several per order"):
+        _shop().run(plan)
+
+
+def test_zero_from_a_remote_value_filter_outside_scope_is_rejected():
+    plan = {"source": "orders", "filters": [{"column": f"{WARRANTY}.ticket", "op": "eq", "value": "W3"}],
+            "measure": {"agg": "count"}}
+    with pytest.raises(PlanError, match="matched no rows"):
+        _shop().run(plan)  # the linked claim belongs to a February order, not January
+
+
+def test_zero_from_a_numeric_equality_with_no_scoped_match_is_rejected():
+    plan = {"source": "orders", "filters": [{"column": "revenue", "op": "eq", "value": 900}],
+            "measure": {"agg": "count"}}
+    with pytest.raises(PlanError, match="matched no rows"):
+        _shop().run(plan)  # the value is stored in February only
+
+
+def test_cancelled_purchase_scope_does_not_include_valid_receipts():
+    db = build_shop()
+    db.executemany("INSERT INTO purchases (purchase_id,date,amount,cancelled) VALUES (?,?,?,?)",
+                   [("r1", "2026-01-04", 40, 0), ("r2", "2026-01-05", 70, 1)])
+    plan = {"source": "purchases", "scope": "cancelled", "measure": {"agg": "sum", "expr": "amount"}}
+    assert _shop(con=db).run(plan) == (AnswerType.NUMBER, 70)
+
+
+@pytest.mark.parametrize("unused", [
+    {"having": {"op": "gt", "value": 50}},
+    {"share_filters": [{"column": "employee", "op": "eq", "value": "Kim"}]},
+    {"test": {"op": "gt", "value": 10}},
+])
+def test_constraints_that_the_output_would_ignore_are_rejected(unused):
+    with pytest.raises(PlanError):
+        _shop().run({"source": "orders", "measure": {"agg": "count"}, **unused})
+
+
+def test_period_checks_ignore_period_words_inside_values_and_unused_fields():
+    plan = {"source": "orders", "period": "none", "measure": {"agg": "count"},
+            "filters": [{"column": "employee", "op": "eq", "value": "comparison"}]}
+    assert "compares" in question_check(plan, None, FEB, [])
+    assert "period" in question_check({**plan, "unused": {"period": "question"}}, JAN, None, [])
+    today = (TODAY, date(2026, 3, 16))
+    named_today = {**plan, "filters": [{"column": "employee", "op": "eq", "value": "today"}]}
+    assert "period" in question_check(named_today, today, None, [], TODAY)
+
+
+def test_named_product_cannot_be_satisfied_by_a_broader_partial_filter():
+    plan = {"source": "lines", "measure": {"agg": "count"},
+            "filters": [{"column": "product_name", "op": "contains", "value": "bike"}]}
+    assert "Road Bike" in question_check(plan, JAN, None, ["Road Bike"])
+
+
+def test_staff_dimension_join_uses_normalized_names_without_changing_money_totals():
+    db = build_shop()
+    add_staff_catalog(db)
+    plan = {"source": "orders", "group_by": "src_staff.category",
+            "measure": {"agg": "sum", "expr": "revenue"}, "output": "table"}
+    assert _shop(con=db).run(plan) == (AnswerType.TABLE, {"columns": ["name", "value"],
+                                                        "rows": [["senior", 3800], ["junior", 1501]]})
+    commission = {"source": "orders", "measure": {"agg": "sum", "expr": {"op": "/",
+        "left": {"op": "*", "left": "revenue", "right": "src_staff.rate"}, "right": 100}}}
+    assert _shop(con=db).run(commission) == (AnswerType.NUMBER, 680.1)
+
+
+def test_staff_filter_with_duplicate_catalog_names_does_not_fan_out():
+    db = build_shop()
+    add_staff_catalog(db, [("Kim", 10, "senior"), (" KIM ", 15, "senior"), ("Lan", 20, "junior")])
+    plan = {"source": "orders", "filters": [{"column": "src_staff.category", "op": "eq", "value": "senior"}],
+            "measure": {"agg": "sum", "expr": "revenue"}}
+    assert _shop(con=db).run(plan) == (AnswerType.NUMBER, 3800)
+    with pytest.raises(PlanError, match="multiplies"):
+        _shop(con=db).run({"source": "orders", "measure": {"agg": "sum", "expr": "src_staff.rate"}})
+
+
+def test_staff_dimension_can_reach_lines_through_their_order_only():
+    db = build_shop()
+    add_staff_catalog(db)
+    plan = {"source": "lines", "filters": [{"column": "src_staff.category", "op": "eq", "value": "senior"}],
+            "measure": {"agg": "sum", "expr": "amount"}}
+    assert _shop(con=db).run(plan) == (AnswerType.NUMBER, 3800)
+    with pytest.raises(PlanError, match="no link"):
+        _shop(con=db).run({**plan, "source": SPECS, "scope": "all", "period": "none"})
+
+
+def test_multiple_distinct_dimension_relationships_are_not_chosen_arbitrarily():
+    db = build_shop()
+    db.execute("CREATE TABLE src_people (staff TEXT, customer TEXT, rate REAL)")
+    db.executemany("INSERT INTO src_people VALUES (?,?,?)", [("Kim", "c1", 10), ("Lan", "c2", 20)])
+    db.executemany("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)", [
+        ("src_people", "staff", "people", "Staff", "employee_name", "text", 2, '[]', None),
+        ("src_people", "customer", "people", "Customer", "customer_id", "code", 2, '[]', None)])
+    with pytest.raises(PlanError, match="ambiguous dimension"):
+        _shop(con=db).run({"source": "orders", "measure": {"agg": "sum", "expr": "src_people.rate"}})
+
+
+@pytest.mark.parametrize("role,keys", [("customer_id", ["c1", "c2"]),
+                                     ("customer_name", [" ANN LEE ", "bob ray"])])
+def test_customer_dimension_filter_uses_the_verified_customer_key(role, keys):
+    db = build_shop()
+    db.execute("CREATE TABLE src_customers (person TEXT, tier TEXT)")
+    db.executemany("INSERT INTO src_customers VALUES (?,?)", [(keys[0], "gold"), (keys[1], "silver")])
+    db.execute("INSERT INTO column_catalog VALUES ('src_customers','person','customer_sheet','Customer',"
+               "?,'text',2,'[]',NULL)", [role])
+    plan = {"source": "orders", "filters": [{"column": "src_customers.tier", "op": "eq", "value": "gold"}],
+            "measure": {"agg": "sum", "expr": "revenue"}}
+    assert _shop(con=db).run(plan) == (AnswerType.NUMBER, 3500)

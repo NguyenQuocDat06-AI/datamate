@@ -231,3 +231,20 @@ PURCHASE_MINUS_SOLD_RE = r"\bnhap(?: vao| ve| zia)? (?:\S+ ){0,6}?tru (?:\S+ ){0
 RULE_TICKET_VISITS = ("luot xe",)
 RULE_DEVICE_LINE = ("dong may",)
 RULE_DELIVERY_TRIPS = ("dot", "giao")
+
+# Explicit definitional prose connectors, independent of document heading depth.
+DEFINITION_PROSE_CONNECTORS = ("is defined as", "means", "is", "là", "được định nghĩa là")
+
+# Narrow, explicit population clauses. Status values themselves come from the runtime
+# schema/data; these are grammar words, not a mapping from metric names to answers.
+POPULATION_ENTITY_RE = r"(?:orders?|records?|rows?|transactions?|đơn(?: hàng)?|bản ghi|giao dịch)"
+POPULATION_POSITIVE_RE = (
+    r"\bof (?P<values>{values}) {entities}\b",
+    r"\bonly (?P<values>{values}) {entities}\b",
+    r"\b(?P<values>{values}) {entities} only\b",
+    r"\b{entities} (?:whose )?status (?:is|in) (?P<values>{values})\b",
+    r"\bchỉ (?:tính |gồm )?{entities} (?P<values>{values})\b",
+)
+POPULATION_ALL_RE = r"\b(?:all|every|tất cả|mọi) {entities}\b"
+POPULATION_INCLUDE_RE = r"\b(?:including|include|kể cả|bao gồm cả) (?P<values>{values}) {entities}\b"
+POPULATION_CONNECTOR_RE = r"(?: or | hoặc | hay )"

@@ -30,6 +30,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +59,7 @@ log = logging.getLogger(__name__)
 EXTRACT_TIMEOUT = 120.0
 MAX_LIST_ITEMS = 20
 MAX_SHIFTS = 8
+CONTEXT_MODES = ("cues", "full")
 # The canonical order statuses the layer produces (layer.CANONICAL_STATUS). Copied rather than imported because layer
 # imports this module; a test pins the two tuples equal.
 CANONICAL_ORDER_STATUSES = ("completed", "shipping", "cancelled", "returned")
@@ -146,8 +149,17 @@ def active() -> RulebookParams:
 _rulebook_text: str | None = None
 
 
+_rulebook_raw: str | None = None
+
+
+def rulebook_raw_text() -> str | None:
+    """The rulebook as written (punctuation and digits intact), for readers of stated numbers."""
+    return _rulebook_raw
+
+
 def set_rulebook_text(text: str | None) -> None:
-    global _rulebook_text
+    global _rulebook_text, _rulebook_raw
+    _rulebook_raw = text
     from bizreason.utils import normalize_lookup
     _rulebook_text = None if text is None else f" {normalize_lookup(text)} "
 
@@ -217,52 +229,147 @@ class _Invalid(ValueError):
 
 
 def extract_rulebook_params(
-    rulebook_text: str, model: _Model, *, timeout: float = EXTRACT_TIMEOUT,
+    rulebook_text: str, model: _Model, *, timeout: float = EXTRACT_TIMEOUT, context_mode: str = "cues",
+    validation_retries: int = 0, diagnostics: dict[str, Any] | None = None,
 ) -> tuple[RulebookParams, list[str]]:
-    """One model call on the relevant rulebook lines. Returns the parameters and the field names the rulebook stated."""
-    params, taken, _ok = _extract(rulebook_text, model, timeout)
+    """Extract validated parameters; full context is an explicit control for lexical retrieval."""
+    params, taken, _ok = _extract(rulebook_text, model, timeout, context_mode=context_mode,
+                                validation_retries=validation_retries, diagnostics=diagnostics)
     return params, taken
 
 
 def load_or_extract(
     rulebook_path: Path, model: _Model, cache_path: Path, *, timeout: float = EXTRACT_TIMEOUT,
+    context_mode: str = "cues",
+    validation_retries: int = 0, model_identity: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> tuple[RulebookParams, list[str]]:
     """extract_rulebook_params, cached in cache_path under the sha256 of the rulebook file.
 
-    A cache whose digest differs from the rulebook, or that does not parse strictly, is ignored. A failed extraction
-    is not written to the cache, so the next run asks the model again.
+    Match the document, transformation, profile and caller-supplied model identity.
+    CLI callers without a verified identity use a fresh nonce instead of cross-run reuse.
+    Invalid explicit fields and failed requests are never cached as successful defaults.
     """
+    _validate_context_mode(context_mode)
+    _validate_retries(validation_retries)
     rulebook_path = Path(rulebook_path)
     cache_path = Path(cache_path)
     raw = rulebook_path.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
-    cached = _read_cache(cache_path, digest)
+    provenance = _cache_provenance(context_mode, validation_retries, model_identity)
+    fingerprint = hashlib.sha256(json.dumps(provenance, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    if diagnostics is not None:
+        diagnostics.update(cache_hit=False, fingerprint=fingerprint, model_calls=0,
+                           context_mode=context_mode, document_chars=len(raw.decode("utf-8")))
+    cached = _read_cache(cache_path, digest, context_mode=context_mode, fingerprint=fingerprint)
     if cached is not None:
+        if diagnostics is not None:
+            text = raw.decode("utf-8")
+            selected = text.strip() if context_mode == "full" else relevant_rulebook_text(text)
+            diagnostics.update(cache_hit=True, outcome="cache_hit", taken=cached[1], selected_chars=len(selected),
+                               validation_scope="schema", http_attempts=0)
         return cached
-    params, taken, ok = _extract(raw.decode("utf-8"), model, timeout)
+    params, taken, ok = _extract(raw.decode("utf-8"), model, timeout, context_mode=context_mode,
+                                validation_retries=validation_retries, diagnostics=diagnostics)
     if ok:
-        _write_cache(cache_path, digest, params, taken)
+        _write_cache(cache_path, digest, params, taken, context_mode=context_mode,
+                     fingerprint=fingerprint, provenance=provenance)
     return params, taken
 
 
-def _extract(rulebook_text: str, model: _Model, timeout: float) -> tuple[RulebookParams, list[str], bool]:
-    relevant = relevant_rulebook_text(rulebook_text)
+def _validate_context_mode(context_mode: str) -> None:
+    if context_mode not in CONTEXT_MODES:
+        raise ValueError(f"unknown rulebook context mode: {context_mode!r}")
+
+
+def _validate_retries(retries: int) -> None:
+    if type(retries) is not int or retries not in (0, 1):
+        raise ValueError("validation retries must be zero or one")
+
+
+def _cache_provenance(context_mode: str, retries: int, model_identity: dict[str, Any] | None) -> dict[str, Any]:
+    module = Path(__file__).resolve()
+    sources = {"extractor": module, "transport": module.parents[1] / "llm.py",
+               "normalization": module.parents[1] / "utils.py", "vocabulary": module.with_name("vocabulary.py")}
+    return {"version": 2, "context_mode": context_mode, "validation_retries": retries,
+            "source_sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in sources.items()},
+            "system_prompt_sha256": hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest(),
+            "cue_tokens": list(_CUE_TOKENS), "statuses": list(CANONICAL_ORDER_STATUSES),
+            "defaults": _to_reply(DEFAULTS), "model_identity": model_identity}
+
+
+def _validation_feedback(errors: dict[str, str]) -> str:
+    return ("Correct the JSON response using these schema validation errors:\n"
+            + "\n".join(f"{name}: {error}" for name, error in errors.items())
+            + "\nThe status fields require canonical identifiers from " + json.dumps(list(CANONICAL_ORDER_STATUSES))
+            + ". Map the source wording to its meaning; do not copy source status labels into enum fields. "
+              "Keep the business meaning and unspecified fields unchanged. Return only the corrected JSON object.")
+
+
+def _extract(rulebook_text: str, model: _Model, timeout: float, *,
+             context_mode: str = "cues", validation_retries: int = 0,
+             diagnostics: dict[str, Any] | None = None) -> tuple[RulebookParams, list[str], bool]:
+    _validate_context_mode(context_mode)
+    _validate_retries(validation_retries)
+    started = time.monotonic()
+    relevant = rulebook_text.strip() if context_mode == "full" else relevant_rulebook_text(rulebook_text)
+    stats = diagnostics if diagnostics is not None else {}
+    stats.update(model_calls=0, selected_chars=len(relevant), document_chars=len(rulebook_text),
+                 context_mode=context_mode, validation_error_fields=[], validation_scope="schema")
+    attempts_before = getattr(getattr(model, "usage", None), "http_attempts", None)
+
+    def finish(params: RulebookParams, taken: list[str], ok: bool, outcome: str):
+        attempts_after = getattr(getattr(model, "usage", None), "http_attempts", None)
+        stats.update(outcome=outcome, taken=taken, elapsed_seconds=round(time.monotonic() - started, 4))
+        stats["http_attempts"] = (attempts_after - attempts_before
+                                  if attempts_before is not None and attempts_after is not None else None)
+        return params, taken, ok
+
     if not relevant:
-        log.info("rulebook has no parameter cue lines; using defaults")
-        return DEFAULTS, [], True
+        log.info("rulebook has no parameter context in %s mode; using defaults", context_mode)
+        return finish(DEFAULTS, [], True, "no_context")
+    prompt = "Rulebook lines:\n" + relevant
     try:
-        reply = model.generate_json(SYSTEM_PROMPT, "Rulebook lines:\n" + relevant, timeout=timeout)
+        stats["model_calls"] += 1
+        reply = model.generate_json(SYSTEM_PROMPT, prompt, timeout=timeout)
     except Exception as exc:  # a failed model call must not stop a run
         log.warning("rulebook parameter call failed (%s: %s); using defaults", type(exc).__name__, exc)
-        return DEFAULTS, [], False
+        return finish(DEFAULTS, [], False, "model_failure")
     if not isinstance(reply, dict):
         log.warning("rulebook parameter reply is not a JSON object; using defaults")
-        return DEFAULTS, [], False
-    params, taken = _from_reply(reply, strict=False)
-    return params, taken, True
+        return finish(DEFAULTS, [], False, "invalid_response")
+    stats["initial_reply_sha256"] = hashlib.sha256(json.dumps(reply, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    errors: dict[str, str] = {}
+    params, taken = _from_reply(reply, strict=False, errors=errors)
+    stats["validation_error_fields"] = list(errors)
+    if errors and validation_retries:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            return finish(params, taken, False, "retry_deadline")
+        repair = getattr(model, "reask_json", None)
+        if not callable(repair):
+            return finish(params, taken, False, "retry_unavailable")
+        try:
+            stats["model_calls"] += 1
+            corrected = repair(SYSTEM_PROMPT, prompt, reply, _validation_feedback(errors), timeout=remaining)
+        except Exception as exc:
+            log.warning("rulebook parameter repair failed (%s); not caching", type(exc).__name__)
+            return finish(params, taken, False, "repair_failure")
+        if not isinstance(corrected, dict):
+            return finish(params, taken, False, "invalid_repair")
+        stats["repair_reply_sha256"] = hashlib.sha256(json.dumps(corrected, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        # Only failing fields may change; deleting a failing field cannot hide its error.
+        reply = {**reply, **{name: corrected[name] for name in errors if corrected.get(name) is not None}}
+        errors = {}
+        params, taken = _from_reply(reply, strict=False, errors=errors)
+        stats["remaining_error_fields"] = list(errors)
+    if errors:
+        return finish(params, taken, False, "invalid_parameters")
+    return finish(params, taken, True, "validated" if taken else "unstated")
 
 
-def _from_reply(reply: dict[str, Any], *, strict: bool) -> tuple[RulebookParams, list[str]]:
+def _from_reply(reply: dict[str, Any], *, strict: bool,
+                errors: dict[str, str] | None = None) -> tuple[RulebookParams, list[str]]:
     """Validate every field. Lenient mode falls back per field and logs; strict mode raises _Invalid instead."""
     taken: list[str] = []
 
@@ -276,6 +383,8 @@ def _from_reply(reply: dict[str, Any], *, strict: bool) -> tuple[RulebookParams,
         except _Invalid as exc:
             if strict:
                 raise
+            if errors is not None:
+                errors.update({name: str(exc) for name in names})
             log.warning("rulebook parameter %s is not usable (%s); using the default", "/".join(names), exc)
             return defaults
         taken.extend(names)
@@ -449,10 +558,15 @@ def _to_reply(params: RulebookParams) -> dict[str, Any]:
     }
 
 
-def _read_cache(path: Path, digest: str) -> tuple[RulebookParams, list[str]] | None:
+def _read_cache(path: Path, digest: str, *, context_mode: str = "cues",
+                fingerprint: str) -> tuple[RulebookParams, list[str]] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("sha256") != digest or not isinstance(data.get("params"), dict):
+            return None
+        if data.get("context_mode", "cues") != context_mode:
+            return None
+        if data.get("fingerprint") != fingerprint:
             return None
         params, _ = _from_reply(data["params"], strict=True)
         taken = data.get("taken")
@@ -463,15 +577,23 @@ def _read_cache(path: Path, digest: str) -> tuple[RulebookParams, list[str]] | N
         return None
 
 
-def _write_cache(path: Path, digest: str, params: RulebookParams, taken: list[str]) -> None:
-    payload = {"sha256": digest, "params": _to_reply(params), "taken": taken}
+def _write_cache(path: Path, digest: str, params: RulebookParams, taken: list[str], *, context_mode: str = "cues",
+                 fingerprint: str, provenance: dict[str, Any]) -> None:
+    payload = {"sha256": digest, "context_mode": context_mode, "params": _to_reply(params), "taken": taken,
+               "fingerprint": fingerprint, "provenance": provenance}
+    tmp: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=path.name + ".", suffix=".tmp",
+                                         dir=path.parent, delete=False) as handle:
+            tmp = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except OSError as exc:
         log.warning("could not write the rulebook parameter cache %s: %s", path, exc)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def _union(defaults: tuple[str, ...], stated: tuple[str, ...]) -> tuple[str, ...]:

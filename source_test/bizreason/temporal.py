@@ -242,6 +242,17 @@ class TemporalResolver:
         self.lunar = lunar
 
     def resolve(self, question: str, as_of: date) -> list[TimeWindow]:
+        """Windows of the question; see _resolve_windows. Every full date the question writes must be inside some
+        window: two or more written days that the windows leave out are read as one range by their structure
+        (_written_day_windows: a range, a comparison or a list), or not at all, so a phrasing no rule knows never
+        shrinks to its first day."""
+        windows = self._resolve_windows(question, as_of)
+        days = _written_days(question)
+        if len(days) < 2 or all(any(w.start <= d < w.end_exclusive for w in windows) for d in days):
+            return windows
+        return _written_day_windows(question, days)
+
+    def _resolve_windows(self, question: str, as_of: date) -> list[TimeWindow]:
         raw_text = _untelex(normalize_lookup(question))
         text = re.sub(r"\btrc\b", "truoc", raw_text)
         text = re.sub(r"\bvs\b", "voi", text)
@@ -257,7 +268,8 @@ class TemporalResolver:
         text = re.sub(r"\btuan\s+ni\b", "tuan nay", text)
         # A month written in words ("tháng ba", "tháng giêng", "tháng chạp") is that month number.
         # "tháng năm trước / năm nay" is a month of a year, not May.
-        text = re.sub(rf"\bthang ({"|".join(_MONTH_WORDS)})\b(?! \d{{1,2}}\b)(?! (?:truoc|ngoai|nay|ni|roi|sau|kia|qua|toi)\b)",
+        month_alternatives = "|".join(_MONTH_WORDS)  # outside the f-string: nested same-type quotes need Python 3.12
+        text = re.sub(rf"\bthang ({month_alternatives})\b(?! \d{{1,2}}\b)(?! (?:truoc|ngoai|nay|ni|roi|sau|kia|qua|toi)\b)",
                       lambda m: f"thang {_MONTH_WORDS[m.group(1)]}", text)
         today_end = as_of + timedelta(days=1)
         evidence = ["question", "as_of_date"]
@@ -866,3 +878,62 @@ class TemporalResolver:
                 return window(date(y - 1, 1, 1), date(y, 1, 1), role="comparison")
 
         return None
+
+# A full date written day first ("08/08/2026", "8-8-2026").
+_WRITTEN_DAY_RE = re.compile(r"(?<![\d/.\-])(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(20\d{2})(?![\d/.\-])")
+# Only a dash-like sign between two days: a range ("08/08/2026 – 06/12/2026").
+_RANGE_SIGN_RE = re.compile(r"^\s*[-\u2013\u2014~\u2192>]+\s*$")
+# The three ways two written days relate, read from the words around them (after normalize_lookup):
+# a range opened before the first day ("từ A … B", "giữa A và B"), a comparison ("A so với B"), or a list ("A và B").
+_RANGE_OPENERS = ("tu", "giua", "khoang")
+_COMPARE_WORDS = ("so voi", "so", "voi", "hon", "kem")
+_LIST_WORDS = ("va", "hay", "hoac", "cung", "lan luot")
+_MAX_LINK_WORDS = 4  # words between two days that still link them
+
+
+def _written_days(question: str) -> list[date]:
+    days = []
+    for day, month, year in _WRITTEN_DAY_RE.findall(question):
+        try:
+            value = date(int(year), int(month), int(day))
+        except ValueError:
+            continue
+        if value not in days:
+            days.append(value)
+    return days
+
+
+def _day(start: date, role: str = "target", end: date | None = None) -> TimeWindow:
+    return TimeWindow(role=role, start=start, end_exclusive=(end or start) + timedelta(days=1),
+                      evidence=["question", "as_of_date"])
+
+
+def _written_day_windows(question: str, days: list[date]) -> list[TimeWindow]:
+    """Windows for two written days that the rules left out, from how the text links them:
+    - a range when only a dash-like sign stands between them, or a range opener ("từ", "giữa", "khoảng") comes just
+      before the first day and the link holds no comparison word: [first, last], both days included (rulebook §2);
+    - a comparison ("A so với B"): A is the asked period, B the comparison;
+    - a list ("A và B", "lần lượt"): each day is its own period, in the order written.
+    Anything else (more than two days, a long or unknown link, a range that ends before it starts) gives no window,
+    so the solver abstains rather than answering for one day."""
+    found = list(_WRITTEN_DAY_RE.finditer(question))
+    if len(days) != 2 or len(found) != 2:
+        return []
+    first, last = days
+    between = question[found[0].end():found[1].start()]
+    words = normalize_lookup(between).split()
+    if len(words) > _MAX_LINK_WORDS:
+        return []
+    link = f" {' '.join(words)} "
+    before = normalize_lookup(question[:found[0].start()]).split()[-2:]
+    has = lambda vocabulary: any(f" {w} " in link for w in vocabulary)
+    if _RANGE_SIGN_RE.match(between) or (any(w in before for w in _RANGE_OPENERS) and not has(_COMPARE_WORDS)):
+        return [_day(first, end=last)] if first <= last else []
+    if re.search(r"\b\d{1,3} ngay\b", normalize_lookup(question)):
+        # A day count ("10 ngày kể từ ngày đó") hangs on one of the written days: which one is ambiguous.
+        return []
+    if has(_COMPARE_WORDS):
+        return [_day(first), _day(last, role="comparison")]
+    if has(_LIST_WORDS):
+        return [_day(first), _day(last)]
+    return []

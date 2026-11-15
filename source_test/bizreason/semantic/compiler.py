@@ -13,9 +13,10 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from bizreason.contracts import TimeWindow
-from bizreason.semantic import rulebook_params
+from bizreason.semantic import debt_sources, rulebook_params, stock_sources
 from bizreason.semantic.vocabulary import GENERIC_FILTER_WORDS, LOT_MEASURES, STOCK_MEASURES
 from bizreason.semantic.vocabulary import RULE_DEVICE_LINE
+from bizreason.semantic import value_resolver
 from bizreason.utils import normalize_lookup
 
 
@@ -90,6 +91,8 @@ NO_PARTIAL_DIMS = {"customer", "customer_group"}
 # Dimensions whose filter text may carry extra words around the stored name (a unit word such as the dish or
 # bottle counter, a trailing particle) or only some of its words; see _word_match.
 WORD_MATCH_DIMS = {"product", "product_group"}
+# Dimensions where a fuzzy (typo / word order) match is tried after every exact step failed; never customers.
+FUZZY_MATCH_DIMS = {"product", "product_group", "employee", "supplier"}
 # Prescription values: a token for "no" means 0, any other value means 1 (rulebook section 6). ASCII tokens.
 NO_TOKENS = ("no", "khong")
 # Prescription values that say "yes"; a value with neither a yes nor a no token is not a prescription value.
@@ -148,13 +151,19 @@ LIST_CELL_SHARE = 0.3
 
 def _list_cell_match(values: list[Any], needle: str) -> list[Any]:
     """Cells that list several items ("a, b + c"): when such cells are common in the column, a filter names every
-    cell that has one item containing the filter text as whole words."""
+    cell that has one item containing the filter text as whole words. When some item is exactly the filter text (equal
+    after _name_key), only the cells with such an item are named: an item that merely contains it is another name
+    ("matcha latte" is not "latte")."""
     if not values or not needle:
         return []
     listed = [v for v in values if re.search(r"[,;+]", str(v))]
     if len(listed) / len(values) < LIST_CELL_SHARE:
         return []
     padded = f" {needle} "
+    key = needle.replace(" ", "")
+    exact = [v for v in values if any(_name_key(part) == key for part in re.split(r"[,;+]", str(v)))]
+    if exact:
+        return exact
     return [v for v in values if any(padded in f" {normalize_lookup(part)} " for part in re.split(r"[,;+]", str(v)))]
 
 
@@ -543,7 +552,12 @@ class Compiler:
             found = _word_match(values, needle)
             if found:
                 return found
-            return _list_cell_match(values, needle)
+            found = _list_cell_match(values, needle)
+            if found:
+                return found
+        if partial and dim in FUZZY_MATCH_DIMS:
+            # Last resort: a misspelt, unaccented or reordered name that clearly names one stored name.
+            return value_resolver.resolve(needle, values, dim) or []
         return []
 
     def _stored_matches(
@@ -554,6 +568,9 @@ class Compiler:
         if not matched:
             if dim in CLOSED_DIMS and values:
                 raise NotRecorded(f"not recorded {dim}: {text}")
+            if dim in CLOSED_DIMS and table == "orders" and self._column_empty(table, source):
+                # The column exists but no order has a value (as for the customer group): the shop records none.
+                raise NotRecorded(f"no {dim} recorded: {text}")
             if dim == "product_group" and not values:
                 # The shop records no product group at all: a question about one is unanswerable (rulebook §7).
                 raise NotRecorded(f"no product group recorded: {text}")
@@ -565,6 +582,12 @@ class Compiler:
                     raise NotRecorded(f"no purchase recorded for product: {text}")
             raise Unsupported(f"unresolved {dim}: {text}")
         return matched
+
+    def _column_empty(self, table: str, column: str) -> bool:
+        """True when the table has rows and none of them has a value in the column."""
+        if self.db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None:
+            return False
+        return self.db.execute(f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL LIMIT 1").fetchone() is None
 
     def _customer_predicate(self, text: str) -> tuple[str, list[Any], bool]:
         """Rulebook §3. A customer is a code when the shop has codes, otherwise the name written on the order.
@@ -825,6 +848,13 @@ class Compiler:
                     for order_id, day, due, owed in self.db.execute(
                         "SELECT order_id, date, COALESCE(total_due, revenue), COALESCE(outstanding, 0) FROM orders")}
         if not payment_rows:
+            settled = debt_sources.order_state_settlements(self.db)
+            if settled is not None:
+                if window is None or not debt_sources.cutoff_covers_data_end(self.db, window.end_exclusive):
+                    raise Unsupported("debt known only at the end of the data")
+                return settled
+            if debt_sources.payments_unrecorded(self.db):
+                raise NotRecorded("no payment record")
             raise Unsupported("no payments")
         paid: dict[Any, list[tuple[Any, Any]]] = {}
         for order_id, paid_on, amount in payment_rows:
@@ -1100,21 +1130,26 @@ class Compiler:
         question on that day is answered. Expiring stock value is not answered: a lot's purchase cost is not recorded
         per base unit in this layer.
         """
-        if intent.measure != "expiry_lot":
+        if intent.measure not in LOT_MEASURES:
             raise Unsupported(f"measure {intent.measure}")
         self._require_stock_source(intent.measure)
         if not self._has_lot_balances():
             raise Unsupported("no lot balances")
         dates = {row[0] for row in self.db.execute("SELECT DISTINCT stock_date FROM stock")}
-        if len(dates) != 1 or next(iter(dates)) is None or str(next(iter(dates)))[:10] != as_of.isoformat():
+        if len(dates) != 1 or next(iter(dates)) is None:
             raise Unsupported("lot balances are not on this day")
-        if window.start == date.min:
-            lower, clause, args = as_of, "balance > 0 AND expires_at >= ?", []
-        else:
-            lower = window.start
-            last = (window.end_exclusive - timedelta(days=1)).isoformat()
-            clause, args = "balance > 0 AND expires_at >= ? AND expires_at <= ?", [last]
-        args = [lower.isoformat(), *args]
+        report_day = str(next(iter(dates)))[:10]
+        if intent.measure == "expiring_lot_value":
+            # Balances are the ones after the last recorded movement; they hold for today only when nothing is
+            # recorded after the report day. Earlier than that the layer keeps no per-lot sales to roll back.
+            if report_day > as_of.isoformat():
+                raise Unsupported("lot balances are later than this day")
+        elif report_day != as_of.isoformat():
+            raise Unsupported("lot balances are not on this day")
+        lower, last = stock_sources.lot_expiry_range(window.start, window.end_exclusive, as_of, intent.shape)
+        clause, args = "balance > 0 AND expires_at >= ?", [lower.isoformat()]
+        if last is not None:
+            clause, args = clause + " AND expires_at <= ?", [*args, last.isoformat()]
         filters = intent.filters
         if filters:
             if len(filters) != 1 or filters[0].get("dim") != "product" or filters[0].get("exclude") is True:
@@ -1124,6 +1159,8 @@ class Compiler:
             clause += f" AND product_name IN ({','.join('?' for _ in matched)})"
             args += list(matched)
         shape = intent.shape
+        if intent.measure == "expiring_lot_value":
+            return self._expiring_lot_value(clause, args, shape)
         if shape == "argmax_date":
             if not filters:
                 raise Unsupported("earliest lot needs one product")
@@ -1141,7 +1178,81 @@ class Compiler:
             return Answer("list", [row[0] for row in rows])
         raise Unsupported(f"shape {shape} for expiry")
 
-    def stock(self, intent: Intent, window: TimeWindow, split: bool = False) -> Answer:
+    def _expiring_lot_value(self, clause: str, args: list[Any], shape: str) -> Answer:
+        """Rulebook §6: the value of what is left of the lots in `clause`, at the price the lot was bought for, per base
+        unit. A lot with no recorded cost makes the total unknown, so it is not answered."""
+        if shape != "scalar":
+            raise Unsupported(f"shape {shape} for expiring stock value")
+        if "unit_cost" not in self._columns("lot_balance"):
+            raise Unsupported("lot cost per base unit is not in the layer")
+        rows = self.db.execute(f"SELECT balance, unit_cost FROM lot_balance WHERE {clause}", args).fetchall()
+        if any(cost is None for _, cost in rows):
+            raise Unsupported("lot without a cost per base unit")
+        return Answer("number", _round_money(sum(balance * cost for balance, cost in rows)))
+
+    def _ledger_stock_on(self, day: date) -> list[tuple[str, float]] | None:
+        """(name_key, balance) of each product with a movement by the end of `day`: the balance after its last one
+        (by time, then by order in the ledger). None when the layer has no stock ledger."""
+        if not self._has_table("stock_ledger"):
+            return None
+        if self.db.execute("SELECT 1 FROM stock_ledger LIMIT 1").fetchone() is None:
+            return None
+        before = (day + timedelta(days=1)).isoformat()
+        # One pass with a window function: the layer is read-only, so there is no index for a correlated subquery.
+        return [(row[0], row[1]) for row in self.db.execute(
+            "SELECT name_key, balance FROM (SELECT name_key, balance, ROW_NUMBER() OVER ("
+            "PARTITION BY name_key ORDER BY ts DESC, rowid DESC) AS pos FROM stock_ledger WHERE ts < ?) WHERE pos = 1",
+            (before,))]
+
+    def _stock_from_ledger(self, intent: Intent, day: date) -> Answer | None:
+        """Rulebook §5: stock at the end of any day from the movement ledger. Only the two shop-wide measures are
+        answered this way; a product that had no movement by then holds nothing and is not counted."""
+        if intent.measure not in ("inventory_value", "out_of_stock_count"):
+            return None
+        balances = self._ledger_stock_on(day)
+        if balances is None:
+            return None
+        if intent.filters:
+            raise Unsupported("stock on a day with a filter")
+        info = {row[0]: row[1:] for row in self.db.execute("SELECT name_key, unit_cost, received FROM stock")}
+        tracked = {row[0] for row in self.db.execute("SELECT DISTINCT name_key FROM stock_ledger")}
+        if not set(info) <= tracked:
+            # A product the ledger never mentions may hold stock the ledger does not show: keep the report's answer.
+            return None
+        if intent.measure == "out_of_stock_count":
+            # Bought-in goods only: a product with receipts.
+            if any(key not in info for key, _ in balances):
+                raise Unsupported("ledger product not in the catalog")
+            return Answer("number", sum(1 for key, balance in balances if balance == 0 and info[key][1] == 1))
+        total = 0.0
+        for key, balance in balances:
+            if balance <= 0:
+                continue
+            cost = info.get(key, (None, None))[0]
+            if cost is None:
+                raise Unsupported("product without a unit cost")
+            total += balance * cost
+        return Answer("number", _round_money(total))
+
+    def _ledger_qty_answer(self, intent: Intent, day: date, split: bool) -> Answer | None:
+        """One product's stock at the end of any day, from the movement ledger (see stock_sources)."""
+        filters = intent.filters
+        if intent.measure != "inventory_qty" or len(filters) != 1 or filters[0].get("dim") != "product" \
+                or filters[0].get("exclude") is True:
+            return None
+        text = filters[0]["value"]
+        matched = self._stored_matches("stock", "product_name", "product", normalize_lookup(text), text)
+        qty = stock_sources.ledger_balance_on(self.db, matched, day)
+        if qty is None:
+            return None
+        factors = {row[0] for row in self.db.execute(
+            f"SELECT large_factor FROM stock WHERE product_name IN ({','.join('?' for _ in matched)})", list(matched))}
+        result = stock_sources.quantity_answer(qty, factors.pop() if len(factors) == 1 else None, split)
+        if result is None:
+            raise Unsupported("stock quantity is not a whole count or has no large unit")
+        return Answer(result[0], result[1])
+
+    def stock(self, intent: Intent, window: TimeWindow, split: bool = False, question_text: str | None = None) -> Answer:
         """Rulebook §2 and §5: the stock at the end of the window's last day, from the stock report.
 
         A report gives the balance on the day it was taken (the last day with data, see layer._build_stock). Any
@@ -1151,12 +1262,19 @@ class Compiler:
         self._require_stock_source(intent.measure)
         if not self._has_table("stock"):
             raise Unsupported("no stock report")
+        last_day = window.end_exclusive - timedelta(days=1)
+        from_ledger = self._stock_from_ledger(intent, last_day)
+        if from_ledger is not None:
+            return from_ledger
         dates = {row[0] for row in self.db.execute("SELECT DISTINCT stock_date FROM stock")}
         if len(dates) != 1 or next(iter(dates)) is None:
             raise Unsupported("stock report date unknown")
         report_day = str(next(iter(dates)))[:10]
         day = (window.end_exclusive - timedelta(days=1)).isoformat()
         if day != report_day:
+            answered = self._ledger_qty_answer(intent, window.end_exclusive - timedelta(days=1), split)
+            if answered is not None:
+                return answered
             raise Unsupported("stock on a day other than the report date")
         if self.db.execute("SELECT COUNT(*) - COUNT(DISTINCT name_key) FROM stock").fetchone()[0]:
             raise Unsupported("product listed twice in the stock report")
@@ -1176,6 +1294,14 @@ class Compiler:
                 "SELECT COUNT(*) FROM stock WHERE qty_base = 0 AND received = 1").fetchone()[0])
         if m != "inventory_qty":
             raise Unsupported(f"measure {m}")
+        if split and question_text:
+            from bizreason.semantic.stock_split import SplitUnsupported, split_stock
+            try:
+                pair = split_stock(self.db, question_text, intent.filters)
+            except SplitUnsupported as exc:
+                raise Unsupported(str(exc)) from exc
+            if pair is not None:
+                return Answer("list", list(pair))
         qty, factor, _unit = self._stock_product(intent)
         if qty < 0 or float(qty) != int(qty):
             raise Unsupported("stock quantity is not a whole count")
@@ -1537,6 +1663,19 @@ class Compiler:
         sql = {"after_today": ">", "before_today": "<", "on_or_before_today": "<=", "on_or_after_today": ">="}[op]
         return f"{alias}.{dated} {sql} ?", [self.as_of.isoformat()]
 
+    def _order_link(self, home: str, cols: set[str]) -> str:
+        """The one column of a side table that holds order ids (the layer records it by value coverage, not by name)."""
+        keys = {row[0] for row in self.db.execute(
+            "SELECT column_name FROM column_catalog WHERE table_name=? AND join_key_to LIKE 'orders.%'", (home,))}
+        if "order_id" in cols:
+            keys.add("order_id")
+        keys &= cols
+        if not keys:
+            raise Unsupported(f"no order link for {home}")
+        if len(keys) > 1:
+            raise Unsupported(f"several order links in {home}")
+        return next(iter(keys))
+
     def column_value(self, intent: Intent, window: TimeWindow) -> float | None:
         """A sum, count or distinct count on any kept column, over valid sales in the window (rulebook §1)."""
         spec = intent.column_measure or {}
@@ -1569,26 +1708,29 @@ class Compiler:
                 where += [w.replace("product_key", "t.product_key") if False else w for w in piece]
                 args += extra
         else:
-            if "order_id" in cols:
-                key = "order_id"
-            else:
-                row = self.db.execute("SELECT column_name FROM column_catalog WHERE table_name=? AND join_key_to LIKE "
-                                      "'orders.%' LIMIT 1", (home,)).fetchone()
-                if row is None:
-                    raise Unsupported(f"no order link for {home}")
-                key = row[0]
-            source = f"{home} t JOIN orders o ON o.order_id = t.{key}"
-            joined = True
-            where += [_valid_sale_sql().replace("status", "o.status"), "o.date >= ? AND o.date < ?"]
-            args += span
+            key = self._order_link(home, cols)
+            # A semi-join: each side-table row is kept when its order is a valid sale in the window (and passes the
+            # order-level filters), and no order is counted twice whatever the side table's own cardinality.
+            order_where = [_valid_sale_sql(), "date >= ? AND date < ?"]
+            order_args: list[Any] = list(span)
             if intent.filters:
-                raise Unsupported("filter on a joined table")
+                piece, extra, needs_lines = self._predicates(intent)
+                if needs_lines:
+                    raise Unsupported("line filter on a joined table")
+                order_where += piece
+                order_args += extra
+            source = f"{home} t"
+            joined = True
+            where.append(f"t.{key} IN (SELECT order_id FROM orders WHERE {' AND '.join(order_where)})")
+            args += order_args
         for item in intent.column_filters:
             target = item.get("column")
             if target in cols:
                 piece, extra = self._column_condition("t", cols, item)
             elif joined and target in self.order_columns:
+                # An order column: the order must satisfy it too (semi-join, so the side table is not multiplied).
                 piece, extra = self._column_condition("o", self.order_columns, item)
+                piece = f"t.{key} IN (SELECT o.order_id FROM orders o WHERE {piece})"
             else:
                 raise Unsupported(f"column filter on {target} outside {home}")
             where.append(piece)
@@ -1598,6 +1740,8 @@ class Compiler:
             expr = f"SUM(CAST(t.{number} AS REAL))"
         elif op == "count_distinct":
             expr = f"COUNT(DISTINCT lookup(t.{column}))"
+        elif joined:
+            expr = f"COUNT(DISTINCT t.{key})"
         else:
             expr = "COUNT(DISTINCT t.order_id)" if home == "lines" else "COUNT(*)"
         return self.db.execute(f"SELECT {expr} FROM {source} WHERE {' AND '.join(where)}", args).fetchone()[0]
@@ -1622,6 +1766,8 @@ class Compiler:
         # Public test: shops with no customer on their orders still have answers to customer questions (another
         # source names them), so a missing customer only abstains.
         if _uses_customers(intent) and not self._records_customers():
+            if debt_sources.customers_unrecorded(self.db):
+                raise NotRecorded("customer not recorded")
             raise Unsupported("customer not recorded")
         shape = intent.shape
         if intent.location is not None:

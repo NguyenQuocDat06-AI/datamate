@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from bizreason.contracts import BusinessContext, ColumnMeta, Diagnostic, SourceRef, TableMeta
+from bizreason.data import schema
 from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
-from bizreason.data.layout import ArithmeticSubtotals, has_record_evidence, is_note, is_summary
+from bizreason.data.layout import ArithmeticSubtotals, BlockSums, has_record_evidence, is_note, is_summary
+from bizreason.data.row_audit import create_audit, record_audit
 from bizreason.data.readers import RawSheet, read_sheets
 from bizreason.data.identities import (
     canonicalize_products,
@@ -355,6 +357,22 @@ def infer_locale(values: list[Any], readme: str, *, currency: bool = False) -> s
     return "unknown"
 
 
+def _sum_locales(rows: list[tuple[int, tuple[Any, ...]]], locales: list[str], readme: str) -> list[str]:
+    """Separator reading of each column for subtotal arithmetic. A column whose role gave no reading is read as an
+    amount column would be; one that still has none takes the reading most columns share."""
+    sample = [row for _, row in rows[:2000]]
+    out = [
+        locale if locale != "unknown"
+        else infer_locale([row[index] for row in sample if len(row) > index], readme, currency=True)
+        for index, locale in enumerate(locales)
+    ]
+    votes = Counter(locale for locale in out if locale != "unknown")
+    if len(votes) == 1 or (votes and votes.most_common(2)[0][1] > votes.most_common(2)[-1][1]):
+        common = votes.most_common(1)[0][0]
+        out = [common if locale == "unknown" else locale for locale in out]
+    return out
+
+
 def _stored_number(number: Decimal) -> int | str:
     if number == number.to_integral_value() and -(2**63) <= number < 2**63:
         return int(number)
@@ -405,6 +423,9 @@ class BusinessBuilder:
                 "inheritance": self.inheritance_allowed,
                 "derive_units": bool(self.rules),
                 "implementation": self.implementation_hash,
+                # Alias-off runs change the live mapping without changing any source file.
+                # Read it at prepare time so a builder cannot reuse another mode's cache.
+                "header_roles": dict(schema.ROLE_LOOKUP),
             }
         )
         directory = writable_path(self.cache_root / identifier(business_dir.name) / revision[:20])
@@ -421,6 +442,7 @@ class BusinessBuilder:
         tables = []
         connection = sqlite3.connect(temporary)
         try:
+            create_audit(connection)
             for path in paths:
                 relative = path.relative_to(business_dir).as_posix()
                 try:
@@ -715,13 +737,23 @@ class BusinessBuilder:
             default=-1,
         )
         subtotals = ArithmeticSubtotals(roles, locales)
+        block_sums = BlockSums(width, _sum_locales(rows, locales, readme), roles=roles)
         for position, (row_number, raw_row) in enumerate(rows):
             row = list(raw_row[:width]) + [None] * max(0, width - len(raw_row))
+            ambiguous_evidence = None
+            def audit(row_class: str, reason: str, *, retained: bool = False, evidence=None) -> None:
+                record_audit(
+                    connection, source_path=relative, sheet=sheet.name, region=name,
+                    source_row=row_number, row_class=row_class, kept=retained,
+                    reason=reason, raw=raw_row, evidence=evidence,
+                )
             if all(blank(cell) for cell in row) or tuple(row) == tuple(headers):
+                audit("blank" if all(blank(cell) for cell in row) else "header", "structural row")
                 excluded += 1
                 current_group = None
                 continue
             if _is_repeated_header(row, headers):
+                audit("header", "repeated header")
                 excluded += 1
                 current_group = None
                 diagnostics.append(
@@ -745,10 +777,12 @@ class BusinessBuilder:
                 )
             )
             if kind:
+                audit(kind, "explicit row label and shape")
                 excluded += 1
                 current_group = None
                 if kind == "summary":
                     subtotals.reset()
+                    block_sums.reset()
                 diagnostics.append(
                     Diagnostic(
                         code=f"EXCLUDED_{kind.upper()}_ROW",
@@ -758,20 +792,33 @@ class BusinessBuilder:
                     )
                 )
                 continue
-            if subtotals.is_subtotal(row):
-                excluded += 1
-                current_group = None
-                subtotals.reset()
-                diagnostics.append(
-                    Diagnostic(
-                        code="EXCLUDED_SUBTOTAL_ROW",
-                        message="Arithmetic subtotal outside transaction rows: empty keys, amount equals the rows above",
-                        source=SourceRef(path=relative, table=sheet.name, row=row_number),
-                        severity="info",
+            # The role-based rule also needs a total's shape: a continuation line of an order has blank keys too.
+            if (subtotals.is_subtotal(row) and block_sums.looks_like_total(row)) or block_sums.is_subtotal(row):
+                if block_sums.ambiguous_single_amount(row):
+                    ambiguous_evidence = block_sums.evidence(row)
+                    diagnostics.append(Diagnostic(
+                        code="AMBIGUOUS_SUBTOTAL_ROW",
+                        message="Kept possible continuation: one numeric equality does not identify a subtotal",
+                        source=SourceRef(path=relative, table=sheet.name, row=row_number), severity="info",
+                    ))
+                else:
+                    audit("subtotal", "arithmetic candidate with additional column or label evidence",
+                          evidence=block_sums.evidence(row))
+                    excluded += 1
+                    current_group = None
+                    subtotals.reset()
+                    block_sums.reset()
+                    diagnostics.append(
+                        Diagnostic(
+                            code="EXCLUDED_SUBTOTAL_ROW",
+                            message="Arithmetic subtotal outside transaction rows: empty keys, amount equals the rows above",
+                            source=SourceRef(path=relative, table=sheet.name, row=row_number),
+                            severity="info",
+                        )
                     )
-                )
-                continue
+                    continue
             subtotals.add(row)
+            block_sums.add(row)
             if grain == "order_line" and order_index is not None:
                 if not blank(row[order_index]):
                     row[order_index] = clean_text(row[order_index])
@@ -798,6 +845,7 @@ class BusinessBuilder:
                 row[order_index] = clean_text(row[order_index])
                 fingerprint = digest(row)  # Includes identity, scope and every source cell.
                 if fingerprint in seen:
+                    audit("duplicate", "exact repeated order record")
                     duplicate += 1
                     if grain == "order_header":
                         diagnostics.append(Diagnostic(
@@ -807,6 +855,9 @@ class BusinessBuilder:
                         ))
                     continue
                 seen.add(fingerprint)
+            if ambiguous_evidence is not None:
+                audit("ambiguous_total", "single numeric equality without an explicit summary label",
+                      retained=True, evidence=ambiguous_evidence)
             parsed = []
             for index, (value, role) in enumerate(zip(row, roles)):
                 result = None

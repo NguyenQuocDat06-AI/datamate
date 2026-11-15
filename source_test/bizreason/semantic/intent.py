@@ -393,6 +393,13 @@ def _filter_value(value: Any) -> str | None:
     return None
 
 
+# A kept column of the shop's own data is named like an identifier: lowercase words joined by underscores, with an
+# optional prefix marking the layer's numeric, date or source copy. Anything else (spaces, capitals, accents) is not.
+_COLUMN_IDENTIFIER = re.compile(r"(?:x_|xd_|xn_|src_)?[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+# Measures whose answer is a count of orders, which a count on the filtered column's rows can stand for.
+_COLUMN_COUNT_MEASURES = ("order_count",)
+
+
 def _is_time_only(text: str) -> bool:
     return bool(_TIME_SLASHED.fullmatch(text) or _TIME_PREFIXED.fullmatch(text))
 
@@ -410,7 +417,11 @@ def _location(value: Any) -> str | None:
     return None
 
 
-def _filters(value: Any) -> list[dict[str, Any]]:
+def _filters(
+    value: Any, moved: list[dict[str, Any]] | None = None, *, may_move: bool = False
+) -> list[dict[str, Any]]:
+    """The row filters on dimensions. A filter named like a column of the shop goes to `moved` as a column
+    condition when `may_move` allows it (the column's existence is checked later, against the shop's own data)."""
     if value is None:
         return []
     if not isinstance(value, list):
@@ -429,6 +440,12 @@ def _filters(value: Any) -> list[dict[str, Any]]:
         if dim not in DIMENSIONS:
             if dim in TIME_FILTER_DIMS or dim in MEASURES or dim in SHAPES:
                 # Time is resolved from the time phrase, and a measure or shape name is not a row constraint.
+                continue
+            if may_move and moved is not None and _COLUMN_IDENTIFIER.fullmatch(dim):
+                if _is_time_only(text):
+                    moved.append({"column": dim, "op": "in_period", "value": None})
+                else:
+                    moved.append({"column": dim, "op": "eq", "value": text})
                 continue
             # Dropping this filter would silently widen the question, so refuse instead.
             raise _Unresolvable(f"unknown filter dimension: {dim}")
@@ -452,8 +469,17 @@ def _threshold_number(value: Any) -> int | float | None:
     return None
 
 
-def _threshold(value: Any) -> dict[str, Any] | None:
-    """Return the validated condition, None when the model gave none, or raise when it gave an unusable one."""
+# A per-order metric the solver and compiler resolve themselves (the solver rewrites the metric of an order
+# threshold to it when the question and the rulebook ask for delivery trips; the compiler reads it for subject "order").
+ORDER_RESOLVED_METRICS = ("delivery_trips",)
+
+
+def _threshold(value: Any, *, final: bool = False) -> dict[str, Any] | None:
+    """Return the validated condition, None when the model gave none, or raise when it gave an unusable one.
+
+    On the last attempt an order threshold whose metric is an unlisted identifier is kept: the solver rewrites it
+    when the question asks for it and otherwise the compiler refuses it, so it can only answer or abstain.
+    """
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -462,9 +488,13 @@ def _threshold(value: Any) -> dict[str, Any] | None:
     metric = value.get("metric")
     op = value.get("op")
     number = _threshold_number(value.get("value"))
+    metric_ok = _is_text(metric) and (
+        metric in THRESHOLD_METRICS
+        or (subject == "order" and (
+            metric in ORDER_RESOLVED_METRICS or (final and _COLUMN_IDENTIFIER.fullmatch(metric) is not None))))
     if (
         not _is_text(subject) or subject not in THRESHOLD_SUBJECTS
-        or not _is_text(metric) or metric not in THRESHOLD_METRICS
+        or not metric_ok
         or not _is_text(op) or op not in THRESHOLD_OPS
         or number is None
     ):
@@ -573,17 +603,27 @@ def _interpret(raw: Any, *, final: bool) -> Intent:
         # A ranking without its dimension cannot name the entities, so the reply is retried instead.
         raise _Invalid("missing group_by", _GROUP_BY_HINT)
     age_days = _age_days(raw.get("age_days"))
-    threshold = _threshold(raw.get("threshold"))
+    threshold = _threshold(raw.get("threshold"), final=final)
     if shape in THRESHOLD_SHAPES and threshold is None:
         raise _Invalid("missing threshold", _MISSING_THRESHOLD_HINT)
     compare_as = raw.get("compare_as")
     if not _is_text(compare_as) or compare_as not in COMPARE_MODES:
         compare_as = DEFAULT_COMPARE_AS
+    column_filters = _column_filters(raw.get("column_filters"))
+    moved: list[dict[str, Any]] = []
+    # A filter on a kept column can only be a column condition when something counts rows of that column.
+    filters = _filters(
+        raw.get("filters"), moved, may_move=column_measure is not None or measure in _COLUMN_COUNT_MEASURES)
+    for item in moved:
+        if item not in column_filters:
+            column_filters.append(item)
+    if moved and column_measure is None:
+        column_measure = {"op": "count", "column": moved[0]["column"]}
     return Intent(
         measure=measure,
         shape=shape,
         group_by=group_by,
-        filters=_filters(raw.get("filters")),
+        filters=filters,
         top_k=top_k,
         compare_as=compare_as,
         threshold=threshold,
@@ -591,7 +631,7 @@ def _interpret(raw: Any, *, final: bool) -> Intent:
         measure2=_measure2(raw.get("measure2")),
         location=_location(raw.get("location")),
         column_measure=column_measure,
-        column_filters=_column_filters(raw.get("column_filters")),
+        column_filters=column_filters,
     )
 
 

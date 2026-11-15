@@ -243,3 +243,88 @@ def test_a_canonical_column_described_in_the_catalog_takes_its_readme_descriptio
                 "'product_name', 'text', 5, '[]', NULL)")
     col = build_card(con).tables["lines"].columns["product_name"]
     assert col.core and col.header == "Ngày bán" and col.description == "sale date"
+
+
+def add_staff_catalog(con, rows=None):
+    con.execute("CREATE TABLE src_staff (person TEXT, rate REAL, category TEXT)")
+    con.executemany("INSERT INTO src_staff VALUES (?,?,?)", rows or [
+        (" KIM ", 10, "senior"), ("lan", 20, "junior")])
+    con.executemany("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)", [
+        ("src_staff", "person", "staff_sheet", "Staff", "employee_name", "text", 2, '[]', None),
+        ("src_staff", "rate", "staff_sheet", "Rate", "other", "number", 2, '[]', None),
+        ("src_staff", "category", "staff_sheet", "Category", "other", "text", 2, '[]', None)])
+
+
+def test_dimension_links_require_roles_and_observed_overlap_and_render_the_target():
+    db = build_shop()
+    add_staff_catalog(db)
+    card = build_card(db)
+    link = card.link("src_staff", "employee_name")
+    assert link.column == "person" and link.share == 1 and link.unique
+    assert "person links orders.employee (one row each)" in card.render()
+    db.execute("UPDATE column_catalog SET role='other' WHERE table_name='src_staff'")
+    assert build_card(db).link("src_staff", "employee_name") is None
+    db.execute("UPDATE column_catalog SET role='employee_name' WHERE table_name='src_staff' AND column_name='person'")
+    db.execute("UPDATE src_staff SET person='Unrelated Person'")
+    assert build_card(db).link("src_staff", "employee_name") is None
+
+
+def test_dimension_links_do_not_treat_a_numeric_attribute_as_an_identifier():
+    db = build_shop()
+    add_staff_catalog(db)
+    db.execute("UPDATE orders SET order_id=CASE WHEN employee='Kim' THEN '10' ELSE '20' END")
+    links = build_card(db).tables["src_staff"].links
+    assert [(link.column, link.kind) for link in links] == [("person", "employee_name")]
+
+
+def test_equally_supported_dimension_key_columns_are_ambiguous():
+    db = build_shop()
+    add_staff_catalog(db)
+    db.execute("ALTER TABLE src_staff ADD COLUMN alternate TEXT")
+    db.execute("UPDATE src_staff SET alternate=person")
+    db.execute("INSERT INTO column_catalog VALUES ('src_staff','alternate','staff_sheet','Alternate',"
+               "'employee_name','text',2,'[]',NULL)")
+    assert build_card(db).link("src_staff", "employee_name") is None
+
+
+def test_dimension_uniqueness_uses_normalized_names():
+    db = build_shop()
+    add_staff_catalog(db, [("Kim", 10, "senior"), (" KIM ", 15, "senior"), ("Lan", 20, "junior")])
+    link = build_card(db).link("src_staff", "employee_name")
+    assert link is not None and not link.unique
+
+
+def test_customer_code_and_name_links_use_their_own_comparison_rules():
+    db = build_shop()
+    db.execute("CREATE TABLE src_customers (code TEXT, person TEXT, tier TEXT)")
+    db.executemany("INSERT INTO src_customers VALUES (?,?,?)", [
+        ("c1", " ANN LEE ", "gold"), ("c2", "bob ray", "silver")])
+    db.executemany("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)", [
+        ("src_customers", "code", "customer_sheet", "Code", "customer_id", "code", 2, '[]', None),
+        ("src_customers", "person", "customer_sheet", "Name", "customer_name", "text", 2, '[]', None)])
+    card = build_card(db)
+    assert card.link("src_customers", "customer_id").column == "code"
+    assert card.link("src_customers", "customer_name") is None  # a code is the stronger customer key
+    db.execute("UPDATE src_customers SET code=upper(code)")
+    card = build_card(db)
+    assert card.link("src_customers", "customer_id") is None
+    assert card.link("src_customers", "customer_name") is not None
+
+
+def test_single_row_staff_catalog_links_with_a_verified_role_and_matching_name():
+    db = build_shop()
+    add_staff_catalog(db, [("Kim", 10, "senior")])
+    link = build_card(db).link("src_staff", "employee_name")
+    assert link is not None and link.unique and link.share == 1
+
+
+def test_customer_code_and_name_that_contradict_orders_are_not_linked():
+    db = build_shop()
+    db.execute("CREATE TABLE src_customers (code TEXT, person TEXT)")
+    db.executemany("INSERT INTO src_customers VALUES (?,?)", [("c1", "Bob Ray"), ("c2", "Ann Lee")])
+    db.executemany("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)", [
+        ("src_customers", "code", "customer_sheet", "Code", "customer_id", "code", 2, '[]', None),
+        ("src_customers", "person", "customer_sheet", "Name", "customer_name", "text", 2, '[]', None)])
+    card = build_card(db)
+    assert card.link("src_customers", "customer_id") is None
+    assert card.link("src_customers", "customer_name") is None
