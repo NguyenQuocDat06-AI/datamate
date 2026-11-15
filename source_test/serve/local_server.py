@@ -491,6 +491,34 @@ def sse_body(payload: dict[str, Any]) -> bytes:
 # Worker role: loads the model on the GPU selected by CUDA_VISIBLE_DEVICES and serves /v1/chat/completions.
 # ---------------------------------------------------------------------------------------------------------------
 
+QUANT_ENV = "DATAMATE_QUANT"  # "nf4" (default, the measured configuration) or "fp16" (no quantization)
+
+
+def quant_mode(environ: Any = None) -> str:
+    """nf4 unless DATAMATE_QUANT=fp16 asks for the unquantized fp16 weights."""
+    value = str((environ if environ is not None else os.environ).get(QUANT_ENV, "nf4")).strip().lower()
+    return "fp16" if value == "fp16" else "nf4"
+
+
+def load_with_quant_fallback(load: Any, mode: str, wlog: Any, release: Any = None) -> tuple[Any, str]:
+    """Load with load(quantized: bool). nf4 first; when that raises anything but an out-of-memory error, print the full
+    traceback to the server log (it is the only place the cause shows) and load the fp16 weights instead.
+    Returns (model, mode actually used). An out-of-memory error or a failing fp16 load is raised unchanged."""
+    if mode == "fp16":
+        return load(False), "fp16"
+    try:
+        return load(True), "nf4"
+    except BaseException as exc:  # noqa: BLE001 - a quantization stack failure must not end the run
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)) or is_oom_error(exc):
+            raise
+        wlog(f"NF4 loading failed ({type(exc).__name__}: {str(exc)[:300]}); full traceback follows")
+        traceback.print_exc()
+        wlog("falling back to unquantized fp16 weights")
+        if release is not None:
+            release()
+        return load(False), "fp16"
+
+
 def run_worker(args: argparse.Namespace) -> int:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     token = os.environ.get(TOKEN_ENV, "")
@@ -562,20 +590,30 @@ def run_worker(args: argparse.Namespace) -> int:
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
     )
-    load_kwargs: dict[str, Any] = {
-        "device_map": {"": 0} if cuda else "cpu",
-        "quantization_config": bnb_config if cuda else None,
-        "attn_implementation": "sdpa",
-        "trust_remote_code": True,
-        "torch_dtype": torch.float16,
-    }
-    wlog("loading 4-bit NF4 weights")
-    try:
-        model = model_cls.from_pretrained(model_dir, **load_kwargs)
-    except TypeError:
-        load_kwargs.pop("torch_dtype", None)
-        load_kwargs["dtype"] = torch.float16
-        model = model_cls.from_pretrained(model_dir, **load_kwargs)
+
+    def load_model(quantized: bool):
+        load_kwargs: dict[str, Any] = {
+            "device_map": {"": 0} if cuda else "cpu",
+            "quantization_config": bnb_config if (cuda and quantized) else None,
+            "attn_implementation": "sdpa",
+            "trust_remote_code": True,
+            "torch_dtype": torch.float16,
+        }
+        wlog("loading 4-bit NF4 weights" if (cuda and quantized) else "loading unquantized fp16 weights")
+        try:
+            return model_cls.from_pretrained(model_dir, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop("torch_dtype", None)
+            load_kwargs["dtype"] = torch.float16
+            return model_cls.from_pretrained(model_dir, **load_kwargs)
+
+    def release_gpu() -> None:
+        import gc
+        gc.collect()
+        _empty_cuda_cache(cuda)
+
+    model, used_mode = load_with_quant_fallback(load_model, quant_mode() if cuda else "fp16", wlog, release_gpu)
+    wlog(f"weights loaded as {used_mode}")
     for p in model.parameters():
         if p.dtype == torch.bfloat16:
             p.data = p.data.to(torch.float16)

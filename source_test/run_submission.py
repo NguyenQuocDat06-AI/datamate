@@ -134,6 +134,33 @@ def start_model_server(*, model_dir: Path, port: int, token: str, out_dir: Path,
     return ModelServer(proc=proc, port=port, token=token, log_path=log_path, log_file=log_file)
 
 
+SERVER_LOG_TAIL_LINES = 80
+SERVER_LOG_TAIL_BYTES = 16000
+
+
+def server_log_tail(path: Path, lines: int = SERVER_LOG_TAIL_LINES, max_bytes: int = SERVER_LOG_TAIL_BYTES) -> str:
+    """The last lines of the model server log. The server prints its own traceback there, and the console of a run
+    shows only what run_submission logs, so a start-up failure stays invisible unless the tail is echoed. The server
+    never prints its bearer token. Returns "" when the file is missing or unreadable."""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - max_bytes))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def log_server_tail(server: "ModelServer") -> None:
+    tail = server_log_tail(server.log_path)
+    if tail:
+        log(f"---- last lines of {server.log_path} ----")
+        for line in tail.splitlines():
+            log("server| " + line)
+        log("---- end of server log ----")
+
+
 def wait_until_ready(server: ModelServer, *, timeout: float, poll: float = 1.0) -> str:
     """Poll /v1/models until it answers. Returns the served model id. Raises ServerError on exit or timeout."""
     start = time.monotonic()
@@ -142,6 +169,7 @@ def wait_until_ready(server: ModelServer, *, timeout: float, poll: float = 1.0) 
     while True:
         rc = server.proc.poll()
         if rc is not None:
+            log_server_tail(server)
             raise ServerError(f"model server exited with code {rc}; see {server.log_path}")
         name = probe_models(server.port, server.token)
         if name is not None:
@@ -149,6 +177,7 @@ def wait_until_ready(server: ModelServer, *, timeout: float, poll: float = 1.0) 
             return name
         now = time.monotonic()
         if now >= deadline:
+            log_server_tail(server)
             raise ServerError(f"model server did not answer /v1/models within {timeout:.0f}s; see {server.log_path}")
         if now >= next_report:
             log(f"waiting for the model server ({now - start:.0f}s elapsed)")
