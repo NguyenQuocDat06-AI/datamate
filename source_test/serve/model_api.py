@@ -4,7 +4,7 @@ No endpoint or token is printed. `export` writes mode-600 client files for run_v
 The stable local gateway is optional; the Python client also discovers new URLs.
 """
 from __future__ import annotations
-import argparse,ast,base64,contextlib,fcntl,gzip,hashlib,hmac,http.server,importlib.util,io,json,os,secrets,shutil,sys,tarfile,tempfile,threading,time,uuid
+import argparse,ast,datetime,base64,contextlib,fcntl,gzip,hashlib,hmac,http.server,importlib.util,io,json,os,secrets,shutil,sys,tarfile,tempfile,threading,time,uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 import httpx
@@ -208,6 +208,7 @@ class ModelApiClient:
                 # Other active GPU jobs on the account; a state may allow up to max_account_sessions (default 1: none).
                 others=0;allowed=max(1,int(cfg.get('max_account_sessions',1)))
                 for kernel in kernels:
+                    if not kernel.ref:continue  # a listed entry without a reference has no session to count
                     try:value=api.kernels_status(kernel.ref)
                     except Exception as exc:
                         # Old drafts can be listed without any executable session.
@@ -233,13 +234,14 @@ class ModelApiClient:
                     if digest!=cfg['source_sha256']:raise ServiceUnavailable('existing service source changed outside this controller')
                 elif own is not None:
                     raise ServiceUnavailable('kernel exists without an ownership receipt')
-                if os.environ.get('DATAMATE_IGNORE_GPU_QUOTA')!='1':  # explicit operator opt-in: Kaggle itself stops the job when quota runs out
-                    with api.build_kaggle_client() as k:quota=k.kernels.kernels_api_client.get_accelerator_quota_statistics().gpu_quota
-                    if quota is None or quota.total_time_allowed is None or quota.time_used is None:
-                        raise ServiceUnavailable('GPU quota is not available')
-                    available=(quota.total_time_allowed-quota.time_used).total_seconds()
-                    if quota.time_reserved is not None:available-=quota.time_reserved.total_seconds()
-                    if available<cfg['session_seconds']+180:raise ServiceUnavailable('insufficient GPU quota for configured session')
+                with api.build_kaggle_client() as k:quota=k.kernels.kernels_api_client.get_accelerator_quota_statistics().gpu_quota
+                if quota is None or quota.total_time_allowed is None:
+                    raise ServiceUnavailable('GPU quota is not available')
+                # A new account reports no usage yet: that is zero used, not an unknown quota.
+                used=quota.time_used if quota.time_used is not None else datetime.timedelta(0)
+                available=(quota.total_time_allowed-used).total_seconds()
+                if quota.time_reserved is not None:available-=quota.time_reserved.total_seconds()
+                if available<cfg['session_seconds']+180:raise ServiceUnavailable('insufficient GPU quota for configured session')
                 cfg.update(instance_id=str(uuid.uuid4()),phase='starting',desired='running',endpoint=None,started_at=time.time())
                 program=self._program(cfg);cfg['source_sha256']=hashlib.sha256(program.rstrip().encode()).hexdigest();self._save(cfg)
                 with tempfile.TemporaryDirectory(prefix='dm_api_push_') as folder:

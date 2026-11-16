@@ -1,0 +1,14 @@
+# Build of the submit stage on top of the already built dependency image (python 3.11 + torch 2.9.1 cu128 +
+# transformers 5.23.0 + bitsandbytes 0.50.2, see requirements.txt and Dockerfile). Identical to the `submit` stage of Dockerfile;
+# only the base differs, so the dependency layers are not rebuilt under emulation.
+FROM datamate-runtime-deps:20261114 AS submit
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
+    TOKENIZERS_PARALLELISM=false PYTHONHASHSEED=42 NCCL_P2P_DISABLE=1 \
+    NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost OMP_NUM_THREADS=4 \
+    DATAMATE_AUDIT_LOG_DIR=/result/logs \
+    PYTHONPATH=/code/src
+WORKDIR /code/src
+COPY code/ /code/
+RUN chmod +x /code/predict.sh && cp /opt/requirements.lock.txt /code/requirements.lock.txt
+ENTRYPOINT []
+CMD ["bash", "/code/predict.sh"]

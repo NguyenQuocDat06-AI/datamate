@@ -15,3 +15,14 @@ __pycache__/
 source_test/data/
 source_test/artifacts/
 logs/
+
+# Generated Docker build context
+docker/build/
+
+# Datasets, gold, answers and traces
+*.sqlite
+*.sqlite3
+submission*.jsonl
+acceptance_ids.json
+accept*/
+source_test/artifacts/
