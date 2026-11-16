@@ -116,18 +116,20 @@ def test_customer_canonicalization_and_embedded_phone(workspace_tmp, rules):
 
     with closing(sqlite3.connect(context.database)) as db:
         dim_rows = dict(db.execute(f'SELECT ma_khach_hang, ten_khach_hang FROM "{cust_dim.name}"').fetchall())
-        assert dim_rows["C01"] == "Nguyễn Văn A"
-        assert dim_rows["C02"] == "Trần Thị B"
+        # Rulebook section 9: names are given as the data writes them, so the phone number stays in the name
+        # (the old behaviour cut it off, which no longer matched the reference answers of customer rankings).
+        assert dim_rows["C01"] == "Nguyễn Văn A (0901234567)"
+        assert dim_rows["C02"] == "Trần Thị B - 0912.345.678"
 
         sales_rows = db.execute(f'SELECT ma_don, ma_khach_hang, ten_khach_hang FROM "{sales_tbl.name}" ORDER BY ma_don').fetchall()
         row_map = {r[0]: (r[1], r[2]) for r in sales_rows}
-        assert row_map["O1"] == ("C01", "Nguyễn Văn A")
-        assert row_map["O2"] == ("C01", "Nguyễn Văn A")
-        assert row_map["O3"] == ("C02", "Trần Thị B")
+        assert row_map["O1"] == ("C01", "Nguyễn Văn A (0901234567)")
+        assert row_map["O2"] == ("C01", "Nguyễn Văn A (0901234567)")
+        assert row_map["O3"] == ("C02", "Trần Thị B - 0912.345.678")
 
         # Intra-customer unification without separate catalog
-        assert row_map["O4"] == ("C03", "Lê Văn C")
-        assert row_map["O5"] == ("C03", "Lê Văn C")
+        assert row_map["O4"] == ("C03", "Lê Văn C (0988888888)")
+        assert row_map["O5"] == ("C03", "Lê Văn C (0988888888)")
 
         # Distinct customer IDs with same name strictly preserved
         assert row_map["O6"] == ("C04", "Lê Văn C")
@@ -144,7 +146,8 @@ def test_customer_canonicalization_and_embedded_phone(workspace_tmp, rules):
         assert "Nguyễn Văn A - 0901234567" in raw_o1
 
     cname_col = next(c for c in sales_tbl.columns if c.semantic_role == "customer_name")
-    assert all("09" not in str(ex) for ex in cname_col.examples)
+    # Examples show the names as the data writes them, phone numbers included (rulebook section 9).
+    assert any("09" in str(ex) for ex in cname_col.examples)
 
 
 def test_status_from_notes_rulebook_governed(workspace_tmp):

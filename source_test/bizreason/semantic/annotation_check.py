@@ -6,6 +6,10 @@ shop's orders, a "base unit" column that holds the large units of a conversion t
 swaps a role when the values give strong evidence; any doubt keeps the annotation as it is. Every change is
 returned as a short dict (and build puts the list in report["annotation_fixes"]).
 
+A lone paid_amount column is never judged by order totals: a payment table of fully paid orders holds the same numbers
+as the totals, and the values cannot tell the two readings apart. Only a table with a second paid_amount column that
+does not look like order totals loses the total-like one.
+
 No table, column or value of any dataset is named here: the checks read structure (parse rates, shared keys,
 numeric ranges), and the role names are the annotation's own vocabulary.
 """
@@ -42,6 +46,21 @@ ORDER_SOURCE_KIND = "sales"
 # above this value and the units are confirmed as large (see _large_unit_evidence).
 LARGE_FACTOR_ABOVE = 1.0
 PLAIN_NUMBER = re.compile(r"\s*\d+(?:[.,]\d+)?\s*")
+# A real key to the orders spreads over the orders it names: its distinct values reach at least this share of
+# min(rows with a value, order ids known). A small-domain numeric column (a count of periods, a number of days) that
+# happens to match a few order ids reaches far less. Only a column with at most ORDER_KEY_SMALL_DOMAIN distinct values
+# is judged this way: a real key to a large shop's orders is never that small.
+ORDER_KEY_MIN_SPREAD = 0.1
+ORDER_KEY_SMALL_DOMAIN = 50
+# ... and each of its values sits on at least this many rows on average (a key to a few orders is not repeated so much).
+ORDER_KEY_MIN_REPEAT = 20
+# A paid_amount column whose value is at least the goods total of the joined order (within this relative margin) on
+# at least this share of its joined rows holds order totals, not payments; it is judged only with this many joined rows
+# and when at least this share of its rows joined an order.
+PAID_TOTAL_MARGIN = 0.005
+PAID_TOTAL_MIN_SHARE = 0.8
+PAID_TOTAL_MIN_JOINED = 5
+PAID_TOTAL_MIN_JOIN_SHARE = 0.5
 
 
 def _text(column: str | None) -> str:
@@ -135,6 +154,86 @@ def _large_unit_evidence(dst: sqlite3.Connection, table: TableMeta, unit_column:
     return None
 
 
+def _order_key_spread(dst: sqlite3.Connection, table: TableMeta, column: str,
+                      order_columns: list[tuple[TableMeta, str]]) -> tuple[float, int] | None:
+    """(distinct values / min(rows with a value, order ids known), distinct values, rows with a value) for a column
+    that should name orders, or None when it cannot be judged (no order ids, no values)."""
+    if not order_columns:
+        return None
+    rows, distinct = dst.execute(
+        f"SELECT COUNT({_text(column)}), COUNT(DISTINCT {_text(column)}) FROM source.{q(table.name)} AS src").fetchone()
+    union = " UNION ".join(
+        f"SELECT NULLIF(TRIM(CAST(k.{q(col)} AS TEXT)),'') AS v FROM source.{q(other.name)} AS k"
+        for other, col in order_columns)
+    known = dst.execute(f"SELECT COUNT(v) FROM ({union})").fetchone()[0]
+    denominator = min(rows, known)
+    return (distinct / denominator, distinct, rows) if denominator and distinct else None
+
+
+def join_key_verdict(dst: sqlite3.Connection, target: str, column: str, min_share: float) -> tuple[bool, str]:
+    """Whether a layer column (in table `target`, orders already loaded) is a key to orders.order_id, with the reason.
+
+    Needs both: at least min_share of its distinct values are order ids, and its values are spread like a key (see
+    ORDER_KEY_MIN_SPREAD): a small-domain numeric column that matches a few order ids is not a key."""
+    total, hits = dst.execute(
+        f"SELECT COUNT(__value), SUM(CASE WHEN __value IN (SELECT order_id FROM orders) THEN 1 ELSE 0 END) "
+        f"FROM (SELECT DISTINCT {q(column)} AS __value FROM {q(target)})").fetchone()
+    hits = hits or 0
+    if not total or hits < min_share * total:
+        return False, f"{hits} of {total} distinct values are order ids"
+    rows = dst.execute(f"SELECT COUNT({q(column)}) FROM {q(target)}").fetchone()[0]
+    orders = dst.execute("SELECT COUNT(DISTINCT order_id) FROM orders").fetchone()[0]
+    denominator = min(rows, orders)
+    if (total <= ORDER_KEY_SMALL_DOMAIN and denominator and total / denominator < ORDER_KEY_MIN_SPREAD
+            and rows >= ORDER_KEY_MIN_REPEAT * total):
+        return False, f"only {total} distinct values over {rows} rows and {orders} orders: not spread like a key"
+    return True, f"{hits} of {total} distinct values are order ids"
+
+
+def _order_goods_totals(dst: sqlite3.Connection, order_columns: list[tuple[TableMeta, str]],
+                        annotated: Annotated) -> dict[str, float]:
+    """Order id (trimmed text) to the sum of its sale lines' amounts, over the shop's sales tables."""
+    from bizreason.semantic import layer
+    totals: dict[str, float] = {}
+    by_name = {table.name: note for table, note in annotated}
+    for table, order_column in order_columns:
+        roles = layer.effective_roles(table, by_name[table.name], dst)
+        amount = roles.get("line_amount")
+        if not amount:
+            continue
+        locale = layer._column_locale(dst, table, amount)
+        parse = (lambda v: layer._number(v, locale)) if locale else layer.to_number
+        for order, cell in dst.execute(
+                f"SELECT {_text(order_column)}, {_text(amount)} FROM source.{q(table.name)} AS src"):
+            value = parse(cell) if cell is not None else None
+            if order is not None and value is not None:
+                totals[order] = totals.get(order, 0.0) + value
+    return totals
+
+
+def _order_total_evidence(dst: sqlite3.Connection, table: TableMeta, column: str, order_column: str,
+                          totals: dict[str, float]) -> str | None:
+    """Why the column holds order totals rather than payments (its value is at least the goods total of the order on
+    its row, on most rows), or None."""
+    from bizreason.semantic import layer
+    locale = layer._column_locale(dst, table, column)
+    parse = (lambda v: layer._number(v, locale)) if locale else layer.to_number
+    rows = dst.execute(f"SELECT {_text(order_column)}, {_text(column)} FROM source.{q(table.name)} AS src "
+                       f"WHERE {_text(column)} IS NOT NULL").fetchall()
+    joined = at_least = 0
+    for order, cell in rows:
+        value = parse(cell)
+        total = totals.get(order) if order is not None else None
+        if value is None or total is None or total <= 0:
+            continue
+        joined += 1
+        at_least += value >= total * (1 - PAID_TOTAL_MARGIN)
+    if (joined < PAID_TOTAL_MIN_JOINED or joined < PAID_TOTAL_MIN_JOIN_SHARE * len(rows)
+            or at_least < PAID_TOTAL_MIN_SHARE * joined):
+        return None
+    return f"{at_least} of {joined} joined rows are at least the goods total of their order"
+
+
 def _set_role(table: TableMeta, roles: dict[str, Any], column: str, old: str, new: str) -> dict[str, Any] | None:
     """The roles with the key that names column (same compact spelling) moved from old to new, or None when no
     key names it (then the annotation is left alone)."""
@@ -153,6 +252,7 @@ def check_annotations(dst: sqlite3.Connection, annotated: Annotated) -> tuple[An
     from bizreason.semantic import layer
     order_columns = _order_columns(dst, annotated)
     fixes: list[dict[str, Any]] = []
+    totals: dict[str, float] | None = None  # read on the first paid_amount column to judge
     result: Annotated = []
     for table, note in annotated:
         roles = note.get("roles") or {}
@@ -166,12 +266,19 @@ def check_annotations(dst: sqlite3.Connection, annotated: Annotated) -> tuple[An
                 judged = _parse_share(dst, table, column, role)
                 if judged is not None and judged[1] >= ROLE_MIN_CELLS and judged[0] < ROLE_MIN_PARSE_SHARE:
                     new_role, why = "other", f"only {judged[0]:.0%} of {judged[1]} cells parse as {role}"
-            elif role == "order_id" and note.get("kind") not in ORDER_LINKED_KINDS:
+            elif role == "order_id":
                 others = [pair for pair in order_columns if pair[0].name != table.name]
-                if others:
+                if note.get("kind") not in ORDER_LINKED_KINDS and others:
                     share = layer._matching_share(dst, table, column, others)
                     if share < ORDER_ID_MIN_SHARE:
                         new_role, why = "other", f"{share:.0%} of its values are order ids of the sales tables"
+                if new_role is None and note.get("kind") not in ORDER_LINKED_KINDS and others:
+                    spread = _order_key_spread(dst, table, column, others)
+                    if (spread and spread[1] <= ORDER_KEY_SMALL_DOMAIN and spread[0] < ORDER_KEY_MIN_SPREAD
+                            and spread[2] >= ORDER_KEY_MIN_REPEAT * spread[1]):
+                        new_role = "other"
+                        why = (f"{spread[1]} distinct values spread over {spread[0]:.1%} of the orders it could "
+                               f"name: a small-domain column, not an order key")
             elif role == "base_unit" and note.get("kind") == "unit_conversion":
                 factor = next((c for c, r in given.items() if r == "conversion_factor"), None)
                 product = next((c for c, r in given.items() if r in ("product_id", "product_name")), None)
@@ -179,6 +286,17 @@ def check_annotations(dst: sqlite3.Connection, annotated: Annotated) -> tuple[An
                     why = _large_unit_evidence(dst, table, column, factor, product, annotated)
                     if why:
                         new_role = "large_unit"
+            if new_role is None and role == "paid_amount":
+                if totals is None:
+                    totals = _order_goods_totals(dst, order_columns, annotated)
+                order_column = next((c for c, r in given.items() if r == "order_id"), None)
+                siblings = [c for c, r in given.items() if r == "paid_amount" and c != column]
+                if order_column and totals and siblings:  # a lone paid column is never judged: see module note
+                    evidence = {c: _order_total_evidence(dst, table, c, order_column, totals)
+                                for c in (column, *siblings)}
+                    # the column goes only while another paid column stays: the shop must keep some payment column
+                    if evidence[column] and not all(evidence[c] for c in siblings):
+                        new_role, why = "other", f"holds order totals, not payments: {evidence[column]}"
             if new_role is None:
                 continue
             changed = _set_role(table, updated, column, role, new_role)

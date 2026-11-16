@@ -34,6 +34,8 @@ COMPARE_MODES = ("percent", "value", "average_per_weekday")
 DEFAULT_COMPARE_AS = "percent"
 # Time concepts a model may put into filters; time is resolved from the time phrase, so these filters are dropped.
 TIME_FILTER_DIMS = ("date", "day", "month", "quarter", "year", "week", "time", "period", "range")
+# A model sometimes puts the place a question restricts customers to into a filter instead of the `location` key.
+LOCATION_FILTER_DIMS = ("location", "address", "area", "district", "street", "ward", "place")
 THRESHOLD_SUBJECTS = ("customer", "order", "product", "day")
 THRESHOLD_METRICS = ("order_count", "revenue", "qty")
 THRESHOLD_OPS = ("gte", "gt", "lte", "lt")
@@ -611,9 +613,20 @@ def _interpret(raw: Any, *, final: bool) -> Intent:
         compare_as = DEFAULT_COMPARE_AS
     column_filters = _column_filters(raw.get("column_filters"))
     moved: list[dict[str, Any]] = []
+    raw_filters = raw.get("filters")
+    location = _location(raw.get("location"))
+    if isinstance(raw_filters, list):
+        # A place given as a filter is the question's location, not an unknown dimension: the `location` key wins,
+        # else the first such filter is taken. An exclusion is a different question and is left to fail as before.
+        places = [item for item in raw_filters if isinstance(item, dict) and isinstance(item.get("dim"), str)
+                  and item["dim"].strip().lower() in LOCATION_FILTER_DIMS and item.get("exclude") is not True]
+        if places and location is None:
+            location = _location(places[0].get("value"))
+        if places and location is not None:
+            raw_filters = [item for item in raw_filters if item not in places]
     # A filter on a kept column can only be a column condition when something counts rows of that column.
     filters = _filters(
-        raw.get("filters"), moved, may_move=column_measure is not None or measure in _COLUMN_COUNT_MEASURES)
+        raw_filters, moved, may_move=column_measure is not None or measure in _COLUMN_COUNT_MEASURES)
     for item in moved:
         if item not in column_filters:
             column_filters.append(item)
@@ -629,7 +642,7 @@ def _interpret(raw: Any, *, final: bool) -> Intent:
         threshold=threshold,
         age_days=age_days,
         measure2=_measure2(raw.get("measure2")),
-        location=_location(raw.get("location")),
+        location=location,
         column_measure=column_measure,
         column_filters=column_filters,
     )
@@ -737,13 +750,53 @@ class IntentParser:
                     hint = exc.hint
                 else:
                     if threshold_grounded(intent, question):
-                        return ParsedIntent(intent=intent, reason="", attempts=attempts, raw=raw)
+                        gated, why = apply_measure_family_gate(question, intent)
+                        if gated is None:
+                            return ParsedIntent(intent=None, reason=why, attempts=attempts, raw=raw)
+                        return ParsedIntent(intent=gated, reason="", attempts=attempts, raw=raw)
                     # A threshold the question does not state would count a different population: retry, then
                     # give up rather than answer with it.
                     reason = "threshold value not stated in the question"
                     hint = _THRESHOLD_VALUE_HINT
             prompt = base_prompt + " " + hint + suffix
         return ParsedIntent(intent=None, reason=reason, attempts=attempts, raw=raw)
+
+
+def _has_phrase(text: str, cue: str) -> bool:
+    return re.search(r"(?<![a-z0-9])" + re.escape(cue) + r"(?![a-z0-9])", text) is not None
+
+
+def apply_measure_family_gate(question: str, intent: Intent) -> tuple[Intent | None, str]:
+    """Check that the measure belongs to the family of a cue in the question. Returns (intent, "") when consistent
+    or repaired by a single unambiguous reading, and (None, reason) when the question must not be answered."""
+    from dataclasses import replace
+    from bizreason.semantic.vocabulary import (
+        FAMILY_AMBIGUOUS_COUNT_WORDS, FAMILY_COUNT_ASK_WORDS, FAMILY_COUNT_ENTITY_WORDS, FAMILY_MONEY_WORDS, MEASURE_FAMILIES)
+    from bizreason.utils import normalize_lookup
+    text = normalize_lookup(question)
+    for name, family in MEASURE_FAMILIES.items():
+        if not any(_has_phrase(text, cue) for cue in family["cues"]):
+            continue
+        if any(_has_phrase(text, cue) for cue in family["veto"]):
+            continue
+        if family["money"] not in MEASURES or family["count"] not in MEASURES:
+            continue
+        if intent.measure in family["allowed"] or (intent.measure2 or "") in family["allowed"]:
+            continue
+        reason = f"measure inconsistent with the question's {name} cue"
+        if intent.shape != "scalar" or intent.group_by or intent.measure2 or intent.column_measure:
+            return None, reason
+        asks = "|".join(re.escape(w) for w in FAMILY_COUNT_ASK_WORDS)
+        entities = "|".join(re.escape(w) for w in FAMILY_COUNT_ENTITY_WORDS)
+        counts = re.search(rf"(?<![a-z0-9])(?:{asks}) (?:[a-z0-9]+ ){{0,2}}(?:{entities})(?![a-z0-9])", text) is not None
+        money = any(_has_phrase(text, w) for w in FAMILY_MONEY_WORDS)
+        other = any(_has_phrase(text, w) for w in FAMILY_AMBIGUOUS_COUNT_WORDS)
+        if money and not counts and not other:
+            return replace(intent, measure=family["money"]), ""
+        if counts and not money and not other:
+            return replace(intent, measure=family["count"]), ""
+        return None, reason
+    return intent, ""
 
 
 def intent_key(intent: Intent) -> tuple:

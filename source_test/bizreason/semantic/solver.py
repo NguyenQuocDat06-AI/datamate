@@ -28,19 +28,23 @@ from bizreason.utils import normalize_lookup
 POINT_IN_TIME = {
     "debt_outstanding", "debtor_count", "inventory_qty", "inventory_value", "out_of_stock_count",
     "expiry_lot", "expiring_lot_value",
+    "installment_outstanding", "installments_due_count", "overdue_amount", "overdue_debtor_count",
 }
 ORDER_MEASURES = {
     "no_sale_count", "orders_containing_product",
     "revenue", "order_count", "cancelled_count", "cancel_rate", "avg_per_order",
-    "qty_base_sold", "distinct_customers", "gross_profit",
+    "qty_base_sold", "distinct_customers", "gross_profit", "avg_price_per_unit", "avg_order_total_due",
 }
 # Which data-quality flags an intent depends on (see quality.py). Unlisted measures depend on none of them.
 QUANTITY_MEASURES = {
     "qty_base_sold", "gross_profit", "unit_sale_price_on_date", "no_sale_count",
-    "orders_containing_product", "unit_purchase_price",
+    "orders_containing_product", "unit_purchase_price", "avg_price_per_unit",
 }
 QUANTITY_FILTERS = {"unit", "size"}
-MONEY_MEASURES = {"revenue", "avg_per_order", "gross_profit", "purchase_amount", "order_total_due"} | DEBT_MEASURES
+MONEY_MEASURES = {
+    "revenue", "avg_per_order", "gross_profit", "purchase_amount", "order_total_due", "avg_price_per_unit",
+    "avg_order_total_due",
+} | DEBT_MEASURES
 ORDER_BASED_MEASURES = ORDER_MEASURES | DEBT_MEASURES
 FLAG_NAMES = (
     "qty_unreliable", "money_unreliable", "order_structure_broken", "status_unreliable", "payments_unlinked",

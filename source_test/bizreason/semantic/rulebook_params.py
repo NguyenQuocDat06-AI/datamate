@@ -25,6 +25,7 @@ DEFAULTS with taken == [], logs a warning and is never cached.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -39,6 +40,8 @@ from typing import Any, Protocol
 
 from bizreason.semantic.vocabulary import (
     DEBT_METHOD_TOKENS,
+    INSTALLMENT_TOPIC_CUES,
+    OVERDUE_TOPIC_CUES,
     NON_DEBT_METHOD_TOKENS,
     CANCELLED_STATUSES,
     RULEBOOK_CUES,
@@ -79,12 +82,16 @@ SYSTEM_PROMPT = """You read one section of a shop's business rulebook, written i
  "tet_start": {"lunar_month": <int>, "lunar_day": <int>, "year_offset": <int>},
  "tet_end": {"lunar_month": <int>, "lunar_day": <int>},
  "valid_sale_statuses": ["<canonical order status whose orders count as sales>", ...],
- "cancelled_statuses": ["<canonical order status of a cancelled order>", ...]
+ "cancelled_statuses": ["<canonical order status of a cancelled order>", ...],
+ "installment_counts_as_debt": <true | false | null>,
+ "overdue_due_day_counts_as_overdue": <true | false | null>
 }
 Rules:
 - shift_windows: the two shifts by order time, both ends inclusive, in HH:MM:SS. A shift 06:00-13:59 is ["06:00:00", "13:59:59"]. The shift word is the bare word the questions use for the shift, without the word "ca" (for example the word for morning, in the rulebook's spelling).
 - tet_start: the first day of the Tet window. 23 of lunar month 12 of the previous lunar year is {"lunar_month": 12, "lunar_day": 23, "year_offset": -1}. tet_end: the last day, inclusive, in the Tet lunar year; 10 of lunar month 1 is {"lunar_month": 1, "lunar_day": 10}.
 - valid_sale_statuses (orders that count as sales) and cancelled_statuses (cancelled orders) use only these English names: completed (order done), shipping (order being delivered), cancelled (order cancelled), returned (goods returned). A return is not a cancellation; valid_sale_statuses never has "cancelled".
+- installment_counts_as_debt: true when the rulebook says an instalment order is a debt order (unpaid instalments are money owed); false when it says they are not debt; null when not stated.
+- overdue_due_day_counts_as_overdue: an instalment due ON the asked day: true if the rulebook says it is overdue; false if only those due BEFORE the asked day are overdue; null if not stated.
 - Copy other names and wording from the rulebook. Do not translate, shorten or add words.
 - A field the section does not state is null. Never fill a field from general knowledge.
 """
@@ -113,6 +120,49 @@ class RulebookParams:
     # Definition sets of canonical order statuses (CANONICAL_ORDER_STATUSES), in that canonical order.
     valid_sale_statuses: tuple[str, ...]
     cancelled_statuses: tuple[str, ...]
+    # Conventions with no default: True, False, or None when the rulebook does not state them. A measure that depends
+    # on one (MEASURE_CONVENTIONS) gives no number while it is None.
+    installment_counts_as_debt: bool | None = None
+    overdue_due_day_counts_as_overdue: bool | None = None
+
+
+# Measure -> the conventions its answer depends on: (field, value the measure needs or None for "stated either way",
+# what the rulebook would have to define). A rulebook that does not state one makes the measure unanswerable, so
+# the answer is an abstain, never a convention carried over from another rulebook. A new gate is one more row.
+MEASURE_CONVENTIONS: dict[str, tuple[tuple[str, bool | None, str], ...]] = {
+    "installment_outstanding": (("installment_counts_as_debt", True, "that an instalment order is a debt order"),),
+    "installments_due_count": (("installment_counts_as_debt", True, "that an instalment order is a debt order"),),
+    "overdue_amount": (
+        ("installment_counts_as_debt", True, "that an instalment order is a debt order"),
+        ("overdue_due_day_counts_as_overdue", None, "whether an instalment due on the asked day is overdue"),
+    ),
+    "overdue_debtor_count": (
+        ("installment_counts_as_debt", True, "that an instalment order is a debt order"),
+        ("overdue_due_day_counts_as_overdue", None, "whether an instalment due on the asked day is overdue"),
+    ),
+}
+# Fields grounded in the rulebook text: the field is dropped to None unless the rulebook writes each group of cues.
+_FIELD_TOPICS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "installment_counts_as_debt": (INSTALLMENT_TOPIC_CUES,),
+    "overdue_due_day_counts_as_overdue": (INSTALLMENT_TOPIC_CUES, OVERDUE_TOPIC_CUES),
+}
+TRI_STATE_FIELDS = tuple(_FIELD_TOPICS)
+
+
+class RulebookGap(Exception):
+    """The rulebook does not define a convention that a measure needs."""
+
+
+def require(measure: str, params: RulebookParams | None = None) -> RulebookParams:
+    """The active parameters when every convention the measure needs is stated (and as it needs); else RulebookGap."""
+    params = _active if params is None else params
+    for field, needed, meaning in MEASURE_CONVENTIONS.get(measure, ()):
+        value = getattr(params, field)
+        if value is None:
+            raise RulebookGap(f"rulebook does not define {meaning}")
+        if needed is not None and value is not needed:
+            raise RulebookGap(f"rulebook does not say {meaning}")
+    return params
 
 
 DEFAULTS = RulebookParams(
@@ -363,9 +413,29 @@ def _extract(rulebook_text: str, model: _Model, timeout: float, *,
         errors = {}
         params, taken = _from_reply(reply, strict=False, errors=errors)
         stats["remaining_error_fields"] = list(errors)
+    params, taken = _ground(params, taken, rulebook_text)
     if errors:
         return finish(params, taken, False, "invalid_parameters")
     return finish(params, taken, True, "validated" if taken else "unstated")
+
+
+def _ground(params: RulebookParams, taken: list[str], rulebook_text: str) -> tuple[RulebookParams, list[str]]:
+    """Drop a tri-state convention to None unless the rulebook writes the topic (every group of cue words)."""
+    padded = f" {normalize_lookup(rulebook_text)} "
+    drop = {field for field, groups in _FIELD_TOPICS.items() if getattr(params, field) is not None
+            and not all(any(f" {normalize_lookup(cue)} " in padded for cue in group) for group in groups)}
+    if not drop:
+        return params, taken
+    log.warning("rulebook conventions %s are not grounded in the rulebook text; treated as not stated", sorted(drop))
+    return (dataclasses.replace(params, **{field: None for field in drop}),
+            [name for name in taken if name not in drop])
+
+
+def _tri_state(reply: dict[str, Any], name: str) -> bool | None:
+    value = reply.get(name)
+    if value is not None and not isinstance(value, bool):
+        raise _Invalid("must be true, false or null")
+    return value
 
 
 def _from_reply(reply: dict[str, Any], *, strict: bool,
@@ -418,6 +488,21 @@ def _from_reply(reply: dict[str, Any], *, strict: bool,
         ("cancelled_statuses",), lambda: (_statuses(reply["cancelled_statuses"], forbidden=valid[0]),),
         (DEFAULTS.cancelled_statuses,),
     )
+    # Tri-state conventions have no default: a missing, null or unusable value is "not stated" (None), which makes the
+    # measures that depend on it abstain.
+    tri: dict[str, bool | None] = {}
+    for name in TRI_STATE_FIELDS:
+        try:
+            tri[name] = _tri_state(reply, name)
+        except _Invalid as exc:
+            if strict:
+                raise
+            if errors is not None:
+                errors[name] = str(exc)
+            log.warning("rulebook parameter %s is not usable (%s); treated as not stated", name, exc)
+            tri[name] = None
+        if tri[name] is not None:
+            taken.append(name)
     # Word lists are unions with the defaults: a rulebook adds the words it names but never removes a default
     # word, because rulebooks name examples ("COD", "sàn TMĐT") rather than exhaustive lists.
     params = RulebookParams(
@@ -432,6 +517,7 @@ def _from_reply(reply: dict[str, Any], *, strict: bool,
         tet_end=tet[1],
         valid_sale_statuses=valid[0],
         cancelled_statuses=cancelled[0],
+        **tri,
     )
     return params, taken
 
@@ -555,6 +641,7 @@ def _to_reply(params: RulebookParams) -> dict[str, Any]:
         "tet_end": {"lunar_month": params.tet_end[0], "lunar_day": params.tet_end[1]},
         "valid_sale_statuses": list(params.valid_sale_statuses),
         "cancelled_statuses": list(params.cancelled_statuses),
+        **{name: getattr(params, name) for name in TRI_STATE_FIELDS},
     }
 
 

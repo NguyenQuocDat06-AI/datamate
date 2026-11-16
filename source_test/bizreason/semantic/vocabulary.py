@@ -21,8 +21,12 @@ MEASURES: dict[str, str] = {
     "gross_profit": "revenue minus cost of goods sold",
     "net_profit": "gross profit minus all expenses of the month",
     "expense_amount": "money in the expense ledger",
-    "debt_outstanding": "money still owed at the end of a day",
+    "debt_outstanding": "money still owed at the end of a day, credit sales and instalment plans alike, instalments not yet due included",
     "debtor_count": "number of customers still owing at the end of a day",
+    "installment_outstanding": "money still owed on instalment plans only at the end of a day, instalments not yet due included",
+    "installments_due_count": "number of instalments whose due day has arrived by a day, one due on that day included, whether paid or not",
+    "overdue_amount": "money of instalments due before a day and not yet paid (only instalments already past due)",
+    "overdue_debtor_count": "number of customers with an instalment due before a day that is still unpaid",
     "debt_new": "credit added in a period: unpaid part on the purchase day",
     "debt_repaid": "money repaid in a period, after the purchase day",
     "debt_age_bucket": "outstanding debt split by age in days since the order date",
@@ -38,6 +42,8 @@ MEASURES: dict[str, str] = {
     "warranty_rate": "warranty claims divided by paid tickets or units sold",
     "delivery_trip_count": "number of delivery trips",
     "new_member_count": "customers who registered in a period",
+    "avg_price_per_unit": "money sold divided by the base units sold: the average selling price of one unit",
+    "avg_order_total_due": "average, over orders, of the total the customer must pay for the whole order",
     "outside": "none of the above, or the concept is not defined",
 }
 
@@ -76,6 +82,7 @@ DIMENSIONS: dict[str, str] = {
     "hour": "an hour of the day",
     "service_item": "a kind of repair work",
     "vehicle": "a vehicle or plate",
+    "device_line": "a device model line: the product name before its storage capacity",
 }
 
 # Dimensions whose filter value is copied from the question text, so the value must be found in the question.
@@ -94,6 +101,19 @@ CANCEL_TOKENS = ("huy", "cancel")
 # (cash on delivery, marketplace sales). Compared after lookup normalization, as whole words.
 DEBT_METHOD_TOKENS = ("ghi no", "debt")
 NON_DEBT_METHOD_TOKENS = ("cod", "giao hang thu tien", "san", "marketplace", "tmdt")
+# Free-text debt notes on an order (accent-free lower case, whole words). PAID: the debt is settled (read as nothing
+# owed); OWES_ALL: the whole order is owed; OWES: an amount still owed follows the word, or, with no amount, the rest
+# of the order is owed; PRE_PAID: an amount already handed over follows.
+DEBT_NOTE_PAID = ("da tra du", "tra du", "ck du", "chuyen khoan du", "da thanh toan", "da tat toan", "het no",
+                  "tra het", "da tra het", "tra xong", "da tra xong", "tra day du")
+DEBT_NOTE_OWES_ALL = ("no ca don", "no het don", "no toan bo", "chua tra gi", "chua thanh toan")
+DEBT_NOTE_OWES = ("ghi no", "ghi so", "con no", "con thieu", "con lai", "thieu lai", "thieu", "chua tra", "no")
+DEBT_NOTE_PRE_PAID = ("dua truoc", "tra truoc", "khach dua", "da dua", "dat coc", "da tra", "ck", "chuyen khoan", "tra")
+# Words after a number that give its size, accent-free: a thousand, a million.
+MONEY_THOUSAND_WORDS = ("k", "nghin", "ngan")
+MONEY_MILLION_WORDS = ("tr", "trieu")
+# A phrase that makes a wording an example, not a rule of the shop (README conversions and notes).
+EXAMPLE_CUES = ("vd", "v.d", "vi du", "chang han", "e.g", "eg", "example", "for example")
 # Rulebook §1 and §4: the payment methods a shop's wording is mapped onto. The only fixed category list; the
 # keys are English and the definitions say what each method means for a sale.
 PAYMENT_CANONICAL: dict[str, str] = {
@@ -146,7 +166,13 @@ RULEBOOK_CUES: dict[str, tuple[str, ...]] = {
     "tet": ("tết", "âm lịch", "chạp", "giêng", "mùng"),
     # Rulebook §1 definitions of a sale, a cancelled order and a return, with the canonical status names.
     "order_status": ("đơn có trạng thái huỷ", "đơn trả hàng", "đang giao", "cancelled", "returned", "shipping"),
+    # Rulebook §4 instalments: whether an instalment order is a debt order and when an instalment is overdue.
+    "installment": ("trả góp", "kỳ góp", "quá hạn", "installment", "installments", "overdue"),
 }
+# A convention is read from the rulebook only when it writes the topic at all (a deterministic check against a model
+# that reports a rule from general knowledge). Each field needs every group to be present (one cue of each group).
+INSTALLMENT_TOPIC_CUES = ("trả góp", "kỳ góp", "installment", "installments")
+OVERDUE_TOPIC_CUES = ("quá hạn", "overdue")
 # Rulebook §5 stock in large units: a question that asks for whole large units and loose base units gets the list
 # [whole large units, loose base units]. Whole-word cues after normalize_lookup: one for "whole" and one for "loose".
 LARGE_UNIT_WHOLE_CUES = ("chan", "nguyen")
@@ -232,6 +258,27 @@ RULE_TICKET_VISITS = ("luot xe",)
 RULE_DEVICE_LINE = ("dong may",)
 RULE_DELIVERY_TRIPS = ("dot", "giao")
 
+# Rulebook sentences a measure's meaning rests on. The measure answers only when the active rulebook writes one of
+# the alternatives (each a tuple of accent-free phrases that must all appear); a rulebook that does not define it
+# makes the question unanswerable by this measure (abstain), never a meaning carried over from another rulebook.
+# No rulebook text at all (unit tests) leaves a measure open, as rulebook_params.mentions does.
+MEASURE_RULE_CUES: dict[str, tuple[tuple[str, ...], ...]] = {
+    # a new member is a customer whose registration date falls in the period
+    "new_member_count": (("thanh vien moi", "dang ky"),),
+    # the total of a whole order: what the customer must pay for it
+    "avg_order_total_due": (("tong don",), ("khach phai tra",)),
+}
+# Storage capacity inside a product name ("128GB", "1 TB"), case-insensitive. A device line is the name before it.
+DEVICE_CAPACITY_RE = r"\s*\b\d+(?:[.,]\d+)?\s*(?:gb|tb)\b"
+# Share of the distinct names of a product kind that carry a capacity for the kind to count as devices.
+DEVICE_KIND_MIN_SHARE = 0.5
+# Gender wording a question uses for customers, accent-free after normalize_lookup, and the header wording of a
+# column that records it (as it does for an address with ADDRESS_HEADER_TOKENS).
+GENDER_VALUE_WORDS = ("nam", "nu", "male", "female")
+GENDER_HEADER_TOKENS = ("gioi tinh", "gender", "sex")
+# Header wording of a column that records when a customer registered.
+REGISTRATION_HEADER_TOKENS = ("dang ky", "tham gia", "registered", "registration", "join")
+
 # Explicit definitional prose connectors, independent of document heading depth.
 DEFINITION_PROSE_CONNECTORS = ("is defined as", "means", "is", "là", "được định nghĩa là")
 
@@ -248,3 +295,26 @@ POPULATION_POSITIVE_RE = (
 POPULATION_ALL_RE = r"\b(?:all|every|tất cả|mọi) {entities}\b"
 POPULATION_INCLUDE_RE = r"\b(?:including|include|kể cả|bao gồm cả) (?P<values>{values}) {entities}\b"
 POPULATION_CONNECTOR_RE = r"(?: or | hoặc | hay )"
+
+
+# Measure families: a question that carries a cue of a family must get a measure of that family, otherwise the model
+# read the wrong concept and the number would belong to another question. Cues are accent-free, whole words after
+# normalize_lookup. `veto` cues move the question out of the family (an overdue lot is not an overdue instalment).
+# `allowed` are the measures that can answer such a question; `money` and `count` are the measures a plain
+# "how much money" or "how many customers" question maps to when the model chose a measure outside the family.
+MEASURE_FAMILIES: dict[str, dict] = {
+    "overdue": {
+        "cues": ("qua han", "tre han", "cham gop", "cham tra gop", "tre gop", "no xau", "overdue", "past due"),
+        "veto": ("han su dung", "hsd", "expiry", "expire", "expired", "lo hang"),
+        "allowed": frozenset({"overdue_amount", "overdue_debtor_count", "debt_age_bucket", "outside"}),
+        "money": "overdue_amount",
+        "count": "overdue_debtor_count",
+    },
+}
+# Wording that asks for a count of customers, wording that asks for money, and counts of other things; used only to
+# repair the measure when exactly one reading remains.
+FAMILY_COUNT_ENTITY_WORDS = ("khach", "nguoi", "ho", "customer", "customers", "debtor", "debtors")
+FAMILY_MONEY_WORDS = ("tien", "money", "amount")
+FAMILY_AMBIGUOUS_COUNT_WORDS = ("don", "hoa don", "order", "orders")
+# Words that ask for a count, accent-free; a customer count is one of them followed within two words by an entity word.
+FAMILY_COUNT_ASK_WORDS = ("bao nhieu", "bnhiu", "may", "so", "so luong", "tong so", "how many", "number of")

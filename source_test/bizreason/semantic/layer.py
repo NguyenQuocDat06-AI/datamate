@@ -13,13 +13,15 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from bizreason.contracts import BusinessContext, TableMeta
+from bizreason.data.identities import unify_phone_spellings
 from bizreason.data.notes_facets import classify_note_status
 from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
-from bizreason.semantic import annotation_check, rulebook_params, stock_sources
+from bizreason.semantic import annotation_check, debt_sources, obligations, rulebook_params, stock_sources
 from bizreason.semantic.vocabulary import (
     ADDRESS_HEADER_TOKENS,
     CANCEL_TOKENS,
     CURRENCY_SUFFIXES,
+    EXAMPLE_CUES,
     INGESTION_ROLES,
 )
 from bizreason.data.vocabulary import (
@@ -129,6 +131,17 @@ CODE_MAX_LENGTH = 24
 CODE_MIN_DIGITS = 10  # a digit string this long is an identifier, not an amount
 JOIN_MIN_SHARE = 0.5  # share of a column's distinct values that must be order ids for it to join orders
 CATALOG_SAMPLES = 8
+# Order-level adjustments and the order total (see _derive_order_totals).
+ORDER_LEVEL_MIN_ORDERS = 10  # multi-line orders with a discount needed to read a line column as an order discount
+ORDER_LEVEL_SHARE = 0.95  # share of those orders whose lines all repeat one value
+AMOUNT_TOLERANCE = 1  # two money amounts within this many units are equal
+TOTAL_AGREE_SHARE = 0.9  # share of orders whose derived total must match paid plus outstanding, where both exist
+# Ledger payments (see _load_ledger_payments).
+LEDGER_KEY_SHARE = 0.95  # share of a ledger's keyed rows that must resolve to exactly one order
+LEDGER_PRICE_SHARE = 0.9  # a paid column equal to the order total this often is the order price, not payments
+LEDGER_LATER_SHARE = 0.5  # share of rows dated after their order for a ledger date to read as a payment date
+KEY_NUMBER = re.compile(r"\d+")
+TRAILING_DIGITS = re.compile(r"(\d+)\s*$")
 CATALOG_TARGETS = ("raw_lines", "lines", "orders", "purchases", "payments", "deliveries")
 # The roles each loader reads, so that every other column of its table is carried
 LINE_READ_ROLES = tuple(dict.fromkeys([
@@ -903,8 +916,10 @@ def _load_product_facts(dst: sqlite3.Connection, table: TableMeta, roles: dict[s
     conversion table."""
     if not (roles.get("product_id") or roles.get("product_name")):
         return
-    if not roles.get("base_unit") and roles.get("unit") and not roles.get("conversion_factor"):
-        # A product list with one unit column and no conversion: that unit is the unit the product is counted in.
+    if not roles.get("base_unit") and roles.get("unit") and (
+            not roles.get("conversion_factor") or _text_factor_column(dst, table, roles)):
+        # A product list with one unit column and no conversion (or whose conversion cells are statements such as
+        # "1 <large> = <n> <unit>"): that unit is the unit the product is counted in.
         roles = {**roles, "base_unit": roles["unit"]}
     if not (roles.get("product_category") or roles.get("base_unit") or roles.get("catalog_cost")):
         return
@@ -1040,6 +1055,81 @@ def _load_unit_factors(dst: sqlite3.Connection, table: TableMeta, roles: dict[st
             if factor is not None:
                 inserts.append((pid, name_key, row.unit, factor))
     dst.executemany("INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) VALUES (?,?,?,?)", inserts)
+
+
+def _row_factor_statements(cell: Any) -> list[tuple[str, float, str]]:
+    """The (large unit, count, small unit) statements of one catalog conversion cell, units normalized."""
+    if not isinstance(cell, str):
+        return []
+    found = []
+    for match in ROW_FACTOR_STATEMENT.finditer(cell):
+        large, small = normalize_lookup(match.group("large")), normalize_lookup(match.group("small"))
+        if (not large or not small or large == small or {large, small} & UNIT_NON_QUANTITY_WORDS
+                or _GROUPED_THOUSANDS.match(match.group("n"))):
+            continue
+        count = float(match.group("n").replace(",", "."))
+        if count > 0:
+            found.append((large, count, small))
+    return found
+
+
+def _text_factor_column(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> bool:
+    """True when the table's conversion column holds statements of the shape "1 <unit> = <n> <unit>" (or nothing at
+    all): the table's unit column is then the unit each product is counted in, the statements go from larger units to
+    it. A column of plain numbers says nothing of the kind."""
+    column = roles.get("conversion_factor")
+    if not column:
+        return False
+    try:
+        cells = dst.execute(f"SELECT {_text(column)} FROM source.{q(table.name)} AS src").fetchall()
+    except sqlite3.Error:
+        return False
+    filled = [cell[0] for cell in cells if cell[0] is not None]
+    return not filled or any(_row_factor_statements(cell) for cell in filled)
+
+
+def _load_text_row_factors(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str]) -> int:
+    """Conversions a catalog states per row, in a text cell "1 <large> = <n> <unit>[; ...]" (rulebook: the factor
+    belongs to the product of the row). The unit the count is in must be the row's own base unit (the unit column) or
+    another unit the same cell converts; a statement that ends in any other unit is left out. Returns factors added."""
+    if roles.get("large_unit") or not roles.get("conversion_factor"):
+        return 0
+    if not (roles.get("product_id") or roles.get("product_name")):
+        return 0
+    base_column = roles.get("base_unit") or roles.get("unit")
+    if not base_column:
+        return 0
+    added = 0
+    inserts: list[tuple[str | None, str | None, str, float]] = []
+    for pid, name, base, cell in dst.execute(
+            f"SELECT {_text(roles.get('product_id'))}, {_text(roles.get('product_name'))}, {_text(base_column)}, "
+            f"{_text(roles['conversion_factor'])} FROM source.{q(table.name)} AS src"):
+        statements = _row_factor_statements(cell)
+        base_key = normalize_lookup(base) if base else ""
+        name_key = normalize_lookup(name) if name else None
+        if not statements or not base_key or not (pid or name_key):
+            continue
+        counts: dict[str, list[tuple[float, str]]] = {}
+        for large, count, small in statements:
+            counts.setdefault(large, []).append((count, small))
+
+        def resolve(unit: str, seen: tuple[str, ...]) -> float | None:
+            if unit == base_key:
+                return 1.0
+            options = counts.get(unit)
+            if not options or unit in seen:
+                return None
+            values = {count * inner for count, small in options
+                      if (inner := resolve(small, (*seen, unit))) is not None}
+            return values.pop() if len(values) == 1 else None
+
+        for large in counts:
+            factor = resolve(large, ())
+            if factor is not None and factor > 0 and large != base_key:
+                inserts.append((pid, name_key, large, factor))
+                added += 1
+    dst.executemany("INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) VALUES (?,?,?,?)", inserts)
+    return added
 
 
 def _load_stock_table(dst: sqlite3.Connection, table: TableMeta, note: dict[str, Any], roles: dict[str, str]) -> int:
@@ -1515,6 +1605,12 @@ _UNIT_STATEMENTS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
 ))
 _GROUPED_THOUSANDS = re.compile(r"^\d{1,3}(?:[.,]\d{3})+$")
 
+# One conversion a catalog cell states for its own row: "1 <large unit> = <n> <unit>"; a cell may hold several,
+# separated by ";", "," or a line break. The units are words, the count a plain number.
+ROW_FACTOR_STATEMENT = re.compile(
+    rf"(?<![\d.,])1\s*(?P<large>{_UNIT_WORD})\s*(?:{_UNIT_LINK})\s*(?P<n>{_UNIT_COUNT})\s*(?P<small>{_UNIT_WORD})",
+    re.IGNORECASE)
+
 
 def _unit_statements(text: str) -> list[tuple[str, str, float, str]]:
     """Conversions written in words: (line, large unit, factor, base unit) for each, in order. A statement whose units
@@ -1535,13 +1631,33 @@ def _unit_statements(text: str) -> list[tuple[str, str, float, str]]:
     return found
 
 
-def _load_text_unit_factors(dst: sqlite3.Connection, text: str) -> int:
+_COLUMN_DESCRIPTION = re.compile(r"^\s*(?:[-*+]\s*)?\*\*(?P<header>[^*]+)\*\*\s*:")
+
+
+def _is_example_line(line: str) -> bool:
+    """A line that gives its conversion as an example ("vd 1 thùng = 4 bịch"): a sample of the cell's shape, not a
+    rule of the shop."""
+    padded = " " + re.sub(r"[^a-z0-9]+", " ", normalize_lookup(line)) + " "
+    return any(f" {re.sub('[^a-z0-9]+', ' ', normalize_lookup(cue)).strip()} " in padded for cue in EXAMPLE_CUES)
+
+
+def _is_column_description(line: str, headers: frozenset[str]) -> bool:
+    """A README line that describes one column of the data ("- **Quy đổi**: ..."): what it says about a unit
+    conversion is the shape of that column's cells, and each row carries its own factor."""
+    match = _COLUMN_DESCRIPTION.match(line)
+    return bool(match and normalize_lookup(match.group("header")) in headers)
+
+
+def _load_text_unit_factors(dst: sqlite3.Connection, text: str, headers: frozenset[str] = frozenset()) -> int:
     """Unit conversions a text (shop README or rulebook) states in words. A statement naming sold products gives them
     the factor; one naming none gives it to every product sold by the large unit whose base unit is the small unit or
     unknown (a product with another base unit is left alone). A factor the shop already has for a product and large
     unit stays; two statements of this text that disagree for one (product, large unit) give nothing. Returns the
-    number of (product, unit) factors added."""
-    statements = _unit_statements(text)
+    number of (product, unit) factors added. An example line and a line describing a column (`headers`, normalized
+    source headers) state no rule of the shop. A product whose catalog gives its unit keeps it: the text never
+    assigns a base unit to it."""
+    statements = [item for item in _unit_statements(text)
+                  if not _is_example_line(item[0]) and not _is_column_description(item[0], headers)]
     if not statements:
         return 0
     sold: dict[str, set[str]] = {}
@@ -1599,15 +1715,16 @@ def _load_text_unit_factors(dst: sqlite3.Connection, text: str) -> int:
         dst.executemany(
             "INSERT INTO temp.unit_factors (product_id, name_key, large_key, factor) VALUES (NULL,?,?,?)",
             [(key, large, factor), (key, base, 1.0)])
-        dst.execute("INSERT INTO temp.product_facts (product_id, name_key, category, base_unit, unit_cost) "
-                    "VALUES (NULL,?,NULL,?,NULL)", (key, base_word))
+        if known_base(key) is None:
+            dst.execute("INSERT INTO temp.product_facts (product_id, name_key, category, base_unit, unit_cost) "
+                        "VALUES (NULL,?,NULL,?,NULL)", (key, base_word))
         added += 1
     return added
 
 
-def _load_readme_unit_factors(dst: sqlite3.Connection, readme: str) -> int:
+def _load_readme_unit_factors(dst: sqlite3.Connection, readme: str, headers: frozenset[str] = frozenset()) -> int:
     """Unit conversions the shop README states in words ("… bán theo bó, 1 bó = 10 cây"). Returns the factors added."""
-    return _load_text_unit_factors(dst, readme)
+    return _load_text_unit_factors(dst, readme, headers)
 
 
 def _derive_qty_base(dst: sqlite3.Connection) -> int:
@@ -2059,7 +2176,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     dst.executemany("INSERT INTO model_failures VALUES (?,?,?)", [_failure_row(item) for item in model_failures or []])
     stats: Counter[str] = Counter({key: 0 for key in BUILD_STAT_KEYS})
     report: dict[str, Any] = {
-        "sales_tables": 0, "service_tables": 0, "purchase_tables": 0, "return_tables": 0, "unannotated": [],
+        "sales_tables": 0, "service_tables": 0, "service_event_rows": 0, "purchase_tables": 0, "return_tables": 0, "unannotated": [],
         "duplicate_lines_removed": 0, "columns_with_locale_inferred": 0, "tickets_defaulted_completed": 0,
         "qty_base_derived": 0, "extra_columns": 0, "extra_numbers_not_scaled": [], "src_tables": [],
         "join_keys": [], "catalog_rows": 0,
@@ -2124,7 +2241,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             _load_sales(dst, table, roles, synthetic, 1 if product else 0, report, stats, scale=scale,
                         combined=combined, carried=carried)
             report["sales_tables"] += 1
-        elif note["kind"] == "service_ticket":
+        elif note["kind"] == "service_ticket" and _ticket_has_money(roles):
             # one row per visit: the ticket is the order, its amount is the line, the work done is the product
             ticket = {role: column for role, column in roles.items() if role != "order_id"}
             if roles.get("ticket_id"):
@@ -2144,6 +2261,9 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
             if status_defaulted:
                 report["tickets_defaulted_completed"] += rows
             report["service_tables"] += 1
+        elif note["kind"] == "service_ticket":
+            # a visit log with no money column: its rows are events (a warranty or reception book), never orders
+            report["service_event_rows"] += _load_service_events(dst, table, roles, synthetic, report, stats, scale)
         elif note["kind"] == "purchase" and (roles.get("purchase_id") or roles.get("purchased_at")):
             carried = _extras_for(dst, table, given, _consumed(roles, PURCHASE_READ_ROLES), "purchases", scale,
                                   report, carry_log)
@@ -2168,6 +2288,7 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
         elif note["kind"] in ("product_catalog", "unit_conversion"):
             _load_product_facts(dst, table, roles)
             _load_unit_factors(dst, table, roles)
+            _load_text_row_factors(dst, table, roles)
         elif note["kind"] == "alias":
             _load_aliases(dst, table, roles)
         elif note["kind"] == "employee_catalog":
@@ -2189,11 +2310,16 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
     report["alias_lines_resolved"] = _resolve_aliases(dst)
     report["non_product_lines"] = _classify_lines(dst, pairs)
     report["status_mapped"] = _map_status(dst, status_map or {}, stats)
-    report["readme_unit_factors"] = _load_readme_unit_factors(dst, context.readme)
+    headers = frozenset(normalize_lookup(c.original_name) for t in context.tables for c in t.columns)
+    report["readme_unit_factors"] = _load_readme_unit_factors(dst, context.readme, headers)
     report["convention_unit_factors"] = _apply_unit_conventions(dst, conventions or [])
-    report["rulebook_unit_factors"] = _load_text_unit_factors(dst, rulebook_params.rulebook_raw_text() or "")
+    report["rulebook_unit_factors"] = _load_text_unit_factors(dst, rulebook_params.rulebook_raw_text() or "", headers)
     report["qty_base_derived"] = _derive_qty_base(dst)
-    _derive(dst)
+    # the annotation's roles, not the header lookup, decide which column names the customer: spellings of one phone
+    # number ("Name 0353 838 285", "Name (0353838285)") are one customer before the order's key is taken from the name
+    report["phone_spellings_unified"] = unify_phone_spellings(dst, [("raw_lines", "customer_name", "customer_id")])
+    derived_columns = _derive(dst, report)
+    report["ledger_payments"] = _load_ledger_payments(dst, context, annotated, report)
     report["ledger_built"] = _build_ledger(dst)
     report["stock_rows"] = _build_stock(dst)
     if not report["stock_rows"]:
@@ -2216,6 +2342,8 @@ def build(context: BusinessContext, records: list[dict[str, Any]], path: Path,
                 report["src_tables"].append(copied)
     report["extra_columns"] = sum(len(carried) for target, carried in carry_log if not target.startswith("src_"))
     report["join_keys"], report["catalog_rows"] = _write_column_catalog(dst, carry_log)
+    _register_derived(dst, derived_columns)
+    report["obligations"] = obligations.build(dst)  # debts and instalments of a side ledger (see obligations.py)
     report["catalog_attributes"] = _attach_catalog_attributes(dst, annotated)
     _write_shop_facts(dst, context)
     report["conventions_applied"] = _apply_data_conventions(dst, conventions or [])
@@ -2246,7 +2374,39 @@ def _layer_loads(kind: str, roles: dict[str, str]) -> bool:
         return bool(roles.get("order_id") or roles.get("paid_at"))
     if kind == "delivery":
         return bool(roles.get("order_id") or roles.get("delivered_at"))
+    if kind == "service_ticket":
+        return _ticket_has_money(roles)
     return kind in LAYER_KINDS
+
+
+def _load_service_events(dst: sqlite3.Connection, table: TableMeta, roles: dict[str, str], synthetic: str,
+                         report: dict[str, Any], stats: Counter, scale: int) -> int:
+    """Rows of a service log with no amount, kept apart from sales in service_events (event_id, date, status,
+    customer_name, item). They are read with the same date, status and name rules as any ticket, then moved out of
+    raw_lines so that no order, line or per-order figure counts them. Returns the rows kept."""
+    dst.execute("CREATE TABLE IF NOT EXISTS service_events (event_id, date, status, customer_name, item, source_table)")
+    ticket = {role: column for role, column in roles.items() if role != "order_id"}
+    if roles.get("ticket_id"):
+        ticket["order_id"] = roles["ticket_id"]
+    if roles.get("service_item"):
+        ticket["product_name"] = roles["service_item"]
+    start = dst.execute("SELECT COALESCE(MAX(rowid), 0) FROM raw_lines").fetchone()[0]
+    status_defaulted = "order_status" not in ticket and not (ticket.get("order_note") or ticket.get("note"))
+    _load_lines(dst, table, ticket, synthetic, 1, report, stats,
+                defaults={"status": "completed"} if status_defaulted else None, scale=scale)
+    dst.execute(
+        "INSERT INTO service_events SELECT order_id, date, status, customer_name, product_name, ? "
+        "FROM raw_lines WHERE rowid > ?", (table.name, start))
+    kept = dst.execute("SELECT changes()").fetchone()[0]
+    dst.execute("DELETE FROM raw_lines WHERE rowid > ?", (start,))
+    return kept
+
+
+def _ticket_has_money(roles: dict[str, str]) -> bool:
+    """A service ticket becomes an order only when the table records an amount. A ledger of visits with no money
+    column (a warranty or reception log) is an event record, not sales: turning each row into an order with a NULL
+    amount would add phantom orders that dilute every per-order average and count. Such a table stays a source."""
+    return bool(roles.get("ticket_amount") or roles.get("line_amount"))
 
 
 def _carry_order_columns(dst: sqlite3.Connection) -> None:
@@ -2287,12 +2447,11 @@ def _copy_unloaded(dst: sqlite3.Connection, table: TableMeta, note: dict[str, An
 
 
 def _join_key(dst: sqlite3.Connection, target: str, column: str) -> str | None:
-    """orders.order_id when at least JOIN_MIN_SHARE of the column's distinct values are order ids."""
-    total, hits = dst.execute(
-        f"SELECT COUNT(__value), SUM(CASE WHEN __value IN (SELECT order_id FROM orders) THEN 1 ELSE 0 END) "
-        f"FROM (SELECT DISTINCT {q(column)} AS __value FROM {q(target)})"
-    ).fetchone()
-    return "orders.order_id" if total and (hits or 0) >= JOIN_MIN_SHARE * total else None
+    """orders.order_id when at least JOIN_MIN_SHARE of the column's distinct values are order ids and the values are
+    spread like a key (a small-domain numeric column that matches a few order ids is not one)."""
+    from bizreason.semantic import annotation_check
+    is_key, _reason = annotation_check.join_key_verdict(dst, target, column, JOIN_MIN_SHARE)
+    return "orders.order_id" if is_key else None
 
 
 def _catalog_row(dst: sqlite3.Connection, target: str, column: str, c: Carried, value_type: str,
@@ -2312,7 +2471,8 @@ def _write_column_catalog(dst: sqlite3.Connection, carry_log: list[tuple[str, li
     values are order ids). Returns the join keys found and the number of rows."""
     dst.execute(
         "CREATE TABLE column_catalog (table_name TEXT, column_name TEXT, source_table TEXT, source_header TEXT, "
-        "role TEXT, value_type TEXT, distinct_count INTEGER, sample_values TEXT, join_key_to TEXT)"
+        "role TEXT, value_type TEXT, distinct_count INTEGER, sample_values TEXT, join_key_to TEXT, "
+        "derived INTEGER DEFAULT 0)"
     )
     origins: dict[str, Carried] = {}  # a carried column's name is its source column; the first table to carry it
     for target, carried in carry_log:
@@ -2347,7 +2507,8 @@ def _write_column_catalog(dst: sqlite3.Connection, carry_log: list[tuple[str, li
                 if join_key:
                     joins.append(f"{target}.{name}")
                 rows.append(_catalog_row(dst, target, name, c, value_type, join_key))
-    dst.executemany("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    dst.executemany("INSERT INTO column_catalog (table_name, column_name, source_table, source_header, role, "
+                    "value_type, distinct_count, sample_values, join_key_to) VALUES (?,?,?,?,?,?,?,?,?)", rows)
     return joins, len(rows)
 
 
@@ -2461,7 +2622,8 @@ def _attach_catalog_attributes(dst: sqlite3.Connection, annotated: list[tuple[Ta
             samples = [r[0] for r in dst.execute(
                 f"SELECT DISTINCT {q(target)} FROM lines WHERE {q(target)} IS NOT NULL LIMIT {CATALOG_SAMPLES}")]
             source_table, header = origins[target]
-            dst.execute("INSERT INTO column_catalog VALUES (?,?,?,?,?,?,?,?,?)",
+            dst.execute("INSERT INTO column_catalog (table_name, column_name, source_table, source_header, role, "
+                        "value_type, distinct_count, sample_values, join_key_to) VALUES (?,?,?,?,?,?,?,?,?)",
                         ("lines", target, source_table, header, "other", "text", distinct,
                          json.dumps(samples, ensure_ascii=False), None))
             attached.append(target)
@@ -2508,26 +2670,41 @@ def _apply_data_conventions(dst: sqlite3.Connection, directives: list[dict[str, 
         kind = item.get("type")
         if kind == "zero_amount_meaning":
             zero = dst.execute("SELECT COUNT(*) FROM orders WHERE COALESCE(revenue, 0) = 0").fetchone()[0]
+            if _has_table(dst, "service_events"):  # visits that collected no money are zero-amount visits too
+                zero += dst.execute("SELECT COUNT(*) FROM service_events").fetchone()[0]
             if zero:
                 dst.execute("INSERT INTO shop_facts VALUES (?, 1)", (f"zero_amount_is_{item['meaning']}",))
                 applied.append(f"zero_amount_is_{item['meaning']}")
-        elif kind == "debt_state_column" and isinstance(item.get("values"), dict):
+        elif kind == "debt_state_column":
             header = normalize_lookup(item.get("column", ""))
             row = dst.execute(
                 "SELECT column_name FROM column_catalog WHERE table_name='orders' AND lookup(source_header)=?",
                 (header,)).fetchone() if _has_table(dst, "column_catalog") else None
             if row is None or "outstanding" not in {r[1] for r in dst.execute("PRAGMA table_info(orders)")}:
                 continue
-            states = {normalize_lookup(k): v for k, v in item["values"].items() if isinstance(v, list) and len(v) == 2}
+            values = item.get("values") if isinstance(item.get("values"), dict) else {}
+            states = {normalize_lookup(k): v for k, v in values.items() if isinstance(v, list) and len(v) == 2}
+            debt_tokens = rulebook_params.active().debt_method_tokens
             updates = []
-            for order_id, text in dst.execute(f"SELECT order_id, {row[0]} FROM orders WHERE {row[0]} IS NOT NULL"):
+            read_by_pattern = 0
+            for order_id, text, due, method in dst.execute(
+                    f"SELECT order_id, {row[0]}, COALESCE(total_due, revenue), payment_method FROM orders "
+                    f"WHERE {row[0]} IS NOT NULL"):
                 state = states.get(normalize_lookup(str(text)))
                 if state and state[0]:
                     updates.append((float(state[1] or 0), order_id))
+                    continue
+                # a note the model's reading does not cover: the patterns of a debt note, on a credit order only
+                words = f" {normalize_lookup(method or '')} "
+                if state is None and any(f" {token} " in words for token in debt_tokens):
+                    owed = debt_sources.read_debt_note(text, due)
+                    if owed is not None:
+                        updates.append((owed, order_id))
+                        read_by_pattern += 1
             if updates:
                 dst.executemany("UPDATE orders SET outstanding=? WHERE order_id=?", updates)
                 dst.execute("INSERT INTO shop_facts VALUES ('debt_state_at_data_end', 1)")
-                applied.append(f"debt_state_column:{row[0]}:{len(updates)}")
+                applied.append(f"debt_state_column:{row[0]}:{len(updates)}:{read_by_pattern}")
         elif kind == "negative_qty_is_return":
             if dst.execute("SELECT 1 FROM raw_lines WHERE qty < 0 LIMIT 1").fetchone():
                 dst.execute("INSERT INTO shop_facts VALUES ('negative_qty_is_return', 1)")
@@ -2576,15 +2753,18 @@ def _has_address_header(original_name: str) -> bool:
     return any(token in text for token in ADDRESS_HEADER_TOKENS)
 
 
-def _derive(dst: sqlite3.Connection) -> None:
+def _derive(dst: sqlite3.Connection, report: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Builds orders and lines; returns the order columns the layer computed (see _derive_order_totals)."""
     _derive_orders(dst)
     _carry_order_columns(dst)
+    derived = _derive_order_totals(dst, report)
     _fill_customer_names(dst)
     _fill_customer_groups(dst)
     _derive_lines(dst)
     tokens = " OR ".join(f"lookup(status) LIKE '%{t}%'" for t in CANCEL_TOKENS)
     dst.execute("ALTER TABLE purchases ADD COLUMN cancelled")
     dst.execute(f"UPDATE purchases SET cancelled=CASE WHEN status IS NOT NULL AND ({tokens}) THEN 1 ELSE 0 END")
+    return derived
 
 
 def _derive_orders(dst: sqlite3.Connection) -> None:
@@ -2620,6 +2800,295 @@ def _derive_orders(dst: sqlite3.Connection) -> None:
         CREATE INDEX orders_date ON orders(date);
         """
     )
+
+
+def _columns_of(dst: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in dst.execute(f"PRAGMA table_info({q(table)})")}
+
+
+def _repeats_per_order(dst: sqlite3.Connection) -> bool:
+    """True when raw_lines.line_discount is a whole-order discount repeated on every line of the order.
+
+    Read from the data, on orders with two or more product lines and a discount: the line values of such an order are
+    all given and equal, and the line amounts are the undiscounted quantity times price (so the discount was never
+    taken off a line). A shop whose line amounts are missing, or whose discounts differ between the lines of an order,
+    is not read this way."""
+    columns = _columns_of(dst, "raw_lines")
+    if not {"line_discount", "line_amount", "qty", "unit_price"} <= columns:
+        return False
+    orders, constant = dst.execute(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN filled=n AND lo=hi THEN 1 ELSE 0 END), 0) FROM ("
+        "SELECT COUNT(*) AS n, COUNT(line_discount) AS filled, MIN(line_discount) AS lo, MAX(line_discount) AS hi "
+        "FROM raw_lines WHERE has_product=1 AND order_id IS NOT NULL GROUP BY order_id "
+        "HAVING COUNT(*)>=2 AND MAX(ABS(COALESCE(line_discount,0)))>0)").fetchone()
+    if orders < ORDER_LEVEL_MIN_ORDERS or constant < ORDER_LEVEL_SHARE * orders:
+        return False
+    lines, undiscounted = dst.execute(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN ABS(line_amount - qty*unit_price) <= ? THEN 1 ELSE 0 END), 0) "
+        "FROM raw_lines WHERE has_product=1 AND line_discount IS NOT NULL AND ABS(line_discount)>0 "
+        "AND line_amount IS NOT NULL AND qty IS NOT NULL AND unit_price IS NOT NULL",
+        (AMOUNT_TOLERANCE,)).fetchone()
+    return bool(lines) and undiscounted >= ORDER_LEVEL_SHARE * lines
+
+
+def _order_component(dst: sqlite3.Connection, name: str, kind: str, column: str | None,
+                     report: dict[str, Any]) -> bool:
+    """Add orders.<name> from the lines: the order's value of a repeated column (MAX over its lines, a negative-only
+    column read as positive) and, separately, the sum of the lines classified as `kind` (an off-goods line such as a
+    voucher or a delivery fee, counted by its absolute amount). An order given by both sources is ambiguous and stays
+    NULL. Returns whether any order has a value; the column is added only then."""
+    sources: list[str] = []
+    if column is not None:
+        sign = dst.execute(f"SELECT MIN({q(column)}) < 0 AND MAX({q(column)}) <= 0 FROM raw_lines").fetchone()[0]
+        pick = f"-MIN({q(column)})" if sign else f"MAX({q(column)})"
+        sources.append(f"(SELECT order_id, {pick} AS v FROM raw_lines "
+                       f"WHERE {q(column)} IS NOT NULL AND order_id IS NOT NULL GROUP BY order_id)")
+    has_rows = dst.execute("SELECT 1 FROM raw_lines WHERE line_kind=? LIMIT 1", (kind,)).fetchone() is not None
+    if has_rows:
+        amount = "COALESCE(line_amount, qty*unit_price, unit_price)"
+        sources.append(f"(SELECT order_id, SUM(ABS({amount})) AS v FROM raw_lines WHERE line_kind={_sql_text(kind)} "
+                       f"AND order_id IS NOT NULL AND {amount} IS NOT NULL GROUP BY order_id)")
+    if not sources:
+        return False
+    dst.execute("DROP TABLE IF EXISTS temp._component")
+    dst.execute("CREATE TEMP TABLE _component (order_id TEXT, v REAL, n INTEGER)")
+    for source in sources:
+        dst.execute(f"INSERT INTO temp._component (order_id, v, n) SELECT order_id, v, 1 FROM {source}")
+    dst.execute("CREATE INDEX temp._component_order ON _component(order_id)")
+    conflicts = dst.execute("SELECT COUNT(*) FROM (SELECT order_id FROM temp._component GROUP BY order_id "
+                            "HAVING COUNT(*)>1)").fetchone()[0]
+    report[f"{name}_conflicts"] = conflicts
+    dst.execute(f"ALTER TABLE orders ADD COLUMN {name} REAL")
+    dst.execute(f"UPDATE orders SET {name}=(SELECT CASE WHEN COUNT(*)=1 THEN MIN(v) END FROM temp._component c "
+                f"WHERE c.order_id=orders.order_id)")
+    dst.execute("DROP TABLE temp._component")
+    return dst.execute(f"SELECT 1 FROM orders WHERE {name} IS NOT NULL LIMIT 1").fetchone() is not None
+
+
+def _derive_order_totals(dst: sqlite3.Connection, report: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Order-level discount and delivery fee on orders, and the order total where the rulebook defines it.
+
+    * orders.order_discount / orders.shipping_fee: a column the sheet gives per order (repeated on every line, so one
+      value per order), or the lines the shop classes as a discount / delivery fee, or a line-discount column that
+      is a whole-order discount repeated on each line (see _repeats_per_order); positive amounts.
+    * orders.total_due is derived only when no sheet gives it (rulebook section 4: the total the customer pays for
+      the whole order, after the order-level discount, including the delivery fee): the goods total (the sheet's, else
+      the sum of the product lines, which already have line discounts taken off) less the order discount plus the
+      delivery fee. It needs a recorded source of at least one of the two; every order that is not cancelled must
+      have a goods total; and where the sheet gives both a paid and an outstanding amount the derived total must
+      agree with their sum, or the sheet records another total and nothing is derived (taxes are never guessed).
+
+    Returns (column, role, description) of each column added, for column_catalog."""
+    derived: list[tuple[str, str, str]] = []
+    raw = _columns_of(dst, "raw_lines")
+    discount_column = "order_discount" if "order_discount" in raw and dst.execute(
+        "SELECT 1 FROM raw_lines WHERE order_discount IS NOT NULL LIMIT 1").fetchone() else None
+    shipping_column = "shipping_fee" if "shipping_fee" in raw and dst.execute(
+        "SELECT 1 FROM raw_lines WHERE shipping_fee IS NOT NULL LIMIT 1").fetchone() else None
+    order_level_line_discount = False
+    if discount_column is None and dst.execute(
+            "SELECT 1 FROM raw_lines WHERE line_kind='discount' LIMIT 1").fetchone() is None:
+        order_level_line_discount = _repeats_per_order(dst)
+        if order_level_line_discount:
+            discount_column = "line_discount"
+    report["order_discount_from_line_column"] = order_level_line_discount
+    has_discount = _order_component(dst, "order_discount", "discount", discount_column, report)
+    has_shipping = _order_component(dst, "shipping_fee", "shipping_fee", shipping_column, report)
+    if has_discount:
+        derived.append(("order_discount", "order_discount",
+                        "order-level discount: the order's value of a per-order column, or the sum of its discount lines"))
+    if has_shipping:
+        derived.append(("shipping_fee", "shipping_fee",
+                        "delivery fee: the order's value of a per-order column, or the sum of its delivery-fee lines"))
+    report["order_total_derived"] = 0
+    if dst.execute("SELECT 1 FROM orders WHERE total_due IS NOT NULL LIMIT 1").fetchone() or not (
+            has_discount or has_shipping):
+        return derived
+    if report.get("order_discount_conflicts") or report.get("shipping_fee_conflicts"):
+        report["order_total_skipped"] = "an order's discount or delivery fee is given by two sources"
+        return derived
+    base = "COALESCE(goods_total, line_total)"
+    adjust = ("-COALESCE(order_discount,0)" if has_discount else "") + ("+COALESCE(shipping_fee,0)" if has_shipping else "")
+    cancelled = "COALESCE(status,'')='cancelled'"
+    if dst.execute(f"SELECT 1 FROM orders WHERE NOT {cancelled} AND {base} IS NULL LIMIT 1").fetchone():
+        report["order_total_skipped"] = "an order has no goods total"
+        return derived
+    both, agree = dst.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN ABS(({base}{adjust}) - (paid+outstanding)) <= ? THEN 1 ELSE 0 END), 0) "
+        "FROM orders WHERE paid IS NOT NULL AND outstanding IS NOT NULL", (AMOUNT_TOLERANCE,)).fetchone()
+    if both and agree < TOTAL_AGREE_SHARE * both:
+        report["order_total_skipped"] = "the sheet's paid and outstanding amounts do not add up to the derived total"
+        return derived
+    dst.execute(f"UPDATE orders SET total_due={base}{adjust} WHERE {base} IS NOT NULL")
+    report["order_total_derived"] = dst.execute("SELECT COUNT(total_due) FROM orders").fetchone()[0]
+    derived.append(("total_due", "derived_order_total",
+                    "order total (rulebook section 4): goods total less order discount plus delivery fee"))
+    return derived
+
+
+def _register_derived(dst: sqlite3.Connection, derived: list[tuple[str, str, str]]) -> None:
+    """column_catalog rows (derived=1) for the columns the layer computed rather than read."""
+    for name, role, description in derived:
+        distinct = dst.execute(f"SELECT COUNT(DISTINCT {q(name)}) FROM orders").fetchone()[0]
+        samples = [row[0] for row in dst.execute(
+            f"SELECT DISTINCT {q(name)} FROM orders WHERE {q(name)} IS NOT NULL LIMIT {CATALOG_SAMPLES}")]
+        dst.execute(
+            "INSERT INTO column_catalog (table_name, column_name, source_table, source_header, role, value_type, "
+            "distinct_count, sample_values, join_key_to, derived) VALUES ('orders', ?, NULL, ?, ?, 'number', ?, ?, NULL, 1)",
+            (name, description, role, distinct, json.dumps(samples, ensure_ascii=False)))
+
+
+def _order_key_map(dst: sqlite3.Connection) -> tuple[set[str], dict[int, str]]:
+    """The order ids, and the order each number names: a number maps to an order id only when exactly one order id
+    ends in it (read as an integer), so that a note's "<label> n" never picks between two orders."""
+    ids = {str(row[0]) for row in dst.execute("SELECT order_id FROM orders")}
+    by_number: dict[int, set[str]] = {}
+    for order_id in ids:
+        found = TRAILING_DIGITS.search(order_id)
+        if found:
+            by_number.setdefault(int(found.group(1)), set()).add(order_id)
+    return ids, {number: next(iter(found)) for number, found in by_number.items() if len(found) == 1}
+
+
+def _resolve_key(cell: Any, ids: set[str], by_number: dict[int, str], from_note: bool) -> str | None:
+    text = str(cell).strip()
+    if text in ids:
+        return text
+    if not from_note:
+        return None
+    numbers = KEY_NUMBER.findall(text)  # a note naming one number: "<label> n"
+    return by_number.get(int(numbers[0])) if len(numbers) == 1 else None
+
+
+def _ledger_candidates(annotated: list[tuple[TableMeta, dict[str, Any]]], dst: sqlite3.Connection
+                       ) -> list[tuple[TableMeta, dict[str, str], dict[str, Any]]]:
+    """Tables the layer does not read as payments that give an amount paid: (table, roles, role of each column)."""
+    found = []
+    for table, note in annotated:
+        if note["kind"] in LAYER_KINDS:
+            continue
+        by_column = _given_by_column(table, note.get("roles") or {})[0]
+        if sum(1 for role in by_column.values() if role == "paid_amount") == 1:  # two such columns are ambiguous
+            found.append((table, effective_roles(table, note, dst, None), by_column))
+    return found
+
+
+def _eligible_unpaid_orders(dst: sqlite3.Connection) -> set[str]:
+    """Orders the debt rules count (rulebook section 4): not cancelled, not a payment method the rulebook says is
+    never customer debt."""
+    params = rulebook_params.active()
+    out: set[str] = set()
+    for order_id, method in dst.execute("SELECT order_id, payment_method FROM orders WHERE COALESCE(status,'')<>'cancelled'"):
+        padded = f" {normalize_lookup(method)} " if method is not None else ""
+        if not any(f" {normalize_lookup(token)} " in padded for token in params.non_debt_method_tokens):
+            out.add(str(order_id))
+    return out
+
+
+def _load_ledger_payments(dst: sqlite3.Connection, context: BusinessContext,
+                          annotated: list[tuple[TableMeta, dict[str, Any]]], report: dict[str, Any]) -> int:
+    """payments(order_id, date, amount) from the amount-paid column of a side ledger (debts, instalments).
+
+    The compiler reads payments as the whole record of money received: an order with no payment row owes its total.
+    A ledger is therefore loaded only when it is the whole record and nothing about it is ambiguous:
+    * one amount column; payments is otherwise empty (no second source to double count);
+    * the order key resolves for LEDGER_KEY_SHARE of the keyed rows: the order-id column, else a note naming one
+      number ("<label> n") that identifies exactly one order; an unresolved row is not loaded;
+    * every row has a payment date: a paid_at column, or the ledger's date column when it falls after the order for
+      most rows and never before (a date equal to the order's date is the sale, not a payment);
+    * the amount column is not the order price (it equals the order total for most rows);
+    * the ledger holds every order the debt rules count, and where orders carry an amount paid it equals the ledger.
+    Otherwise payments stays empty and report["ledger_payments_skipped"] says why. Money is checked: the rows
+    loaded sum to the amounts of the resolved ledger rows, once per order row (no row is multiplied)."""
+    if dst.execute("SELECT 1 FROM payments LIMIT 1").fetchone():
+        return 0
+    candidates = _ledger_candidates(annotated, dst)
+    if not candidates:
+        return 0
+    ids, by_number = _order_key_map(dst)
+    skipped: list[str] = []
+    loaded = 0
+    for table, roles, by_column in candidates:
+        amount_column = roles.get("paid_amount")
+        if not amount_column:
+            continue
+        reason = None
+        rows = dst.execute(f"SELECT * FROM source.{q(table.name)} AS src").fetchall()
+        names = [row[1] for row in dst.execute(f"PRAGMA source.table_info({q(table.name)})")]
+        index = {name: i for i, name in enumerate(names)}
+        locale = _column_locale(dst, table, amount_column)
+        scale = _amount_scale(context, table)
+        keyed: list[tuple[str, Any, Any]] = []  # (order id, date cell, amount) of each resolved row
+        best = None
+        for column, from_note in ((roles.get("order_id"), False), (roles.get("order_note"), True),
+                                  (roles.get("note"), True)):
+            if not column or column not in index:
+                continue
+            cells = [row[index[column]] for row in rows if not blank(row[index[column]])]
+            resolved = [_resolve_key(cell, ids, by_number, from_note) for cell in cells]
+            share = sum(1 for key in resolved if key) / len(cells) if cells else 0.0
+            if share >= LEDGER_KEY_SHARE and (best is None or share > best[0]):
+                best = (share, column, from_note)
+        if best is None:
+            reason = "no column resolves to the orders"
+        else:
+            _, key_column, from_note = best
+            for row in rows:
+                if blank(row[index[key_column]]):
+                    continue
+                key = _resolve_key(row[index[key_column]], ids, by_number, from_note)
+                amount = _number(row[index[amount_column]], locale or "unknown")
+                if key is not None and amount is not None:
+                    keyed.append((key, row, amount * scale))
+        date_column = None
+        if reason is None:
+            dates = [roles.get(role) for role in ("paid_at", "ordered_at") if roles.get(role) in index]
+            order_day = dict(dst.execute("SELECT order_id, date FROM orders"))
+            for column in dates:
+                days = [(to_date(row[index[column]]), order_day.get(key)) for key, row, _ in keyed]
+                if any(day is None or ordered is None for day, ordered in days):
+                    continue
+                if any(day < ordered for day, ordered in days):
+                    continue
+                later = sum(1 for day, ordered in days if day > ordered)
+                if column == roles.get("paid_at") or (days and later >= LEDGER_LATER_SHARE * len(days)):
+                    date_column = column
+                    break
+            if date_column is None:
+                reason = "no payment date"
+        if reason is None:
+            totals = dict(dst.execute("SELECT order_id, COALESCE(total_due, revenue) FROM orders"))
+            priced = sum(1 for key, _, amount in keyed
+                         if totals.get(key) is not None and abs(amount - totals[key]) <= AMOUNT_TOLERANCE)
+            if keyed and priced >= LEDGER_PRICE_SHARE * len(keyed):
+                reason = "the amount column is the order price"
+        if reason is None:
+            covered = {key for key, _, _ in keyed}
+            missing = _eligible_unpaid_orders(dst) - covered
+            if missing:
+                reason = "the ledger does not hold every order the debt rules count"
+        if reason is None:
+            paid = dict(dst.execute("SELECT order_id, paid FROM orders WHERE paid IS NOT NULL"))
+            sums: dict[str, float] = {}
+            for key, _, amount in keyed:
+                sums[key] = sums.get(key, 0.0) + amount
+            checked = [key for key in sums if key in paid]
+            if checked and any(abs(paid[key] - sums[key]) > AMOUNT_TOLERANCE for key in checked):
+                reason = "the amount paid on the orders differs from the ledger"
+        if reason is not None:
+            skipped.append(f"{table.name}: {reason}")
+            continue
+        dst.executemany("INSERT INTO payments (order_id, date, amount) VALUES (?,?,?)",
+                        [(key, to_date(row[index[date_column]]), amount) for key, row, amount in keyed])
+        check = dst.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments").fetchone()
+        if check[0] != len(keyed) or abs(check[1] - sum(amount for _, _, amount in keyed)) > 1e-6:
+            raise RuntimeError(f"ledger payments of {table.name} do not match the source rows")
+        report["ledger_payments_table"] = table.name
+        loaded = len(keyed)
+        break  # one ledger is the record; a second would be a second source
+    if skipped:
+        report["ledger_payments_skipped"] = skipped
+    return loaded
 
 
 def _fill_customer_names(dst: sqlite3.Connection) -> None:

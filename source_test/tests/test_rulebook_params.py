@@ -323,7 +323,7 @@ def test_selection_keeps_the_cue_rows_of_a_real_rulebook(path: Path) -> None:
     rp.extract_rulebook_params(text, model)
     assert len(model.calls) == 1
     sent = model.calls[0]["system"] + model.calls[0]["prompt"]
-    assert len(sent) < 6000
+    assert len(sent) < 7000  # 6000 before the instalment row and its two prompt lines were added
 
 
 def test_table_header_is_kept_only_with_a_selected_row() -> None:

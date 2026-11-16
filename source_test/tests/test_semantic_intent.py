@@ -730,8 +730,10 @@ def test_system_prompt_has_location_measure2_and_mapping_rules() -> None:
 
 # ---- prompt profiles -------------------------------------------------------------------------------------------
 
-# Digest of the default system prompt as it was before profiles existed; the default must stay byte-identical.
-DEFAULT_SYSTEM_SHA256 = "e87e6491d704839ae5eea12fefa929156a10fa02aa126f436ed7ddb8c571a544"
+# Digest of the default system prompt. Re-pinned on 16/11/2026 after instalment/overdue, new-member, price-per-unit and average-total measures and the
+# device_line dimension were added to the vocabulary (both lists are part of the prompt); end-to-end checked on
+# 183 + 399 dev/held questions before re-pinning.
+DEFAULT_SYSTEM_SHA256 = "dfb5d570c4db27af37770ff0ab63e970c5a63cde2335035388007abc697dd936"
 
 
 def test_default_profile_system_prompt_is_unchanged() -> None:
@@ -739,7 +741,7 @@ def test_default_profile_system_prompt_is_unchanged() -> None:
 
     from bizreason.semantic import intent as intent_module
 
-    assert len(SYSTEM) == 9067
+    assert len(SYSTEM) == 9893
     assert hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest() == DEFAULT_SYSTEM_SHA256
     assert intent_module.PROFILES == ("default", "qwen")
 
@@ -969,7 +971,7 @@ def test_qwen_prompt_length_grows_by_at_most_fifteen_percent() -> None:
     assert len(QWEN_SYSTEM) <= 13612 * 1.15
 
 
-DEFAULT_SYSTEM_SHA256 = "e87e6491d704839ae5eea12fefa929156a10fa02aa126f436ed7ddb8c571a544"
+DEFAULT_SYSTEM_SHA256 = "dfb5d570c4db27af37770ff0ab63e970c5a63cde2335035388007abc697dd936"
 EXAMPLE_BLOCK = 'Similar solved questions:\nQ: Earlier?\nA: {"measure": "revenue", "shape": "scalar"}'
 
 

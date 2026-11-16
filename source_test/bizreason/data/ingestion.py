@@ -12,7 +12,10 @@ from typing import Any
 
 from bizreason.contracts import BusinessContext, ColumnMeta, Diagnostic, SourceRef, TableMeta
 from bizreason.data import schema
-from bizreason.data.parsing import ParseStatus, blank, parse_date, parse_number, parse_status
+from bizreason.data.parsing import (
+    ParseStatus, blank, classify_date_column, infer_date_order, parse_date, parse_date_ordered, parse_number,
+    parse_status,
+)
 from bizreason.data.layout import ArithmeticSubtotals, BlockSums, has_record_evidence, is_note, is_summary
 from bizreason.data.row_audit import create_audit, record_audit
 from bizreason.data.readers import RawSheet, read_sheets
@@ -373,6 +376,38 @@ def _sum_locales(rows: list[tuple[int, tuple[Any, ...]]], locales: list[str], re
     return out
 
 
+def _date_column_orders(
+    rows: list[tuple[int, tuple[Any, ...]]], roles: list[str | None], width: int
+) -> dict[int, str]:
+    """Day/month order per date column of a region.
+
+    A date-role column is read day-first (the parser default) unless its own cells prove month-first. A roleless
+    column is added only when classify_date_column recognizes it as dates (serials mixed with text dates, say); the
+    order the shop's date-role columns prove is its hint. Columns carrying numeric roles are never touched.
+    """
+    sample = rows[:20000]
+    columns = {
+        index: [row[index] for _, row in sample if len(row) > index and not blank(row[index])]
+        for index in range(width)
+    }
+    orders: dict[int, str] = {}
+    proven: list[str] = []
+    for index, role in enumerate(roles[:width]):
+        if role in DATE_ROLES:
+            order = infer_date_order(columns[index])
+            if order == "mdy":
+                orders[index] = "mdy"
+            if order in {"dmy", "mdy"}:
+                proven.append(order)
+    hint = proven[0] if proven and len(set(proven)) == 1 else "ambiguous"
+    for index, role in enumerate(roles[:width]):
+        if role is None and columns[index]:
+            order = classify_date_column(columns[index], hint=hint)
+            if order is not None:
+                orders[index] = order
+    return orders
+
+
 def _stored_number(number: Decimal) -> int | str:
     if number == number.to_integral_value() and -(2**63) <= number < 2**63:
         return int(number)
@@ -612,6 +647,30 @@ class BusinessBuilder:
             else:
                 buffered.append((row_number, row))
         regions.append((current_headers, current_header_row, buffered))
+        # A header with no rows whose next row is itself a header is a group-label row ("Money", "Goods") above
+        # the real header, not a table: it becomes the group prefix of the next region's names, not empty columns.
+        merged: list[tuple[tuple[Any, ...], int, list[tuple[int, tuple[Any, ...]]]]] = []
+        group_labels: list[tuple[Any, ...] | None] = []
+        pending: tuple[Any, ...] | None = None
+        for position_, (region_headers, region_header_row, region_rows) in enumerate(regions):
+            following = regions[position_ + 1] if position_ + 1 < len(regions) else None
+            if not region_rows and following is not None and following[1] == region_header_row + 1:
+                pending = region_headers
+                diagnostics.append(
+                    Diagnostic(
+                        code="GROUP_HEADER_ROW",
+                        message="Row of group labels above the real header; kept as a name prefix, not a table",
+                        source=SourceRef(path=relative, table=sheet.name, row=region_header_row),
+                        severity="info",
+                    )
+                )
+                continue
+            merged.append((region_headers, region_header_row, region_rows))
+            group_labels.append(_multi_tier_labels(pending, region_headers) if pending is not None else None)
+            pending = None
+        regions = merged
+        if group_labels and group_labels[0] is not None and labels is None:
+            labels = group_labels[0]
         return [
             self._write_region(
                 connection,
@@ -625,7 +684,7 @@ class BusinessBuilder:
                 index,
                 diagnostics,
                 # Only the first region starts at the chosen header, which the labels describe.
-                labels=labels if index == 0 else None,
+                labels=labels if index == 0 else group_labels[index],
             )
             for index, (region_headers, region_header_row, region_rows) in enumerate(regions)
         ]
@@ -712,6 +771,7 @@ class BusinessBuilder:
             )
             for index in range(width)
         ]
+        date_orders = _date_column_orders(rows, roles, width)
         nulls: Counter[int] = Counter()
         errors: Counter[int] = Counter()
         types: dict[int, set[str]] = {index: set() for index in range(width)}
@@ -879,7 +939,10 @@ class BusinessBuilder:
                         ),
                     )
                 elif role in DATE_ROLES:
-                    result = parse_date(value, year=year)
+                    result = parse_date_ordered(value, date_orders.get(index, "dmy"), year=year)
+                elif index in date_orders:
+                    # A roleless column that reads as dates: each cell is normalized on its own.
+                    result = parse_date_ordered(value, date_orders[index], year=year)
                 elif role == "status":
                     purchase_domain = (
                         grain in {"purchase_header", "purchase_line"}

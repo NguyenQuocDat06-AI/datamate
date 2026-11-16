@@ -8,6 +8,8 @@ cells, the shop's own README), never from a column or table name of one dataset:
   a shop that records customers in a place the order table does not carry (that stays an abstention).
 * `payments_unrecorded`: no payment table, no per-order paid / still-owed amount, no column with such a role and no
   README line about money received. A debt question is then unanswerable.
+  When the only debt data is a table of payment terms (days allowed, due date) and the README merely names debt, the
+  question is unanswerable too: who paid is not recorded.
 * `order_state_settlements`: a shop with no payment table whose orders carry the amount payable and a state of
   settlement taken when the data was exported (an amount still owed, or an amount paid) gets one settled amount per
   order. It is valid only for a cutoff at or after the data's last day (`cutoff_covers_data_end`).
@@ -22,6 +24,16 @@ import sqlite3
 import unicodedata
 from datetime import date, timedelta
 from typing import Any
+
+from bizreason.semantic import obligations
+from bizreason.semantic.vocabulary import (
+    DEBT_NOTE_OWES,
+    DEBT_NOTE_OWES_ALL,
+    DEBT_NOTE_PAID,
+    DEBT_NOTE_PRE_PAID,
+    MONEY_MILLION_WORDS,
+    MONEY_THOUSAND_WORDS,
+)
 
 # Column roles that name a customer, wherever they sit in the layer.
 CUSTOMER_ROLE_MARKER = "customer"
@@ -38,8 +50,13 @@ PAYMENT_ROLE_NON_AMOUNT = frozenset({"payment_method", "due_at", "credit_days", 
 PAYMENT_ORDER_COLUMNS = ("total_due", "paid", "outstanding")
 # README words for money received or still owed (accent-free lower case).
 PAYMENT_README_TOKENS = ("da tra", "da thu", "da thanh toan", "con no", "con thieu", "con phai thu", "so tien no",
-                         "du no", "cong no", "tien da", "khach tra", "khach da tra", "thu no", "tra no",
+                         "du no", "tien da", "khach tra", "khach da tra", "thu no", "tra no",
                          "amount paid", "paid amount", "outstanding", "balance due")
+# README words that only name the topic of debt. Alone they do not say money received or owed is recorded: a shop
+# whose only debt data is a table of payment terms (days allowed, due date) names its debt ledger this way.
+PAYMENT_README_TOPIC_TOKENS = ("cong no",)
+# Roles of a table of payment terms: when and for how long, never how much (see PAYMENT_ROLE_NON_AMOUNT).
+PAYMENT_TERMS_ROLES = frozenset({"due_at", "credit_days"})
 
 
 STROKED_D = chr(0x111)  # the one Vietnamese letter that does not decompose into base plus accent
@@ -111,6 +128,10 @@ def _payment_roles(db: sqlite3.Connection) -> bool:
     return False
 
 
+def _has_payment_terms(db: sqlite3.Connection) -> bool:
+    return any(role in PAYMENT_TERMS_ROLES for role in _catalog_roles(db))
+
+
 def payments_unrecorded(db: sqlite3.Connection) -> bool:
     """True when the shop records no money received and no amount still owed, anywhere."""
     tables = _tables(db)
@@ -118,6 +139,8 @@ def payments_unrecorded(db: sqlite3.Connection) -> bool:
         return False
     if db.execute("SELECT 1 FROM payments LIMIT 1").fetchone() is not None:
         return False
+    if obligations.active(db):
+        return False  # debts and their repayments are recorded in a ledger
     for column in _columns(db, "orders") & set(PAYMENT_ORDER_COLUMNS):
         if _any_filled(db, "orders", column):
             return False
@@ -126,7 +149,13 @@ def payments_unrecorded(db: sqlite3.Connection) -> bool:
     readme = _readme(db)
     if not readme:
         return False
-    return not any(token in readme for token in PAYMENT_README_TOKENS)
+    if any(token in readme for token in PAYMENT_README_TOKENS):
+        return False
+    # A README that only names debt is explained by a table of payment terms; with no such table it may describe
+    # a record the layer did not capture, so the claim is not made.
+    if _has_payment_terms(db):
+        return True
+    return not any(token in readme for token in PAYMENT_README_TOPIC_TOKENS)
 
 
 def order_state_settlements(db: sqlite3.Connection) -> dict[Any, list[tuple[Any, float]]] | None:
@@ -135,6 +164,8 @@ def order_state_settlements(db: sqlite3.Connection) -> dict[Any, list[tuple[Any,
 
     Needs the amount payable on every order that has a state, and a state on every such order: either an amount still
     owed (a missing one means nothing owed) or an amount paid (a missing one is unknown, so the shop is not used)."""
+    if obligations.active(db):
+        return None  # dated repayments of a debt ledger are the record (see obligations.py)
     columns = _columns(db, "orders")
     if "total_due" not in columns:
         return None
@@ -150,6 +181,92 @@ def order_state_settlements(db: sqlite3.Connection) -> dict[Any, list[tuple[Any,
             return None
         return {oid: [(day, min(max(float(paid), 0.0), float(due)))] for oid, day, due, paid in rows}
     return None
+
+
+def _word_pattern(words: tuple[str, ...]) -> str:
+    return "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True))
+
+
+_PAID_NOTE = re.compile(rf"\b(?:{_word_pattern(DEBT_NOTE_PAID)})\b")
+_OWES_ALL_NOTE = re.compile(rf"\b(?:{_word_pattern(DEBT_NOTE_OWES_ALL)})\b")
+_NOTE_KEYWORD = re.compile(
+    rf"\b(?P<owes>{_word_pattern(DEBT_NOTE_OWES)})\b|\b(?P<pre>{_word_pattern(DEBT_NOTE_PRE_PAID)})\b")
+_NOTE_NUMBER = re.compile(
+    rf"(?P<n>\d[\d.,]*)\s*(?:(?P<mil>{_word_pattern(MONEY_MILLION_WORDS)})(?![^\W\d_])\s*(?P<rest>\d{{1,3}})?"
+    rf"|(?P<thou>{_word_pattern(MONEY_THOUSAND_WORDS)})(?![^\W\d_]))?")
+_GROUPED = re.compile(r"^\d{1,3}(?:[.,]\d{3})+$")
+_NOTE_CLAUSES = re.compile(r";|,(?!\d)|\.(?=\s|$)")
+
+
+def read_money_text(text: str) -> float | None:
+    """The first money amount written in an accent-free lower case text: "725 nghin", "366k", "1tr868", "1.038.500d",
+    "39668d". A bare number below 1000 has no unit and is not read. None when there is no amount."""
+    match = _NOTE_NUMBER.search(text)
+    if match is None:
+        return None
+    token = match.group("n").rstrip(".,")
+    if _GROUPED.match(token):
+        value = float(re.sub(r"[.,]", "", token))
+    else:
+        try:
+            value = float(token.replace(",", ".")) if re.fullmatch(r"\d+(?:[.,]\d+)?", token) else None
+        except ValueError:
+            value = None
+        if value is None:
+            return None
+    if match.group("mil"):
+        value *= 1_000_000
+        if match.group("rest"):
+            value += float(match.group("rest").ljust(3, "0")) * 1000
+        return value
+    if match.group("thou"):
+        return value * 1000
+    return value if value >= 1000 else None
+
+
+def read_debt_note(text: Any, total_due: float | None) -> float | None:
+    """The amount still owed that a free-text note on a credit order states, or None when it does not say plainly.
+
+    Patterns, not wordings of one shop: settled ("da tra du", "khach ck du roi"): nothing owed; the whole order owed
+    ("no ca don"): total_due; an amount after an owes word ("no 725 nghin", "ghi so 443 nghin", "con thieu 853
+    nghin"): that amount; an amount handed over and the rest owed without a figure ("dua truoc 236k, con lai ghi so"):
+    total_due less that amount. An amount outside 0..total_due, a hand-over and a figure that do not add to total_due,
+    two different figures, or no figure at all is not read."""
+    folded = _fold(text)
+    if not folded.strip():
+        return None
+    if _PAID_NOTE.search(folded):
+        return 0.0
+    if _OWES_ALL_NOTE.search(folded):
+        return float(total_due) if total_due is not None else None
+    owed: set[float] = set()
+    given: float | None = None
+    rest_owed = False
+    for clause in _NOTE_CLAUSES.split(folded):
+        found = _NOTE_KEYWORD.search(clause)
+        if found is None:
+            continue
+        amount = read_money_text(clause[found.end():])
+        if found.group("owes"):
+            if amount is None:
+                rest_owed = True
+            else:
+                owed.add(amount)
+        elif amount is not None:
+            given = (given or 0.0) + amount
+    if len(owed) > 1:
+        return None
+    if owed:
+        value = owed.pop()
+        if given is not None and total_due is not None and abs(given + value - float(total_due)) > 0.01 * float(total_due) + 1:
+            return None
+    elif given is not None and rest_owed and total_due is not None:
+        value = float(total_due) - given
+    else:
+        return None
+    if value < 0 or (total_due is not None and value > float(total_due) + 0.5):
+        return None
+    return value
 
 
 def cutoff_covers_data_end(db: sqlite3.Connection, end_exclusive: date) -> bool:
