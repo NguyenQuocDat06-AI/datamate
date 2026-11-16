@@ -433,7 +433,7 @@ class TrammayClient:
         outage_poll_seconds: float = OUTAGE_POLL_SECONDS,
     ):
         if not settings.api_key:
-            raise ModelError("TRAMMAY_KEY is missing (set TRAMMAY_KEY or OPENROUTER_API in source_test/.env)")
+            raise ModelError("TRAMMAY_KEY is missing (set TRAMMAY_KEY or OPENROUTER_API in .env)")
         if outage_poll_seconds <= 0:
             raise ValueError("outage_poll_seconds must be positive")
         self.settings = settings

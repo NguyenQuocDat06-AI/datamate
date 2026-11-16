@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,7 @@ def _probe(code: str) -> None:
     result = subprocess.run(
         [sys.executable, "-c", code],
         cwd=SOURCE_TEST,
+        env={**os.environ, "PYTHONPATH": str(SOURCE_TEST / "src")},
         capture_output=True,
         text=True,
         timeout=300,

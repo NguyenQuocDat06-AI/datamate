@@ -12,7 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-WORKSPACE = Path(__file__).resolve().parents[1]
+WORKSPACE = Path(__file__).resolve().parents[2]  # repository root (data/, artifacts/); /code in the image
 
 _ACTIVE_POLICY: contextvars.ContextVar[PathPolicy | None] = contextvars.ContextVar(
     "_ACTIVE_POLICY", default=None

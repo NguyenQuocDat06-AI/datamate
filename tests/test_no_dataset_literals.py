@@ -12,9 +12,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 # A worktree has no cache of its own; set DATASET_CACHE_ROOT to scan table names from a real one.
 CACHE_ROOT = Path(os.environ.get("DATASET_CACHE_ROOT", ROOT))
-SEMANTIC = ROOT / "bizreason" / "semantic"
-DATA = ROOT / "bizreason" / "data"
-TEMPORAL = ROOT / "bizreason" / "temporal.py"
+SEMANTIC = ROOT / "src" / "bizreason" / "semantic"
+DATA = ROOT / "src" / "bizreason" / "data"
+TEMPORAL = ROOT / "src" / "bizreason" / "temporal.py"
 # The vocabulary modules are the only places allowed to hold domain words (generic synonyms, labels, statuses).
 ALLOWED_FILES = {"vocabulary.py"}
 

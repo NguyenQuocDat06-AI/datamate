@@ -3,14 +3,13 @@
 ## Environment
 
 * Python 3.11+. The unit tests need no GPU, model or network.
-* `cd source_test && pip install -e ".[dev]"`.
-* Datasets live in `source_test/data/` (git-ignored): `train/`, `public_test/`. A test root contains
+* `pip install -e ".[dev]"` from the repository root.
+* Datasets live in `data/` (git-ignored): `train/`, `public_test/`. A test root contains
   `questions.jsonl`, `rulebook.md`, `calendar.csv` and `data/<business_id>/` with the shop's files and `README.md`.
 
 ## Tests
 
 ```bash
-cd source_test
 python -m pytest -o addopts="" -q                         # everything
 python -m pytest -o addopts="" -q tests/test_semantic_intent.py
 ```
@@ -37,7 +36,6 @@ python -m pytest -o addopts="" -q tests/test_semantic_intent.py
 ## Running against a model
 
 ```bash
-cd source_test
 python -m bizreason.run_v2 --help
 ```
 
@@ -57,14 +55,14 @@ that hosts the model on Kaggle GPU sessions; it reads credentials from the envir
 ## Repository layout
 
 ```
-source_test/bizreason/      package (data/, semantic/, evaluation/, top-level helpers)
-source_test/serve/          local_server.py (submission), model_api.py (dev)
-source_test/container/      predict.py, gpu_preflight.py
-source_test/tests/          unit and regression tests
-source_test/scripts/        measurement and analysis scripts (development only; see header of each)
+src/bizreason/              package (data/, semantic/, evaluation/, top-level helpers)
+src/serve/                  local_server.py (submission), model_api.py (dev)
+container/                  predict.py, gpu_preflight.py
+tests/                      unit and regression tests
+scripts/                    measurement and analysis scripts (development only; see header of each)
 docker/                     image build context templates, tools, packaging docs
 docs/                       this documentation
 ```
 
-`source_test/scripts/` contains historical measurement scripts. Some are tied to the local development machine and
+`scripts/` contains historical measurement scripts. Some are tied to the local development machine and
 datasets; treat them as examples, not as a supported CLI.

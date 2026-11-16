@@ -18,11 +18,12 @@ calibration = ["scikit-learn>=1.5,<2"]
 bizreason = "bizreason.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["bizreason*"]
+where = ["src"]
+include = ["bizreason*", "serve*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src", "."]
 addopts = "-q"
 
 [tool.ruff]

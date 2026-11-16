@@ -23,7 +23,7 @@ from bizreason.utils import normalize_lookup
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_CALENDAR = ROOT / "data" / "public_test" / "calendar.csv"
-DATA_ROOT = Path(os.environ.get("DATASET_CACHE_ROOT", "/home/ubuntu/datamate/source_test")) / "data"
+DATA_ROOT = Path(os.environ.get("DATASET_CACHE_ROOT", str(Path(__file__).resolve().parents[1]))) / "data"
 REAL_RULEBOOKS = [DATA_ROOT / "train" / "rulebook.md", DATA_ROOT / "public_test" / "rulebook.md"]
 
 TAKEN_ALL = [

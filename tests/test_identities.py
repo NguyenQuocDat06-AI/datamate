@@ -52,7 +52,7 @@ def test_mixed_case_beats_all_upper_with_diacritics():
 def test_choice_is_independent_of_pythonhashseed():
     script = (
         "import json, sqlite3, sys\n"
-        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        f"sys.path.insert(0, {str(ROOT / 'src')!r})\n"
         "from bizreason.contracts import ColumnMeta, TableMeta\n"
         "from bizreason.data.identities import canonicalize_customers\n"
         "table = TableMeta(name='customers', sources=[], row_count=0, raw_row_count=0, columns=["

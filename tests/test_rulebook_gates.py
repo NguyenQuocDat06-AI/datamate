@@ -14,7 +14,7 @@ from bizreason.semantic import rulebook_params as rp
 from bizreason.semantic.compiler import OBLIGATION_MEASURES, Unsupported
 from test_obligations_ledgers import make_db, value
 
-DATA_ROOT = Path(os.environ.get("DATASET_CACHE_ROOT", "/home/ubuntu/datamate/source_test")) / "data"
+DATA_ROOT = Path(os.environ.get("DATASET_CACHE_ROOT", str(Path(__file__).resolve().parents[1]))) / "data"
 PUBLIC_RULEBOOK = DATA_ROOT / "public_test" / "rulebook.md"
 
 TEXT_WITH_RULES = (

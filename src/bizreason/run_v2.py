@@ -47,7 +47,7 @@ from bizreason.semantic import rule_terms
 from bizreason.semantic import rulebook_params
 from bizreason.v2_setup import build_v2_context
 
-WORKTREE = Path(__file__).resolve().parents[1]
+WORKTREE = Path(__file__).resolve().parents[2]
 DEFAULT_TOTAL_SECONDS = 21600.0
 BUDGET_MARGIN_SECONDS = 300.0
 DEFAULT_OUTAGE_WAIT = 1800.0

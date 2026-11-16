@@ -20,10 +20,11 @@ then calculates the answer from the shop's own data, and quality gates prefer `a
 
 | Path | What it is |
 |---|---|
-| [`source_test/bizreason/`](source_test/bizreason) | The Python package (ingestion, semantic layer, compiler, solver, orchestration) |
-| [`source_test/serve/`](source_test/serve) | Local model server (one worker per GPU) and the Kaggle-hosted API controller used during development |
-| [`source_test/container/`](source_test/container) | Container entry point and GPU pre-flight check |
-| [`source_test/tests/`](source_test/tests) | Test suite (2,300+ tests, no model or network needed) |
+| [`src/bizreason/`](src/bizreason) | The Python package (ingestion, semantic layer, compiler, solver, orchestration) |
+| [`src/serve/`](src/serve) | Local model server (one worker per GPU) and the Kaggle-hosted API controller used during development |
+| [`container/`](container) | Container entry point and GPU pre-flight check |
+| [`tests/`](tests) | Test suite (2,300+ tests, no model or network needed) |
+| [`scripts/`](scripts) | Historical measurement and analysis scripts (development only) |
 | [`docker/`](docker) | Everything needed to build and export the submission image |
 | [`docs/`](docs) | Architecture, Docker guide, development guide, evaluation protocol, compliance |
 
@@ -50,7 +51,6 @@ Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 Requirements: Python 3.11+, no GPU needed for the tests.
 
 ```bash
-cd source_test
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest -o addopts="" -q          # full suite
@@ -59,7 +59,6 @@ python -m pytest -o addopts="" -q          # full suite
 Run the pipeline against an OpenAI-compatible model endpoint (for example a hosted Gemma 4 12B):
 
 ```bash
-cd source_test
 python -m bizreason.run_v2 \
   --data /path/to/test_root \            # questions.jsonl, rulebook.md, calendar.csv, data/<business_id>/
   --out  /path/to/work_dir \             # caches, checkpoints, submission.jsonl
@@ -76,14 +75,14 @@ reader **off**.
 ## Offline run, as the organizers run it
 
 ```bash
-python source_test/run_submission.py \
+python src/run_submission.py \
   --data <test_root> --model-dir <model_dir> --out <work_dir> \
   --submission <work_dir>/submission.jsonl --fewshot-bank <fewshot_bank.jsonl> \
   --total-seconds 21000 --workers 4
 ```
 
 This starts one model worker per GPU, waits for warm-up, runs the pipeline, writes `submission.jsonl` after every
-answer and per-question logs under `<work_dir>/logs/`. See [`source_test/SUBMISSION.md`](source_test/SUBMISSION.md).
+answer and per-question logs under `<work_dir>/logs/`. See [`docs/SUBMISSION.md`](docs/SUBMISSION.md).
 
 ## Docker submission
 

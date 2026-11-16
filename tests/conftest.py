@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-_SOURCE_TEST_ROOT = Path(__file__).resolve().parent.parent
-if str(_SOURCE_TEST_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SOURCE_TEST_ROOT))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _p in (_REPO_ROOT / "src", _REPO_ROOT):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import csv
 import tempfile

@@ -191,7 +191,7 @@ def _run(args: argparse.Namespace) -> None:
                 "implementation_sha256": digest(
                     {
                         path.relative_to(WORKSPACE).as_posix(): file_hash(path)
-                        for path in sorted((WORKSPACE / "bizreason").rglob("*.py"))
+                        for path in sorted(Path(__file__).resolve().parent.rglob("*.py"))
                     }
                 ),
                 "backend": args.backend,
@@ -527,7 +527,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     unpack = commands.add_parser(
-        "unpack", help="Safely extract a competition ZIP under source_test"
+        "unpack", help="Safely extract a competition ZIP under the repository root"
     )
     unpack.add_argument("--archive", required=True)
     unpack.add_argument("--destination", default=str(WORKSPACE / "data"))

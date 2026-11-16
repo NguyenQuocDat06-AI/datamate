@@ -9,7 +9,7 @@ Model duy nhất: `google/gemma-4-12B-it`, revision
 NF4/fp16. Mỗi lần khởi động kiểm SHA-256 trọng số, số tham số, revision và
 instance trước khi chuyển câu hỏi. Hai GPU nạp hai bản sao cùng checkpoint.
 
-Chạy từ `/home/ubuntu/agy-worktrees/arch9/source_test`, dùng Python
+Chạy từ `the repository root`, dùng Python
 `/home/ubuntu/datamate/venv/bin/python`:
 
 ```bash

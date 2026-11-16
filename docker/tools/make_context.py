@@ -3,7 +3,7 @@
 
 The image needs three kinds of content:
 
-* inference code (`source_test/bizreason`, `serve/local_server.py`, `run_submission.py`, `container/`), copied from the
+* inference code (`src/bizreason`, `src/serve/local_server.py`, `src/run_submission.py`, `container/`), copied from the
   repository, plus the *container-only* observability hooks that the competition's logging contract requires;
 * static packaging files kept in `docker/` (entry point, README, model manifest, training-code description);
 * data that is deliberately NOT stored in git (training split, few-shot bank, verification evidence), supplied with
@@ -27,7 +27,7 @@ from pathlib import Path
 
 DOCKER_DIR = Path(__file__).resolve().parents[1]
 REPO = DOCKER_DIR.parent
-SOURCE = REPO / "source_test"
+SOURCE = REPO / "src"
 HOOKED_FILES = ("src/bizreason/run_v2.py", "src/serve/local_server.py")
 
 
@@ -80,8 +80,7 @@ def main() -> int:
                         help="directory merged over context/code (training data, few-shot bank, verification evidence)")
     args = parser.parse_args()
 
-    status = git("status", "--porcelain", "--", "source_test/bizreason", "source_test/serve/local_server.py",
-                 "source_test/run_submission.py", "source_test/container", "docker")
+    status = git("status", "--porcelain", "--", "src", "container", "pyproject.toml", "docker")
     head = git("rev-parse", "HEAD").strip()
     context = args.out / "context"
     code = context / "code"
@@ -103,8 +102,8 @@ def main() -> int:
     copy_tree(SOURCE / "bizreason", code / "src/bizreason", ignore)
     shutil.copy2(SOURCE / "serve/local_server.py", code / "src/serve/local_server.py")
     shutil.copy2(SOURCE / "run_submission.py", code / "src/run_submission.py")
-    shutil.copy2(SOURCE / "pyproject.toml", code / "src/pyproject.toml")
-    copy_tree(SOURCE / "container", code / "container", ignore)
+    shutil.copy2(REPO / "pyproject.toml", code / "src/pyproject.toml")
+    copy_tree(REPO / "container", code / "container", ignore)
     shutil.copy2(DOCKER_DIR / "overlay/submission_audit.py", code / "src/bizreason/submission_audit.py")
     apply_container_hooks(code)
 

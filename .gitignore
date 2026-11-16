@@ -12,8 +12,8 @@ __pycache__/
 *.egg-info/
 
 # Large or generated data (about 1.6 GB, not covered by git)
-source_test/data/
-source_test/artifacts/
+data/
+artifacts/
 logs/
 
 # Generated Docker build context
@@ -25,4 +25,3 @@ docker/build/
 submission*.jsonl
 acceptance_ids.json
 accept*/
-source_test/artifacts/
